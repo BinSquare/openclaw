@@ -1,4 +1,5 @@
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
   ErrorCodes,
   GatewayErrorDetailCodes,
@@ -62,6 +63,7 @@ import { createSessionListEntryFilter } from "../session-sharing.js";
 import { loadCombinedSessionStoreForGatewayCore } from "../session-utils.js";
 import { startProjectsListDiagnostics } from "./projects-list-diagnostics.js";
 import { listProjectRecents } from "./projects-recents.js";
+import { readGatewayRequestMutationAuthority } from "./session-mutation-guards.js";
 import type { GatewayRequestHandlers } from "./types.js";
 import { assertValidParams, defineValidatedGatewayHandler } from "./validation.js";
 
@@ -371,7 +373,8 @@ export function createProjectsHandlers(service: ProjectWorktreeService): Gateway
           client?.authenticatedUserProfile?.profileId !== requesterProfileId ||
           client?.authenticatedUserId !== requesterUserId ||
           readGatewayAccessRevision() !== accessRevision ||
-          context.getRuntimeConfig() !== cfg
+          context.getRuntimeConfig() !== cfg ||
+          !isDeepStrictEqual(configuredDefaultRepository(cfg), defaultRepository)
         ) {
           throw new Error("Project access changed while preparing the listing. Retry the request.");
         }
@@ -578,14 +581,24 @@ export function createProjectsHandlers(service: ProjectWorktreeService): Gateway
     "projects.searchRemote": defineValidatedGatewayHandler(
       "projects.searchRemote",
       validateProjectsSearchRemoteParams,
-      async ({ params, respond, context, signal, hasCurrentClientAuthority }) => {
+      async (options) => {
+        const { params, respond, context, client, signal, hasCurrentClientAuthority } = options;
+        const authority = readGatewayRequestMutationAuthority(options);
         const cfg = context.getRuntimeConfig();
+        const factoryEnv = factoryGitHubActorEnvironment(client, client?.connId ?? "");
+        const factoryProfileId = client?.authenticatedUserProfile?.profileId;
         const host = resolveConfiguredGitHubHost(cfg);
         const apiBaseUrl = resolveConfiguredGitHubApiBaseUrl(cfg);
         const assertCurrent = () => {
-          signal?.throwIfAborted();
-          if (hasCurrentClientAuthority?.() === false) {
-            throw new Error("Project requester authority changed during search");
+          authority.assertCurrent();
+          if (
+            factoryEnv &&
+            (factoryGitHubActorEnvironment(client, client?.connId ?? "")
+              ?.OPENCLAW_FACTORY_ACTOR_ID !== factoryEnv.OPENCLAW_FACTORY_ACTOR_ID ||
+              client?.connId !== factoryEnv.OPENCLAW_FACTORY_SESSION_KEY ||
+              client?.authenticatedUserProfile?.profileId !== factoryProfileId)
+          ) {
+            throw new Error("Factory project requester changed during preparation");
           }
           if (context.getRuntimeConfig() !== cfg) {
             throw new gitHubPublicApi.ControlUiGitHubError(

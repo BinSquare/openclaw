@@ -158,6 +158,31 @@ describe("project GitHub search", () => {
     ]);
   });
 
+  it("rejects a retired explicit host selection before serving cached search results", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async () => json({ items: [] }));
+    const options = {
+      token: "synthetic-host-token",
+      host: "github.com",
+      apiBaseUrl: "https://api.github.com",
+      fetchImpl,
+      now: 1_000,
+    };
+    await searchRemoteProjects("retained-host-cache", options);
+    fetchImpl.mockClear();
+    setRuntimeConfigSnapshot({
+      gateway: {
+        github: {
+          host: "replaced.ghe.example.test",
+          apiBaseUrl: "https://replaced.ghe.example.test/api/v3",
+        },
+      },
+    });
+    await expect(searchRemoteProjects("retained-host-cache", options)).rejects.toThrow(
+      "GitHub host changed",
+    );
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it("returns anonymous public results with a typed missing-credential state", async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(
       json({

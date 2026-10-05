@@ -160,7 +160,7 @@ test("projects.searchRemote binds native tokens to the host through final fetch"
   }
 });
 
-test.each(["revoked", "aborted"] as const)(
+test.each(["revoked", "aborted", "guard"] as const)(
   "registered projects.searchRemote refuses %s callers before credentialed I/O",
   async (closed) => {
     const cfg = {
@@ -199,7 +199,15 @@ test.each(["revoked", "aborted"] as const)(
         registeredProjectsHandlers,
         undefined,
         () => cfg,
-        { signal: controller.signal, hasCurrentClientAuthority: () => active },
+        {
+          signal: controller.signal,
+          hasCurrentClientAuthority: () => closed === "guard" || active,
+          sessionMutationCommitGuard: () => {
+            if (closed === "guard" && !active) {
+              throw new Error("request guard revoked");
+            }
+          },
+        },
       );
       expect(result).toMatchObject({ ok: false });
       expect(fetchImpl).not.toHaveBeenCalled();
@@ -450,40 +458,50 @@ test("projects.list exposes a normalized configured default repository", async (
   });
 });
 
-test("projects.list refuses a default repository from a replaced config during registry lookup", async () => {
-  const original = {
-    gateway: {
-      github: { host: "ghe.example.test" },
-      projects: { defaultRepository: { url: "https://ghe.example.test/acme/private-repo.git" } },
-    },
-  };
-  let current: OpenClawConfig = original;
-  const list = vi
-    .spyOn(await import("../../projects/project-registry.js"), "listProjectRegistry")
-    .mockImplementation(async () => {
-      current = { gateway: { github: { host: "github.com" } } };
-      return [];
-    });
-  try {
-    expect(
-      await invokeProjectMethod(
-        "projects.list",
-        {},
-        original,
-        ["operator.write"],
-        undefined,
-        projectsHandlers,
-        undefined,
-        () => current,
-      ),
-    ).toMatchObject({
-      ok: false,
-      error: { code: "UNAVAILABLE", message: expect.stringContaining("Project access changed") },
-    });
-  } finally {
-    list.mockRestore();
-  }
-});
+test.each(["config", "access", "default-repository"] as const)(
+  "projects.list refuses changed %s during registry lookup",
+  async (change) => {
+    const original = {
+      gateway: {
+        github: { host: "ghe.example.test" },
+        projects: { defaultRepository: { url: "https://ghe.example.test/acme/private-repo.git" } },
+      },
+    };
+    let current: OpenClawConfig = original;
+    const list = vi
+      .spyOn(await import("../../projects/project-registry.js"), "listProjectRegistry")
+      .mockImplementation(async () => {
+        if (change === "config") {
+          current = { gateway: { github: { host: "github.com" } } };
+        } else if (change === "access") {
+          bumpGatewayAccessRevision();
+        } else {
+          original.gateway.projects.defaultRepository.url =
+            "https://ghe.example.test/acme/replaced.git";
+        }
+        return [];
+      });
+    try {
+      expect(
+        await invokeProjectMethod(
+          "projects.list",
+          {},
+          original,
+          ["operator.write"],
+          undefined,
+          projectsHandlers,
+          undefined,
+          () => current,
+        ),
+      ).toMatchObject({
+        ok: false,
+        error: { code: "UNAVAILABLE", message: expect.stringContaining("Project access changed") },
+      });
+    } finally {
+      list.mockRestore();
+    }
+  },
+);
 
 test("projects.list coalesces concurrent observed Git discovery and refreshes later reads", async () => {
   await withProjectState(async (state) => {
