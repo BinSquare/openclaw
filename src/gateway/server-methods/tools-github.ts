@@ -7,6 +7,7 @@ import {
   validateToolsGitHubConfigureParams,
   validateToolsGitHubStatusParams,
 } from "../../../packages/gateway-protocol/src/index.js";
+import { resolveGitHubApiBaseUrl, resolveGitHubHost } from "../../agents/github-host-runtime.js";
 import {
   createManagedGitHubProfileId,
   installManagedGitHubProfile,
@@ -95,6 +96,7 @@ export const toolsGitHubHandlers: GatewayRequestHandlers = {
           await installManagedGitHubProfile({
             profileDir,
             token,
+            issuer: { host: resolveGitHubHost(), apiBaseUrl: resolveGitHubApiBaseUrl() },
             commitConfig: async (account) => {
               const identity = {
                 profileId,

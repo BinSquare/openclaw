@@ -204,6 +204,8 @@ describe("GitHub tool identity", () => {
       agentId: "main",
     });
     expect(envScrub.credentialScrubEnv).toEqual({
+      GITHUB_APP_PRIVATE_KEY: "",
+      OPENCLAW_GITHUB_APP_PRIVATE_KEY: "",
       ...(managed
         ? {
             GH_TOKEN: "",
@@ -231,6 +233,8 @@ describe("GitHub tool identity", () => {
       agentId: "main",
     });
     expect(storeScrub.credentialScrubEnv).toEqual({
+      GITHUB_APP_PRIVATE_KEY: "",
+      OPENCLAW_GITHUB_APP_PRIVATE_KEY: "",
       ...(managed
         ? {
             GH_TOKEN: "",
@@ -295,7 +299,11 @@ describe("GitHub tool identity", () => {
       agentId: "main",
       env: { GH_TOKEN: "test-token", GITHUB_TOKEN: "fallback-token" },
     });
-    expect(prepared.credentialScrubEnv).toEqual(expected);
+    expect(prepared.credentialScrubEnv).toEqual({
+      GITHUB_APP_PRIVATE_KEY: "",
+      OPENCLAW_GITHUB_APP_PRIVATE_KEY: "",
+      ...expected,
+    });
     expect(prepared.excludedStoreNames).toEqual(source === "store" ? [id] : []);
   });
 
