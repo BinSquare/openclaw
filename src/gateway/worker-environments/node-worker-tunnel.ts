@@ -20,10 +20,7 @@ import {
   type NodeWorkerWorkspaceExecInput,
   type NodeWorkerWorkspaceExecResult,
 } from "../../worker/node-workspace-protocol.js";
-import {
-  NODE_WORKSPACE_TRANSFER_ERROR_CODE,
-  NodeWorkerWorkspaceTransferError,
-} from "../../worker/node-workspace-transfer-protocol.js";
+import { NODE_WORKSPACE_TRANSFER_ERROR_CODE } from "../../worker/node-workspace-transfer-protocol.js";
 import { sameWorkerBuild } from "../../worker/worker-build-identity.js";
 import type {
   NodeWorkerSupervisorNodeProof,
@@ -39,13 +36,15 @@ import {
 import { raceNodeWorkerOperation } from "./node-worker-abort.js";
 import { nodeWorkerGatewayNamespace } from "./node-worker-gateway-namespace.js";
 import { createNodeWorkerProcessObserver } from "./node-worker-process-observation.js";
-import { parseNodeWorkerResponse } from "./node-worker-response.js";
+import { nativeRepositoryWorkspaceInput } from "./node-worker-repository-readiness.js";
+import { parseNodeWorkerResponse, workspaceCommandError } from "./node-worker-response.js";
 import {
   createNodeWorkerWorkspaceActions,
   type NodeWorkerWorkspaceBinding,
 } from "./node-worker-workspace-actions.js";
 import { drainNodeWorkerWorkspace } from "./node-worker-workspace-drain.js";
 import type { NodeWorkspaceTransferService } from "./node-workspace-transfer-service.js";
+import { recordWorkerPlacementStage } from "./placement-diagnostics.js";
 import type { WorkerSessionTurnClaim } from "./placement-record.js";
 import { readWorkerProjectPreparation } from "./preparation-identity.js";
 import type { WorkerEnvironmentRecord } from "./store.js";
@@ -63,7 +62,6 @@ import { workerWorkspaceCommandSucceeded } from "./workspace-sync-helpers.js";
 const DEFAULT_COMMAND_TIMEOUT_MS = 60_000;
 const COMMAND_RESULT_GRACE_MS = 5_000;
 const RETRY_DELAY_MS = 100;
-const WORKSPACE_DIAGNOSTIC_MAX_CHARS = 500;
 const tunnelLog = createSubsystemLogger("gateway/worker-tunnel");
 
 export type NodeWorkerWorkspaceBindingResolver = (binding: {
@@ -193,7 +191,8 @@ export function createNodeWorkerTunnelManager(options: NodeWorkerTunnelManagerOp
       gatewayNamespace,
       environmentId: entry.environmentId,
       sessionId: entry.sessionId,
-      ...(preparationKey === undefined ? {} : { preparationKey, sessionKey: command.sessionKey }),
+      preparationKey,
+      sessionKey: command.sessionKey,
       generation: entry.ownerEpoch,
       argv: [...command.argv],
       ...(command.input === undefined ? {} : { input: command.input }),
@@ -210,6 +209,7 @@ export function createNodeWorkerTunnelManager(options: NodeWorkerTunnelManagerOp
       if (remainingMs <= 0 || signal.aborted) {
         throw signal.reason ?? new Error("node worker workspace command timed out");
       }
+      const invokeStartedAt = performance.now();
       let result: Awaited<ReturnType<NodeWorkerSupervisorTransport["invoke"]>>;
       try {
         const { node, transport } = await findNode(entry, signal);
@@ -225,17 +225,7 @@ export function createNodeWorkerTunnelManager(options: NodeWorkerTunnelManagerOp
           }
         };
         assertNativeContract();
-        const params: NodeWorkerWorkspaceExecInput = {
-          ...input,
-          ...(nativeOwnership &&
-          !command.legacyQuiescence &&
-          !input.quiescence &&
-          !input.process &&
-          !input.transfer &&
-          !input.seed
-            ? { nativeProcessOwner: true }
-            : {}),
-        };
+        const params = nativeRepositoryWorkspaceInput(input, command, node);
         result = await transport.invoke({
           node,
           command: NODE_WORKER_WORKSPACE_EXEC_COMMAND,
@@ -269,15 +259,18 @@ export function createNodeWorkerTunnelManager(options: NodeWorkerTunnelManagerOp
         await sleepWithAbort(Math.min(RETRY_DELAY_MS, Math.max(1, deadline - Date.now())), signal);
         continue;
       }
+      assertCurrent();
       if (!result.ok) {
+        recordWorkerPlacementStage(entry.sessionId, "node_workspace_rpc_failed", {
+          environmentId: entry.environmentId,
+          ownerEpoch: entry.ownerEpoch,
+          diagnosticCode: "operation_failed",
+          error: result.error,
+          elapsedMs: performance.now() - invokeStartedAt,
+        });
         const code = result.error?.code ?? "UNAVAILABLE";
         if (code === NODE_WORKSPACE_TRANSFER_ERROR_CODE) {
-          throw new NodeWorkerWorkspaceTransferError(
-            boundedWorkerError(
-              result.error?.message ?? "workspace-transfer-failed: transfer did not complete",
-              WORKSPACE_DIAGNOSTIC_MAX_CHARS,
-            ),
-          );
+          throw workspaceCommandError(result.error);
         }
         if (
           command.transportRetry === "idempotent" &&
@@ -286,11 +279,7 @@ export function createNodeWorkerTunnelManager(options: NodeWorkerTunnelManagerOp
           await sleepWithAbort(Math.min(RETRY_DELAY_MS, remainingMs), signal);
           continue;
         }
-        throw new Error(
-          result.error?.message
-            ? `node workspace command failed (${code}): ${boundedWorkerError(result.error.message, WORKSPACE_DIAGNOSTIC_MAX_CHARS)}`
-            : `node workspace command failed (${code})`,
-        );
+        throw workspaceCommandError(result.error);
       }
       const parsed = parseNodeWorkerWorkspaceExecResult(
         parseNodeWorkerResponse(result.payloadJSON, "node workspace command"),
@@ -732,6 +721,9 @@ export function createNodeWorkerTunnelManager(options: NodeWorkerTunnelManagerOp
       if (failure) {
         throw failure.reason;
       }
+    },
+    async isNodeConnected(deviceId: string): Promise<boolean> {
+      return Boolean(await options.getTransport()?.getCurrentNode(deviceId));
     },
     status(environmentId: string): WorkerTunnelStatus {
       const entry = entries.get(environmentId);

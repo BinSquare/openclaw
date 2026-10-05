@@ -26,8 +26,14 @@ export type PlacementRecoveryDeps = {
     | "reconcileEnvironment"
     | "reconcileOnce"
     | "supportsProviderExecutionMode"
-  >;
-  failure: Omit<PlacementFailureActions, "cancelProvisioning">;
+  > &
+    Partial<
+      Pick<
+        import("./service.js").WorkerEnvironmentService,
+        "holdFailedEnvironment" | "supportsFailedLeaseHold"
+      >
+    >;
+  failure: Omit<PlacementFailureActions, "cancelProvisioning" | "retireSetup">;
   workspaceOperations: WorkerWorkspaceOperationCoordinator;
   resolveWorkspace: (params: WorkerSessionPlacementIdentity) => Promise<WorkerSessionWorkspace>;
   withPreparedRecovery: WithPreparedWorkerWorkspaceRecovery;

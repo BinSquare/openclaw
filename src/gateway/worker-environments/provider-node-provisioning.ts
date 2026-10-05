@@ -7,6 +7,7 @@ import type {
   WorkerNodeRuntimePreparation,
   WorkerProvider,
 } from "../../plugins/types.js";
+import { sameWorkerBuild } from "../../worker/worker-build-identity.js";
 import type { WorkerInstallationArtifact } from "./bundle.js";
 import type { WorkerCredentialBroker } from "./credential-broker.js";
 import { workerEnvironmentServiceError as serviceError } from "./environment-errors.js";
@@ -15,8 +16,12 @@ import { readWorkerProjectPreparation } from "./preparation-identity.js";
 import type { createWorkerProjectPreparation } from "./project-preparation.js";
 import type { WorkerProviderLifecycleOptions } from "./provider-lifecycle.types.js";
 import type { createWorkerProviderOwnerLifecycle } from "./provider-owner-lifecycle.js";
-import { withWorkerProvisionStage } from "./provider-provision-telemetry.js";
+import {
+  reportWorkerProvisionAbort,
+  withWorkerProvisionStage,
+} from "./provider-provision-telemetry.js";
 import type { createWorkerProvisionCancellation } from "./provider-provisioning-cancellation.js";
+import { requireWorkerProfile } from "./service-validation.js";
 import type { WorkerEnvironmentRecord } from "./store.js";
 import { boundedWorkerError as boundedError } from "./worker-error.js";
 
@@ -25,6 +30,8 @@ type NodeLease = Extract<WorkerLease, { node: { deviceId: string } }>;
 type WorkerNodeProvisioningOptions = Pick<
   WorkerProviderLifecycleOptions,
   | "store"
+  | "callProvider"
+  | "callBootstrap"
   | "now"
   | "isStopping"
   | "prepareNodeBootstrap"
@@ -77,8 +84,12 @@ export function createWorkerNodeProvisioning(options: WorkerNodeProvisioningOpti
     try {
       const [bootstrapResult, installationResult] = await racePromiseWithAbortSignal(
         Promise.allSettled([
-          Promise.resolve().then(() => prepareNodeBootstrap(record, signal)),
-          prepareBundle(undefined, signal),
+          withWorkerProvisionStage(record, "node-bootstrap-artifact", () =>
+            prepareNodeBootstrap(record, signal),
+          ),
+          withWorkerProvisionStage(record, "worker-bundle-artifact", () =>
+            prepareBundle(undefined, signal),
+          ),
         ]),
         signal,
       );
@@ -173,6 +184,12 @@ export function createWorkerNodeProvisioning(options: WorkerNodeProvisioningOpti
       }
       open = false;
       signal?.removeEventListener("abort", close);
+      reportWorkerProvisionAbort(
+        record,
+        "runtime-operation",
+        signal?.aborted ? "caller-signal" : "operation-closed",
+        controller.signal,
+      );
       controller.abort();
       if (runtime) {
         options.closeNodeRuntime?.(runtime);
@@ -190,15 +207,40 @@ export function createWorkerNodeProvisioning(options: WorkerNodeProvisioningOpti
     const assertCurrent = () => {
       beforeProvision?.();
       const current = options.store.get(record.environmentId);
+      const stopping = open ? options.isStopping() : false;
       if (
         !open ||
-        options.isStopping() ||
-        current?.state !== "provisioning" ||
+        stopping ||
+        (current?.state !== "provisioning" &&
+          !(
+            current?.state === record.state &&
+            ["ready", "idle", "attached"].includes(record.state) &&
+            record.leaseId !== null &&
+            current.leaseId === record.leaseId &&
+            record.nodeDeviceId !== null &&
+            current.nodeDeviceId === record.nodeDeviceId
+          )) ||
         current.destroyRequestedAtMs !== null ||
         current.provisionOperationId !== record.provisionOperationId ||
         current.ownerEpoch !== record.ownerEpoch ||
         (current.preparation?.consumedAtMs === null && current.preparation.expiresAtMs <= now())
       ) {
+        reportWorkerProvisionAbort(
+          record,
+          "runtime-operation",
+          !open
+            ? "operation-closed"
+            : stopping
+              ? "host-stopping"
+              : current && current.destroyRequestedAtMs !== null
+                ? "destroy-requested"
+                : current?.state !== "provisioning" ||
+                    current.provisionOperationId !== record.provisionOperationId ||
+                    current.ownerEpoch !== record.ownerEpoch
+                  ? "owner-changed"
+                  : "preparation-expired",
+          controller.signal,
+        );
         controller.abort();
         throw new DOMException("Worker provisioning operation is closed", "AbortError");
       }
@@ -398,5 +440,115 @@ export function createWorkerNodeProvisioning(options: WorkerNodeProvisioningOpti
     );
   };
 
-  return { prepare, createEnrollmentOperation, finish };
+  const resume = async (
+    record: WorkerEnvironmentRecord,
+    provider: WorkerProvider,
+    installation: WorkerInstallationArtifact,
+    authority: { signal: AbortSignal; assertCurrent: () => void },
+  ) => {
+    const assertCurrent = () => {
+      authority.signal.throwIfAborted();
+      authority.assertCurrent();
+      const current = options.store.get(record.environmentId);
+      if (
+        options.isStopping() ||
+        current?.ownerEpoch !== record.ownerEpoch ||
+        current.state !== record.state ||
+        current.leaseId !== record.leaseId ||
+        current.nodeDeviceId !== record.nodeDeviceId ||
+        current.destroyRequestedAtMs !== null
+      ) {
+        throw new Error("Worker resumption lost its exact lease owner");
+      }
+    };
+    assertCurrent();
+    if (!provider.resume || !record.leaseId || !record.nodeDeviceId) {
+      throw new Error("Worker provider has no exact node resumption operation");
+    }
+    if (installation.install !== "bundle" || !options.ensureNodeWorkerBundle) {
+      throw new Error("Worker resumption has no current bundle installer");
+    }
+    const resumeLease = provider.resume;
+    const deviceId = record.nodeDeviceId;
+    const lease = {
+      leaseId: record.leaseId,
+      profile: requireWorkerProfile(record.profileSnapshot.settings),
+    };
+    const inspection = await options.callProvider(record.environmentId, () =>
+      provider.inspect(lease),
+    );
+    assertCurrent();
+    if (inspection.status !== "active" && inspection.status !== "dormant") {
+      throw new Error("Worker resumption requires a recognized lease");
+    }
+    const controller = new AbortController();
+    const signal = AbortSignal.any([authority.signal, controller.signal]);
+    const operation = createEnrollmentOperation(
+      record,
+      provider,
+      signal,
+      installation,
+      undefined,
+      assertCurrent,
+    );
+    let open = true;
+    const assertResumeCurrent = () => {
+      if (!open) {
+        throw new Error("Worker resumption operation closed");
+      }
+      assertCurrent();
+    };
+    try {
+      const disposition = await options.callProvider(record.environmentId, () =>
+        resumeLease(lease, {
+          signal,
+          assertCurrent: assertResumeCurrent,
+          beginNodeEnrollment: async () => {
+            assertResumeCurrent();
+            const enrollment = await operation?.begin();
+            assertResumeCurrent();
+            if (!enrollment || enrollment.mode !== "resume" || enrollment.deviceId !== deviceId) {
+              throw new Error("Worker resumption cannot replace its paired node identity");
+            }
+            return enrollment;
+          },
+        }),
+      );
+      assertCurrent();
+      if (disposition === "unsupported") {
+        return;
+      }
+      if (disposition !== "resumed") {
+        throw new Error("Worker provider returned an invalid resumption outcome");
+      }
+      const observed = await options.callProvider(record.environmentId, () =>
+        provider.inspect(lease),
+      );
+      assertCurrent();
+      if (observed.status !== "active") {
+        throw new Error("Worker lease did not become active after resumption");
+      }
+      const ensureNodeWorkerBundle = options.ensureNodeWorkerBundle;
+      const receipt = await options.callBootstrap(installation, (timeoutSignal) =>
+        ensureNodeWorkerBundle({
+          reason: "refresh",
+          environmentId: record.environmentId,
+          deviceId,
+          artifact: installation,
+          prewarm: record.profileSnapshot.executionMode !== "remote-exec",
+          signal: AbortSignal.any([signal, timeoutSignal]),
+          assertCurrent,
+        }),
+      );
+      assertCurrent();
+      if (!sameWorkerBuild(receipt, installation)) {
+        throw new Error("Worker resumption returned another runtime build");
+      }
+    } finally {
+      open = false;
+      controller.abort();
+      operation?.close();
+    }
+  };
+  return { prepare, createEnrollmentOperation, finish, resume };
 }

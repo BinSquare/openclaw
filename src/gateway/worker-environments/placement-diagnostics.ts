@@ -1,9 +1,70 @@
+import {
+  collectNestedErrorCandidates,
+  extractErrorCode,
+  readErrorName,
+} from "@openclaw/normalization-core/error-coercion";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 
 const log = createSubsystemLogger("gateway/worker-placement");
 export const MAX_PREPARED_CANDIDATE_OBSERVATIONS = 8;
 
+type PlacementAwaitPhase =
+  | "repository_ref_preparation"
+  | "retained_worker_recovery"
+  | "prepared_repository_revalidation"
+  | "cold_repository_revalidation"
+  | "post_sync_repository_revalidation"
+  | "workspace_preparation"
+  | "workspace_sync"
+  | "repository_checkpoint_source"
+  | "repository_identity"
+  | "repository_checkpoint_load"
+  | "repository_sync"
+  | "repository_prepare"
+  | "repository_transfer_bind"
+  | "repository_checkpoint_restore"
+  | "repository_validation"
+  | "node_workspace_rpc"
+  | "activation"
+  | "barrier"
+  | "lifecycle_context"
+  | "lifecycle_fence"
+  | "session_target"
+  | "cancel_session_work"
+  | "cancel_and_drain"
+  | "pending_dispatch_settlement"
+  | "work_admission_drain"
+  | "turn_claim_release"
+  | "session_writer_drain"
+  | "placement_drain"
+  | "workspace_owner"
+  | "result_claim"
+  | "prepared_recovery"
+  | "journal_load"
+  | "journal_recover"
+  | "journal_abort"
+  | "tunnel"
+  | "workspace_lock"
+  | "quiesce"
+  | "snapshot_reconcile"
+  | "final_workspace_fence"
+  | "checkpoint_accept"
+  | "pending_result_read"
+  | "prior_conflict"
+  | "conflict_finalize"
+  | "result_finalize"
+  | "gateway_materialize"
+  | "provider_destroy"
+  | "placement_teardown"
+  | "tunnel_detach"
+  | "quiescence_release"
+  | "result_cancel"
+  | "turn_tool_close"
+  | "empty_ref_probe"
+  | "result_recovery_handoff";
+
 type PlacementStage =
+  | `${"reclaim_" | "dispatch_" | ""}${PlacementAwaitPhase}_${"started" | "completed" | "failed"}`
   | "dispatch_received"
   | "dispatch_joined"
   | "dispatch_admitted"
@@ -58,6 +119,40 @@ export type PreparedCandidateRejectionObserver = (
   code: PreparedCandidateRejectionCode,
 ) => void;
 
+// Only protocol/errno constants cross this metadata boundary; provider payloads stay private.
+const SAFE_FAILURE_CODES = [
+  "ENOENT",
+  "EACCES",
+  "EPERM",
+  "ENOSPC",
+  "EIO",
+  "ETIMEDOUT",
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ABORT_ERR",
+  "INVALID_REQUEST",
+  "UNAVAILABLE",
+  "WORKSPACE_TRANSFER_FAILED",
+] as const;
+
+function readPlacementFailureCode(error: unknown) {
+  try {
+    for (const candidate of collectNestedErrorCandidates(error)) {
+      const code = extractErrorCode(candidate);
+      const recognized = SAFE_FAILURE_CODES.find((safe) => safe === code);
+      if (recognized) {
+        return recognized;
+      }
+      if (readErrorName(candidate) === "AbortError") {
+        return "ABORT_ERR";
+      }
+    }
+  } catch {
+    // Hostile or malformed error getters cannot replace the operation's outcome.
+  }
+  return undefined;
+}
+
 export function recordWorkerPlacementStage(
   sessionId: string,
   stage: PlacementStage,
@@ -65,6 +160,10 @@ export function recordWorkerPlacementStage(
     generation?: number;
     environmentId?: string | null;
     ownerEpoch?: number;
+    claimId?: string;
+    runId?: string;
+    diagnosticCode?: "operation_failed";
+    error?: unknown;
     preparationKey?: string;
     prepared?: boolean;
     candidateCount?: number;
@@ -78,9 +177,14 @@ export function recordWorkerPlacementStage(
       sessionId,
       stage,
       atMs: Date.now(),
+      monotonicAtMs: performance.now(),
       generation: facts.generation,
       environmentId: facts.environmentId,
       ownerEpoch: facts.ownerEpoch,
+      claimId: facts.claimId,
+      runId: facts.runId,
+      diagnosticCode: facts.diagnosticCode,
+      innerDiagnosticCode: readPlacementFailureCode(facts.error),
       preparationKey: facts.preparationKey,
       prepared: facts.prepared,
       candidateCount: facts.candidateCount,
@@ -90,6 +194,35 @@ export function recordWorkerPlacementStage(
     });
   } catch {
     // A diagnostic sink cannot decide placement admission or settlement.
+  }
+}
+
+/** Report the exact awaited phase without deciding its outcome or exposing its error payload. */
+export async function recordWorkerPlacementAwait<T>(
+  sessionId: string,
+  phase: PlacementAwaitPhase,
+  operation: () => T | Promise<T>,
+  facts: NonNullable<Parameters<typeof recordWorkerPlacementStage>[2]> = {},
+  scope: "reclaim" | "dispatch" | "placement" = "reclaim",
+): Promise<T> {
+  const startedAt = performance.now();
+  const prefix = scope === "placement" ? "" : scope === "dispatch" ? "dispatch_" : "reclaim_";
+  recordWorkerPlacementStage(sessionId, `${prefix}${phase}_started`, facts);
+  try {
+    const result = await operation();
+    recordWorkerPlacementStage(sessionId, `${prefix}${phase}_completed`, {
+      ...facts,
+      elapsedMs: performance.now() - startedAt,
+    });
+    return result;
+  } catch (error) {
+    recordWorkerPlacementStage(sessionId, `${prefix}${phase}_failed`, {
+      ...facts,
+      elapsedMs: performance.now() - startedAt,
+      diagnosticCode: "operation_failed",
+      error,
+    });
+    throw error;
   }
 }
 

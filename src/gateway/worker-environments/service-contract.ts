@@ -178,6 +178,28 @@ export type WorkerEnvironmentServiceContract = {
     runSetupScript?: boolean,
   ): Promise<WorkerEnvironmentServiceRecord>;
   destroy(environmentId: string): Promise<WorkerEnvironmentServiceRecord>;
+  holdFailedEnvironment?: (
+    identity: Omit<
+      import("./environment-record.js").WorkerEnvironmentRecoveryHold,
+      "receipt" | "createdAtMs" | "leaseId" | "phase"
+    >,
+    assertCurrent: () => void,
+    signal?: AbortSignal,
+  ) => Promise<WorkerEnvironmentServiceRecord>;
+  acceptRetainedRecovery?: (
+    input: import("./recovery-hold-store.js").RetainedWorkerRecoveryAcceptance & {
+      assertCurrent: () => void;
+    },
+  ) => Promise<
+    Extract<
+      import("./placement-record.js").WorkerSessionPlacementRecord,
+      { state: "failed" | "reclaimed" }
+    >
+  >;
+  readRecoveryHold?: (
+    sessionId: string,
+  ) => import("./environment-record.js").WorkerEnvironmentRecoveryHold | undefined;
+  supportsFailedLeaseHold?: (environmentId: string) => boolean;
   destroyUnattached(environmentId: string): Promise<WorkerEnvironmentServiceRecord>;
   observeDesktop(request: {
     environmentId: string;
@@ -207,11 +229,24 @@ export type WorkerPlacementDispatchRequest = WorkerSessionPlacementDispatchIdent
   readNativeCredential?: (env: NodeJS.ProcessEnv) => Promise<string | undefined>;
   /** Original admitted source for automatic recovery/redispatch; never persisted. */
   operatorAuthority?: import("../../agents/admitted-run-context.js").AdmittedRunOperatorAuthority;
+  /** In-process admission custody; the session lifecycle joins background preparation. */
+  trackRepositoryPreparation?: (operation: Promise<void>) => void;
+  assertRepositoryPreparationCurrent?: () => void;
+  assertRepositoryCleanupCurrent?: () => void;
+  repositoryPreparationSignal?: AbortSignal;
 };
 
 export type WorkerPlacementDispatchAdmission = <T>(
   request: Pick<WorkerPlacementDispatchRequest, "sessionId" | "sessionKey" | "agentId">,
-  run: (signal?: AbortSignal) => Promise<T>,
+  run: (
+    signal?: AbortSignal,
+    repositoryPreparation?: {
+      track(this: void, operation: Promise<void>): void;
+      assertCurrent(this: void): void;
+      assertCleanupCurrent(this: void): void;
+      signal: AbortSignal;
+    },
+  ) => Promise<T>,
   authorize?: () => void,
   signal?: AbortSignal,
 ) => Promise<T>;
@@ -242,6 +277,7 @@ export type WorkerPlacementMoveRequest = WorkerSessionPlacementIdentity & {
   source: WorkerPlacementMoveSource;
   target: WorkerPlacementMoveTarget;
   abandonSource?: true;
+  readNativeCredential?: (env: NodeJS.ProcessEnv) => Promise<string | undefined>;
 };
 
 /** Closure-bound request authority; in-process only and never part of durable placement intent. */
@@ -258,6 +294,9 @@ export type WorkerPlacementReclaimSourceCheck = ((
 // Leaf dispatch contract: GatewayRequestContext must not import the dispatch
 // runtime (it reaches agents/plugins and closes an import cycle through core).
 export type WorkerPlacementDispatchContract = {
+  canRecoverFailedPlacement?: (
+    placement: import("./placement-record.js").WorkerSessionPlacementRecord,
+  ) => boolean;
   getPendingDeviceDispatchCount?(deviceId: string, excludeSessionId?: string): number;
   getAdmittedDeviceSessionCounts?(excludeSessionId?: string): ReadonlyMap<string, number>;
   dispatch(
