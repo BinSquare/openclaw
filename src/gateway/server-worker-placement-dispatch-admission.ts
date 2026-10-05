@@ -51,12 +51,53 @@ export function createGatewayWorkerDispatchAdmission(
         }
       },
     });
+    const background = new Set<Promise<void>>();
+    const assertRepositoryCleanupCurrent = () => {
+      const current = resolve();
+      const currentEntry = runtime.resolveCanonicalSessionEntryFromStoreKeys(
+        current.store,
+        current.storeKeys,
+      );
+      if (
+        current.storePath !== target.storePath ||
+        current.canonicalKey !== target.canonicalKey ||
+        current.agentId !== target.agentId ||
+        currentEntry?.sessionId !== request.sessionId ||
+        (currentEntry.lifecycleRevision ?? null) !== revision ||
+        currentEntry.archivedAt !== undefined
+      ) {
+        throw new WorkerPlacementAdmissionTargetError(
+          "Repository preparation session lifecycle changed",
+        );
+      }
+    };
+    const assertRepositoryPreparationCurrent = () => {
+      controller.signal.throwIfAborted();
+      if (!admission.isActive()) {
+        throw new Error("Repository preparation admission closed");
+      }
+      assertRepositoryCleanupCurrent();
+    };
     try {
       // Reserve before the placement queue, and exclude this owner from its own local barrier.
       // Release only after dispatch's canonical failure cleanup has settled the provider child.
-      return await admission.run(() => run(signal));
+      return await admission.run(() =>
+        run(signal, {
+          signal: controller.signal,
+          assertCurrent: assertRepositoryPreparationCurrent,
+          assertCleanupCurrent: assertRepositoryCleanupCurrent,
+          track: (operation) => {
+            background.add(operation);
+            void operation.catch(() => undefined);
+          },
+        }),
+      );
     } finally {
-      admission.release();
+      if (background.size === 0) {
+        admission.release();
+      } else {
+        void Promise.allSettled(background).then(() => admission.release());
+      }
     }
   };
 }
