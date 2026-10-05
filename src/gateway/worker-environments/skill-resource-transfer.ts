@@ -115,6 +115,7 @@ export async function transferSkillResources(params: {
   assertRunCurrent?: () => void;
   signal?: AbortSignal;
   explicitSelections?: readonly import("../../skills/types.js").ExplicitSkillSelection[];
+  deferEmptyDiscovery?: () => boolean;
 }) {
   const check = () => {
     params.signal?.throwIfAborted();
@@ -127,6 +128,12 @@ export async function transferSkillResources(params: {
     params.explicitSelections,
     params.workspaceDir,
   );
+  check();
+  // No resources need staging. A pending checkout cannot contain this turn's
+  // payload; retain older cleanup for the next ready turn instead of waiting here.
+  if (!delivery && params.deferEmptyDiscovery?.()) {
+    return undefined;
+  }
   const execute = async (operation: ResourceOperation) => {
     const cleanup = operation.op === "cleanup";
     const assertDispatchCurrent = cleanup ? params.assertCurrent : check;
@@ -175,7 +182,11 @@ export async function transferSkillResources(params: {
     throw new Error("Invalid skill resource location from execution environment.");
   }
   const location = { directory, identity };
+  let active = true;
+  const instructions = new Map<string, string>();
   const cleanup = async () => {
+    active = false;
+    instructions.clear();
     await execute({ op: "cleanup", ...location });
   };
   const pending: Extract<ResourceOperation, { op: "write" }> = {
@@ -277,6 +288,7 @@ export async function transferSkillResources(params: {
         selected.readContent = bundle.files
           .find((file) => file.path === "SKILL.md")!
           .bytes.toString("utf8");
+        instructions.set(selected.filePath, selected.readContent);
         delete selected.locationNote;
       }
     }
@@ -292,6 +304,17 @@ export async function transferSkillResources(params: {
       },
       mounts,
       skillUsagePaths,
+      skillResources: {
+        async readInstructions(filePath: string, options: { signal?: AbortSignal }) {
+          options.signal?.throwIfAborted();
+          check();
+          const content = instructions.get(filePath);
+          if (!active || content === undefined) {
+            throw new Error("Skill instructions are not available in this delivered turn.");
+          }
+          return content;
+        },
+      },
       assertCurrent: check,
       cleanup,
     };

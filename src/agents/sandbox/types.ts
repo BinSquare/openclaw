@@ -1,6 +1,10 @@
 import type { SchemaContract } from "../../../packages/gateway-protocol/src/schema-contract.js";
 import type { AgentSandboxConfig } from "../../config/types.agents-shared.js";
-import type { SkillEligibilityContext, SkillUsagePath } from "../../skills/types.js";
+import type {
+  SkillEligibilityContext,
+  SkillResourceSourceReader,
+  SkillUsagePath,
+} from "../../skills/types.js";
 import type { SandboxBackendHandle, SandboxBackendId } from "./backend-handle.types.js";
 import type { SandboxFsBridge } from "./fs-bridge.types.js";
 import type { SandboxDockerConfig } from "./types.docker.js";
@@ -87,6 +91,7 @@ export type SandboxBrowserContext = {
 };
 
 export type SandboxContext = {
+  repositoryPreparationRequired?: true;
   enabled: boolean;
   /** Immutable creator policy: this session may never escape to a host execution target. */
   required?: true;
@@ -101,6 +106,8 @@ export type SandboxContext = {
   skillsWorkspaceDir?: string;
   skillsEligibility?: SkillEligibilityContext;
   skillUsagePaths?: SkillUsagePath[];
+  /** Turn-owned delivered instructions; does not grant general filesystem access. */
+  skillResources?: Pick<SkillResourceSourceReader, "readInstructions">;
   readOnlyResourceMounts?: Array<{ hostPath: string; containerPath: string }>;
   workspaceAccess: SandboxWorkspaceAccess;
   runtimeId: string;

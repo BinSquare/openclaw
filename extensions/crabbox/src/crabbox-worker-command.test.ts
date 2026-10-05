@@ -1,4 +1,5 @@
 import { inspect as inspectValue } from "node:util";
+import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import type { SpawnResult } from "openclaw/plugin-sdk/process-runtime";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -6,6 +7,61 @@ import {
   runCrabboxCommand,
   stopCrabboxLease,
 } from "./crabbox-worker-command.js";
+
+const commandLog = vi.hoisted(() => vi.fn());
+vi.mock("openclaw/plugin-sdk/logging-core", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("openclaw/plugin-sdk/logging-core")>()),
+  createSubsystemLogger: () => ({ info: commandLog }),
+}));
+
+it("records settled CLI facts before preserving caller cancellation and unknown remote effects", async () => {
+  commandLog.mockReset();
+  const pending = createDeferred<SpawnResult>();
+  const controller = new AbortController();
+  const reason = new Error("private-caller-reason");
+  const request = runCrabboxCommand({
+    action: "node runtime preparation",
+    args: ["run", "private-argv"],
+    binary: "crabbox",
+    timeoutMs: 1000,
+    signal: controller.signal,
+    diagnostics: { operationId: "operation-1", leaseId: "cbx_1", stage: "runtime-preparation" },
+    runCommand: () => pending.promise,
+  });
+  const outcome = request.catch((error: unknown) => error);
+  try {
+    expect(commandLog).toHaveBeenCalledWith(
+      "crabbox command",
+      expect.objectContaining({ disposition: "runner_invoked", remoteEffects: "unknown" }),
+    );
+    controller.abort(reason);
+  } finally {
+    pending.resolve({
+      ...absentResult,
+      pid: 17,
+      code: 0,
+      stderr: "private-stderr",
+      stdout: "private-stdout",
+    });
+    await outcome;
+  }
+  expect(await outcome).toBe(reason);
+  expect(commandLog).toHaveBeenCalledWith(
+    "crabbox command",
+    expect.objectContaining({
+      disposition: "runner_settled",
+      provisionStage: "runtime-preparation",
+      pid: 17,
+      exitCode: 0,
+      termination: "exit",
+      callerAborted: true,
+      remoteEffects: "unknown",
+    }),
+  );
+  const records = commandLog.mock.calls.map(([, fields]) => fields);
+  expect(records.every((record) => record.commandId === records[0].commandId)).toBe(true);
+  expect(JSON.stringify(records)).not.toContain("private-");
+});
 
 const LEASE_ID = "cbx_0123456789ab";
 const readError = `coordinator GET /v1/leases/${LEASE_ID}: http 404: {"error":"not_found"}`;

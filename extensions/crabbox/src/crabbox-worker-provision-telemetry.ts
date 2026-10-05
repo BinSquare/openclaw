@@ -1,4 +1,8 @@
+import { createSubsystemLogger } from "openclaw/plugin-sdk/logging-core";
 import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
+const abortLog = createSubsystemLogger("crabbox/provision");
+const ABORT_SOURCES = ["caller", "project", "runtime"] as const;
+type AbortSource = (typeof ABORT_SOURCES)[number];
 export type CrabboxProvisionStageEvent = {
   leaseId: string;
   operationId: string;
@@ -7,13 +11,43 @@ export type CrabboxProvisionStageEvent = {
   totalElapsedMs: number;
   outcome: "started" | "completed" | "failed";
   errorCode?: string;
+  runtimeCache?: {
+    expectedSha256: string;
+    homeCategory: "root" | "other";
+    uidCategory: "root" | "non-root" | "unavailable";
+    cacheHit: boolean;
+    missReason: "none" | "runtime_missing" | "worker_archive_missing" | "verification_failed";
+  };
+  firstAbortSource?: AbortSource | "unknown" | "none";
+  abortedSources?: AbortSource[];
+  abortReasonCategory?: "abort" | "deadline" | "unknown";
 };
 
 type Emit = (event: CrabboxProvisionStageEvent) => void;
 
 function errorCode(error: unknown): string {
-  const name = error instanceof Error ? error.name : "unknown";
-  return /^[A-Za-z][A-Za-z0-9]{0,39}$/.test(name) ? name : "unknown";
+  try {
+    const name = error instanceof Error ? error.name : "unknown";
+    return /^[A-Za-z][A-Za-z0-9]{0,39}$/.test(name) ? name : "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+function abortReasonCategory(reason: unknown): "abort" | "deadline" | "unknown" {
+  try {
+    if (reason instanceof DOMException) {
+      if (reason.name === "TimeoutError") {
+        return "deadline";
+      }
+      if (reason.name === "AbortError") {
+        return "abort";
+      }
+    }
+  } catch {
+    // An opaque reason stays private and cannot prevent signal observation.
+  }
+  return "unknown";
 }
 
 export function createCrabboxProvisionTelemetry(
@@ -30,8 +64,50 @@ export function createCrabboxProvisionTelemetry(
       // Telemetry is observational and cannot change provider custody.
     }
   };
-  const stage = async <T>(name: string, run: () => Promise<T>): Promise<T> => {
+  const stage = async <T>(
+    name: string,
+    run: () => Promise<T>,
+    signals?: Partial<Record<AbortSource, AbortSignal>>,
+  ): Promise<T> => {
     const stageStartedAt = now();
+    const abortedSources = () => ABORT_SOURCES.filter((source) => signals?.[source]?.aborted);
+    const initial = abortedSources();
+    let firstAbortSource: CrabboxProvisionStageEvent["firstAbortSource"] =
+      initial.length === 0 ? "none" : initial.length === 1 ? initial[0] : "unknown";
+    let reason: unknown = initial.length === 1 ? signals?.[initial[0]!]?.reason : undefined;
+    const observation = () =>
+      signals
+        ? {
+            firstAbortSource,
+            abortedSources: abortedSources(),
+            abortReasonCategory: abortReasonCategory(reason),
+          }
+        : {};
+    const listeners = ABORT_SOURCES.flatMap((source) => {
+      const signal = signals?.[source];
+      if (!signal || signal.aborted) {
+        return [];
+      }
+      const observe = () => {
+        if (firstAbortSource !== "none") {
+          return;
+        }
+        firstAbortSource = abortedSources().length === 1 ? source : "unknown";
+        reason = firstAbortSource === "unknown" ? undefined : signal.reason;
+        try {
+          abortLog.info("worker provision signal aborted", {
+            operationId,
+            leaseId,
+            stage: name,
+            ...observation(),
+          });
+        } catch {
+          // The first signal observation cannot close or settle the operation.
+        }
+      };
+      signal.addEventListener("abort", observe, { once: true });
+      return [{ signal, observe }];
+    });
     publish({
       leaseId,
       operationId,
@@ -39,6 +115,7 @@ export function createCrabboxProvisionTelemetry(
       elapsedMs: 0,
       totalElapsedMs: stageStartedAt - startedAt,
       outcome: "started",
+      ...observation(),
     });
     try {
       const result = await run();
@@ -49,6 +126,7 @@ export function createCrabboxProvisionTelemetry(
         elapsedMs: now() - stageStartedAt,
         totalElapsedMs: now() - startedAt,
         outcome: "completed",
+        ...observation(),
       });
       return result;
     } catch (error) {
@@ -60,8 +138,13 @@ export function createCrabboxProvisionTelemetry(
         totalElapsedMs: now() - startedAt,
         outcome: "failed",
         errorCode: errorCode(error),
+        ...observation(),
       });
       throw error;
+    } finally {
+      for (const { signal, observe } of listeners) {
+        signal.removeEventListener("abort", observe);
+      }
     }
   };
   return { stage };
@@ -83,6 +166,7 @@ const WORKER_STAGES = new Set([
   "installation",
   "activation",
   "plugin-activation",
+  "cache",
 ]);
 /** Project only the allowlisted remote milestone; never log arbitrary command output. */
 export function createCrabboxWorkerStageObserver(leaseId: string, operationId: string, emit: Emit) {
@@ -125,6 +209,33 @@ export function createCrabboxWorkerStageObserver(leaseId: string, operationId: s
         ) {
           continue;
         }
+        let runtimeCache: CrabboxProvisionStageEvent["runtimeCache"];
+        if (event.stage === "cache") {
+          const cache = event.runtimeCache;
+          if (
+            !isRecord(cache) ||
+            typeof cache.expectedSha256 !== "string" ||
+            !/^[a-f0-9]{64}$/.test(cache.expectedSha256) ||
+            (cache.homeCategory !== "root" && cache.homeCategory !== "other") ||
+            (cache.uidCategory !== "root" &&
+              cache.uidCategory !== "non-root" &&
+              cache.uidCategory !== "unavailable") ||
+            typeof cache.cacheHit !== "boolean" ||
+            (cache.missReason !== "none" &&
+              cache.missReason !== "runtime_missing" &&
+              cache.missReason !== "worker_archive_missing" &&
+              cache.missReason !== "verification_failed")
+          ) {
+            continue;
+          }
+          runtimeCache = {
+            expectedSha256: cache.expectedSha256,
+            homeCategory: cache.homeCategory,
+            uidCategory: cache.uidCategory,
+            cacheHit: cache.cacheHit,
+            missReason: cache.missReason,
+          };
+        }
         try {
           emit({
             leaseId,
@@ -133,6 +244,7 @@ export function createCrabboxWorkerStageObserver(leaseId: string, operationId: s
             elapsedMs: event.elapsedMs,
             totalElapsedMs: event.totalElapsedMs,
             outcome: event.outcome,
+            ...(runtimeCache ? { runtimeCache } : {}),
             ...(event.outcome === "failed" ? { errorCode: "bootstrap_failed" } : {}),
           });
         } catch {
