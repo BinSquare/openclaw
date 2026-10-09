@@ -28,7 +28,6 @@ import type {
 import { SessionPendingInputCustodyError } from "./session-pending-input-custody-error.js";
 import type { SessionPendingInputState } from "./session-pending-input-receipt.types.js";
 
-export type { SessionPendingInputState } from "./session-pending-input-receipt.types.js";
 export type SessionPendingInput = {
   id: string;
   runId: string;
@@ -391,6 +390,12 @@ export function writeSessionInputCompletion(
   outcome: AgentRunTerminalOutcome,
 ): AgentRunTerminalOutcome {
   const retained = readSessionInputCompletion(database, scope);
+  if (
+    retained &&
+    (retained.run_id !== scope.runId || retained.request_hash !== scope.requestHash)
+  ) {
+    throw new SessionPendingInputCustodyError("Input completion conflicts with the accepted input");
+  }
   if (retained && isFinalInputCompletion(retained.outcome)) {
     return retained.outcome;
   }

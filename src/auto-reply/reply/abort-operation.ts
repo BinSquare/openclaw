@@ -30,8 +30,7 @@ import {
   normalizeAgentId,
   parseAgentSessionKey,
 } from "../../routing/session-key.js";
-import { resolveCommandAuthorization } from "../command-auth.js";
-import type { FinalizedRuntimeMsgContext } from "../templating.js";
+import { resolveCommandAuthorizationAsync } from "../command-auth.js";
 import {
   type AbortCutoff,
   resolveAbortCutoffFromContext,
@@ -156,24 +155,6 @@ function resolveStoredSessionId(params: {
   }
 }
 
-async function resolveBoundAcpAbortTargetSessionKey(params: {
-  ctx: FinalizedRuntimeMsgContext;
-  cfg: OpenClawConfig;
-  activeSessionKey: string;
-}): Promise<string | undefined> {
-  const bindingContext = resolveSessionConversationBindingContext(params.cfg, params.ctx);
-  if (!bindingContext) {
-    return undefined;
-  }
-  return resolveEffectiveResetTargetSessionKey({
-    cfg: params.cfg,
-    ...bindingContext,
-    activeSessionKey: params.activeSessionKey,
-    skipConfiguredFallbackWhenActiveSessionNonAcp: false,
-    fallbackToActiveAcpWhenUnbound: false,
-  });
-}
-
 export async function stopSubagentsForRequester(params: {
   cfg: OpenClawConfig;
   requesterSessionKey?: string;
@@ -252,7 +233,7 @@ export async function executeFastAbortRequest(
   const { ctx, cfg } = params;
   const { commandSessionKey, targetKey, resolveTargetAgentId } = request;
 
-  const auth = resolveCommandAuthorization({
+  const auth = await resolveCommandAuthorizationAsync({
     ctx,
     cfg,
     commandAuthorized: ctx.CommandAuthorized,
@@ -340,19 +321,22 @@ export async function executeFastAbortRequest(
               lifecycleRevision: resolvedAbortTarget.entry.lifecycleRevision ?? null,
             }
           : undefined,
-        assertCurrent: () => {
-          if (params.isCommandTargetCurrent?.() === false) {
-            throw new Error("The selected session changed before it could be stopped.");
-          }
-        },
+        assertCurrent,
         beforeKill: async (sealRootSelection) => {
           assertCurrent();
+          const bindingContext = commandSessionKey
+            ? resolveSessionConversationBindingContext(cfg, ctx)
+            : undefined;
           const conversationBoundAcpTargetKey = commandSessionKey
-            ? await resolveBoundAcpAbortTargetSessionKey({
-                ctx,
-                cfg,
-                activeSessionKey: commandSessionKey,
-              })
+            ? await (bindingContext
+                ? resolveEffectiveResetTargetSessionKey({
+                    cfg,
+                    ...bindingContext,
+                    activeSessionKey: commandSessionKey,
+                    skipConfiguredFallbackWhenActiveSessionNonAcp: false,
+                    fallbackToActiveAcpWhenUnbound: false,
+                  })
+                : undefined)
             : undefined;
           const boundAcpTargetKey = !isAcpSessionKey(resolvedTargetKey)
             ? conversationBoundAcpTargetKey

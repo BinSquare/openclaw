@@ -1,5 +1,6 @@
 import {
   assertOperatorModelAllowed,
+  createOperatorModelSelectionAssertion,
   type AdmittedRunOperatorAuthority,
 } from "../agents/admitted-run-context.js";
 import { resolveAgentDir, type AgentModelPrimaryWriteTarget } from "../agents/agent-scope.js";
@@ -32,11 +33,15 @@ import {
   SESSION_MODEL_OVERRIDE_TRANSACTION_FIELDS,
   sessionModelOverrideChangesApplied,
 } from "../config/sessions/session-snapshot-merge.js";
+import { composeSessionSourceAssertion } from "../config/sessions/session-source-authority.js";
 import type { InternalSessionEntry as SessionEntry } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { triggerSessionPatchHook } from "../gateway/session-patch-hooks.js";
 import { resolveSessionWorkerPlacementContext } from "../gateway/session-worker-placement-context.js";
-import { resolveWorkerPlacementSessionRuntimeCapabilities } from "../gateway/worker-environments/placement-session-runtime.js";
+import {
+  resolveWorkerPlacementSessionRuntimeCapabilities,
+  resolveWorkerPlacementSessionRuntimeCapabilitiesAsync,
+} from "../gateway/worker-environments/placement-session-runtime.js";
 import { readSessionWorkerPlacementAsync } from "../gateway/worker-environments/session-placement-lifecycle.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { resolveSystemEventQueueKey } from "../infra/system-event-ownership.js";
@@ -84,6 +89,8 @@ export type ApplySessionModelSelectionParams = {
 
 export type InternalApplySessionModelSelectionParams = ApplySessionModelSelectionParams & {
   operatorAuthority?: AdmittedRunOperatorAuthority;
+  /** Set only by the released SDK adapter for its opaque synchronous validator. */
+  nativeCommitValidation?: true;
 };
 
 export type ApplySessionModelSelectionResult =
@@ -136,7 +143,10 @@ function resolveActivePlacementModelSelectionError(
     sessionKey: string;
     entry: SessionEntry;
   },
-  prepared?: { placement: Awaited<ReturnType<typeof readSessionWorkerPlacementAsync>> },
+  prepared?: {
+    placement: Awaited<ReturnType<typeof readSessionWorkerPlacementAsync>>;
+    runtime?: ReturnType<typeof resolveWorkerPlacementSessionRuntimeCapabilities>;
+  },
 ): string | undefined {
   const sessionId = params.entry.sessionId;
   if (!sessionId) {
@@ -149,12 +159,14 @@ function resolveActivePlacementModelSelectionError(
   if (!placement || placement.state === "local") {
     return undefined;
   }
-  const { executionMode } = resolveWorkerPlacementSessionRuntimeCapabilities({
-    cfg: params.cfg,
-    entry: params.entry,
-    agentId: params.agentId,
-    sessionKey: params.sessionKey,
-  });
+  const { executionMode } =
+    prepared?.runtime ??
+    resolveWorkerPlacementSessionRuntimeCapabilities({
+      cfg: params.cfg,
+      entry: params.entry,
+      agentId: params.agentId,
+      sessionKey: params.sessionKey,
+    });
   if (executionMode === placement.executionMode) {
     return undefined;
   }
@@ -307,6 +319,19 @@ export async function applySessionModelSelectionInternal(
       };
     }
   }
+  const placement = await readSessionWorkerPlacementAsync({
+    context: resolveSessionWorkerPlacementContext(),
+    sessionId: nextEntry.sessionId,
+  });
+  const placementRuntime =
+    placement && placement.state !== "local"
+      ? await resolveWorkerPlacementSessionRuntimeCapabilitiesAsync({
+          cfg: params.cfg,
+          agentId: params.agentId,
+          sessionKey: params.sessionKey,
+          entry: nextEntry,
+        })
+      : undefined;
   const placementError = resolveActivePlacementModelSelectionError(
     {
       cfg: params.cfg,
@@ -315,10 +340,8 @@ export async function applySessionModelSelectionInternal(
       entry: nextEntry,
     },
     {
-      placement: await readSessionWorkerPlacementAsync({
-        context: resolveSessionWorkerPlacementContext(),
-        sessionId: nextEntry.sessionId,
-      }),
+      placement,
+      runtime: placementRuntime,
     },
   );
   if (placementError) {
@@ -331,7 +354,8 @@ export async function applySessionModelSelectionInternal(
   // durable write commits. Revalidate placement inside the synchronous commit boundary so an
   // override that became incompatible during that window is rejected without mutating state.
   const validateCommit = () =>
-    validateSelection() ??
+    params.validateAuthProfileSelection?.() ??
+    prepared.validateRuntimeSelection?.() ??
     resolveActivePlacementModelSelectionError({
       cfg: params.cfg,
       agentId: params.agentId,
@@ -348,7 +372,12 @@ export async function applySessionModelSelectionInternal(
       reassertLiveModelSwitchPending: selectionChanged && nextEntry.liveModelSwitchPending === true,
       requireModelSelectionUnlocked: true,
       touchedFields: SESSION_MODEL_OVERRIDE_TRANSACTION_FIELDS,
+      commitGuard: composeSessionSourceAssertion([
+        operatorScope?.assertCurrent,
+        createOperatorModelSelectionAssertion(operatorAuthority, selectedRef),
+      ]),
       validateCommit,
+      nativeCommitValidation: params.nativeCommitValidation,
     });
     if (persistence.entry) {
       params.sessionStore[params.sessionKey] = persistence.entry;
@@ -377,7 +406,7 @@ export async function applySessionModelSelectionInternal(
     }
     persistedEntry = persistence.entry;
   } else {
-    const commitError = validateCommit();
+    const commitError = validateOperatorSelection() ?? validateCommit();
     if (commitError) {
       return { status: "rejected", reason: "not-allowed", message: commitError };
     }

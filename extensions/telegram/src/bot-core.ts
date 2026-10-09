@@ -5,12 +5,12 @@ import {
 } from "openclaw/plugin-sdk/channel-policy";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
-  registerSessionBindingAdapter,
+  registerSessionBindingAdapterV2,
   resolveThreadBindingIdleTimeoutMsForChannel,
   resolveThreadBindingMaxAgeMsForChannel,
   resolveThreadBindingSpawnPolicy,
   unregisterSessionBindingAdapter,
-  type SessionBindingAdapter,
+  type SessionBindingAdapterV2,
 } from "openclaw/plugin-sdk/conversation-runtime";
 import { formatErrorMessage, formatUncaughtError } from "openclaw/plugin-sdk/error-runtime";
 import {
@@ -45,7 +45,6 @@ import {
   TelegramSpooledReplayProcessingError,
 } from "./bot-processing-outcome.js";
 import { createTelegramUpdateTracker } from "./bot-update-tracker.js";
-import type { TelegramUpdateKeyContext } from "./bot-updates.js";
 import { apiThrottler, Bot, type ApiClientOptions } from "./bot.runtime.js";
 import type { TelegramBotOptions } from "./bot.types.js";
 import {
@@ -127,11 +126,6 @@ export async function createTelegramBotCore(
 
   const initialUpdateId =
     typeof opts.updateOffset?.lastUpdateId === "number" ? opts.updateOffset.lastUpdateId : null;
-  const logSkippedUpdate = (key: string) => {
-    if (shouldLogVerbose()) {
-      logVerbose(`telegram dedupe: skipped ${key}`);
-    }
-  };
   const updateTracker = createTelegramUpdateTracker({
     initialUpdateId,
     persistenceFloorUpdateId:
@@ -145,10 +139,13 @@ export async function createTelegramBotCore(
     onPersistError: (err) => {
       runtime.error?.(`telegram: failed to persist update watermark: ${formatErrorMessage(err)}`);
     },
-    onSkip: logSkippedUpdate,
+    onSkip: (key) => {
+      if (shouldLogVerbose()) {
+        logVerbose(`telegram dedupe: skipped ${key}`);
+      }
+    },
   });
-  const shouldSkipUpdate = (ctx: TelegramUpdateKeyContext) =>
-    updateTracker.shouldSkipHandlerDispatch(ctx);
+  const shouldSkipUpdate = updateTracker.shouldSkipHandlerDispatch;
 
   bot.use(async (ctx, next) => {
     const begin = updateTracker.beginUpdate(ctx);
@@ -303,59 +300,53 @@ export async function createTelegramBotCore(
     return resolveTelegramScopedGroupConfig(turnTelegramCfg, chatId, messageThreadId);
   };
 
-  const { nativeCommandNames, nativeCommandCallbackDispatcher } = registerTelegramNativeCommands({
+  const botContext = {
     bot,
-    cfg,
     runtime,
+    opts: runtimeOpts,
+    telegramDeps,
+    resolveTelegramGroupConfig,
+  };
+  const { nativeCommandNames, nativeCommandCallbackDispatcher } = registerTelegramNativeCommands({
+    ...botContext,
+    cfg,
     accountId: account.accountId,
     telegramCfg,
     mediaMaxBytes,
     nativeEnabled,
     nativeSkillsEnabled,
     resolveGroupPolicy,
-    resolveTelegramGroupConfig,
     shouldSkipUpdate,
-    opts: runtimeOpts,
     telegramDeps: {
       ...telegramDeps,
       sendMessageTelegram: defaultTelegramNativeCommandDeps.sendMessageTelegram,
     },
   });
-
-  const processMessage = createTelegramMessageProcessor({
+  const messageContext = {
+    ...botContext,
     nativeCommandNames,
-    bot,
-    account,
     logger,
     resolveGroupActivation,
     resolveGroupRequireMention,
-    resolveTelegramGroupConfig,
+  };
+  const processMessage = createTelegramMessageProcessor({
+    ...messageContext,
+    account,
     sendChatActionHandler,
-    runtime,
     buildContext: opts.buildContext,
-    opts: runtimeOpts,
-    telegramDeps,
   });
 
   const handlers = createTelegramHandlers({
-    nativeCommandNames,
+    ...messageContext,
     cfg,
     accountId: account.accountId,
     ownerAgentId,
-    bot,
-    opts: runtimeOpts,
     telegramTransport,
-    runtime,
     mediaMaxBytes,
     telegramCfg,
     resolveGroupPolicy,
-    resolveGroupActivation,
-    resolveGroupRequireMention,
-    resolveTelegramGroupConfig,
     shouldSkipUpdate,
     processMessage,
-    logger,
-    telegramDeps,
   });
 
   handlers.register(nativeCommandCallbackDispatcher);
@@ -370,17 +361,37 @@ export async function createTelegramBotCore(
         maxAgeMs: resolveThreadBindingMaxAgeMsForChannel(threadBindingScope),
       })
     : null;
-  const disabledBindingAdapter: SessionBindingAdapter | undefined = threadBindingManager
+  let bindingOwnerStopped = false;
+  const disabledBindingAdapter: SessionBindingAdapterV2 | undefined = threadBindingManager
     ? undefined
     : {
+        version: 2,
+        assertCurrent: () => {
+          if (bindingOwnerStopped) {
+            throw new Error("Telegram thread binding manager was retired");
+          }
+        },
         channel: "telegram",
         accountId: account.accountId,
         capabilities: { bindSupported: false, unbindSupported: false, placements: [] },
+        touchAsync: async () => {},
+        listBySessionAsync: async () => [],
+        resolveByConversationAsync: async () => null,
+        inspectByConversationAsync: async () => null,
+        inspectByConversationsAsync: async (refs) => ({
+          bindings: refs.map(() => null),
+          assertCurrent: () => {
+            if (bindingOwnerStopped) {
+              throw new Error("Telegram thread binding manager was retired");
+            }
+          },
+        }),
         listBySession: () => [],
         resolveByConversation: () => null,
       };
   bot.stop = (async (...args: Parameters<typeof originalStop>) => {
     if (disabledBindingAdapter) {
+      bindingOwnerStopped = true;
       unregisterSessionBindingAdapter({
         channel: "telegram",
         accountId: account.accountId,
@@ -394,7 +405,7 @@ export async function createTelegramBotCore(
     }
   }) as typeof bot.stop;
   if (disabledBindingAdapter) {
-    registerSessionBindingAdapter(disabledBindingAdapter);
+    registerSessionBindingAdapterV2(disabledBindingAdapter);
   }
 
   return bot;
