@@ -49,17 +49,22 @@ export const prepareRepositoryRefRecovery: NonNullable<
     const [prefix, generatedId, extra] = prepared.branch.split("/");
     // Creation generates this branch from the workspace's own UUID. A receipt of
     // any publication attempt keeps recovery on the remote-branch path.
-    const unpublishedBase =
+    const unpublishedGeneratedBranch =
       !originalPublication.attempted &&
       !originalPublication.head &&
       /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u.test(prefix ?? "") &&
       generatedId === prepared.workspaceId &&
       extra === undefined &&
       prepared.requestedRef !== prepared.branch &&
-      prepared.requestedRef !== `refs/heads/${prepared.branch}` &&
-      prepared.baseCommit !== null
-        ? prepared.baseCommit
-        : undefined;
+      prepared.requestedRef !== `refs/heads/${prepared.branch}`;
+    const unpublishedBase = unpublishedGeneratedBranch ? prepared.baseCommit : null;
+    const initialUnpublished =
+      unpublishedGeneratedBranch &&
+      prepared.revision === 0 &&
+      prepared.baseCommit === null &&
+      prepared.baseManifestHash === null &&
+      prepared.checkpointRef === null &&
+      prepared.manifestHash === null;
     const assertCurrent = () => {
       identity.signal?.throwIfAborted();
       identity.assertCurrent();
@@ -82,15 +87,15 @@ export const prepareRepositoryRefRecovery: NonNullable<
       repository: {
         agentId: identity.agentId,
         url: prepared.url,
-        ref: prepared.branch,
+        ref: initialUnpublished ? (prepared.requestedRef ?? undefined) : prepared.branch,
         ...(unpublishedBase ? { baseCommit: unpublishedBase } : {}),
-        currentBranch: true,
+        ...(initialUnpublished ? {} : { currentBranch: true as const }),
       },
     });
     assertCurrent();
     await source.revalidate(identity.signal);
     assertCurrent();
-    if (source.branch !== prepared.branch) {
+    if (!initialUnpublished && source.branch !== prepared.branch) {
       throw new Error("Ephemeral worker recovery repository branch changed");
     }
     await store.advanceToPublishedHead({

@@ -180,6 +180,9 @@ describe("repository project admission", () => {
 
   it.each([
     "unpublished",
+    "uninitialized",
+    "uninitialized attempted",
+    "uninitialized checkpoint",
     "attempted",
     "deleted",
     "unknown effect",
@@ -197,11 +200,12 @@ describe("repository project admission", () => {
         url: repositoryUrl,
         requestedRef: state === "external branch" ? `refs/heads/${branch}` : "main",
         branch,
-        baseCommit: commit,
+        baseCommit: state.startsWith("uninitialized") ? null : commit,
         runSetupScript: false,
-        revision: 4,
+        revision: state.startsWith("uninitialized") ? 0 : 4,
         baseManifestHash: null,
-        checkpointRef: null,
+        checkpointRef:
+          state === "uninitialized checkpoint" ? "refs/openclaw/worker-results/held" : null,
         manifestHash: null,
         createdAtMs: 1,
         updatedAtMs: 1,
@@ -209,7 +213,11 @@ describe("repository project admission", () => {
       mocks.workspace.mockResolvedValue(workspace);
       mocks.publication.mockResolvedValue({
         current: () => ({
-          attempted: state === "attempted" || state === "deleted" || state === "unknown effect",
+          attempted:
+            state === "attempted" ||
+            state === "uninitialized attempted" ||
+            state === "deleted" ||
+            state === "unknown effect",
           unsettled: state === "unknown effect",
           head: state === "deleted" ? { pushed_head_commit: "e".repeat(40) } : undefined,
         }),
@@ -233,18 +241,22 @@ describe("repository project admission", () => {
         sessionId: "original",
         assertCurrent: () => {},
       });
-      if (state === "unpublished") {
+      if (state === "unpublished" || state === "uninitialized") {
         await recovered;
         expect(mocks.advance).toHaveBeenCalledWith(
           expect.objectContaining({
             workspaceId,
-            expectedRevision: 4,
+            expectedRevision: workspace.revision,
             branch,
             headCommit: commit,
             preserveRequestedRef: true,
           }),
         );
-        expect(requestPaths()).toContain(`/repos/acme/project/git/commits/${commit}`);
+        expect(requestPaths()).toContain(
+          state === "uninitialized"
+            ? "/repos/acme/project/commits/main"
+            : `/repos/acme/project/git/commits/${commit}`,
+        );
         expect(requestPaths().some((value) => value.includes("/commits/heads%2Fclawson"))).toBe(
           false,
         );
@@ -257,7 +269,11 @@ describe("repository project admission", () => {
           );
         }
       }
-      expect(workspace).toMatchObject({ revision: 4, branch, baseCommit: commit });
+      expect(workspace).toMatchObject({
+        revision: state.startsWith("uninitialized") ? 0 : 4,
+        branch,
+        baseCommit: state.startsWith("uninitialized") ? null : commit,
+      });
       expect(mocks.release).toHaveBeenCalledOnce();
     },
   );
