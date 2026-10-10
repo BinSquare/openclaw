@@ -12,6 +12,7 @@ import { runCommandWithTimeout } from "../process/exec.js";
 import {
   beginSessionWorkAdmission,
   runExclusiveSessionLifecycleMutation,
+  startSessionWorkAdmissionInterruption,
 } from "../sessions/session-lifecycle-admission.js";
 import { closeOpenClawAgentDatabasesForTest } from "../state/openclaw-agent-db.js";
 import { openOpenClawStateDatabase } from "../state/openclaw-state-db.js";
@@ -60,6 +61,63 @@ afterEach(async () => {
   await closeStateDatabaseForTest();
   lookup.value = undefined;
   await Promise.all(roots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })));
+});
+
+it("reports the first session lifecycle interruption after foreground dispatch while retaining background custody", async () => {
+  const root = telemetryDirs.make("dispatch-background-interruption-");
+  const entry = { sessionId: REQUEST.sessionId, lifecycleRevision: "original", updatedAt: 1 };
+  const target = {
+    storePath: path.join(root, "sessions.sqlite"),
+    canonicalKey: REQUEST.sessionKey,
+    storeKeys: [REQUEST.sessionKey],
+    agentId: REQUEST.agentId,
+    store: { [REQUEST.sessionKey]: entry },
+  };
+  const runtime = {
+    managedWorktrees: { findLiveByOwner: () => undefined },
+    resolveGatewaySessionStoreTargetWithStore: () => target,
+    resolveCanonicalSessionEntryFromStoreKeys: () => entry,
+  };
+  const background = createDeferred();
+  let owner: Parameters<Parameters<ReturnType<typeof createGatewayWorkerDispatchAdmission>>[1]>[1];
+  diagnostics.info.mockClear();
+  await createGatewayWorkerDispatchAdmission(async () => runtime)(
+    REQUEST,
+    async (_signal, preparation) => {
+      owner = preparation;
+      preparation!.track(background.promise);
+      return undefined;
+    },
+  );
+  expect(owner!.signal.aborted).toBe(false);
+  const reason = Object.assign(new Error("synthetic-private-stop-reason"), { code: "ABORT_ERR" });
+  const interruption = startSessionWorkAdmissionInterruption({
+    scope: target.storePath,
+    identities: [REQUEST.sessionKey],
+    reason,
+  });
+  startSessionWorkAdmissionInterruption({
+    scope: target.storePath,
+    identities: [REQUEST.sessionKey],
+    reason,
+  });
+  expect(owner!.signal.aborted).toBe(true);
+  expect(owner!.signal.reason).toBe(reason);
+  expect(() => owner!.assertCurrent()).toThrow(reason);
+  const events = diagnostics.info.mock.calls.filter(
+    ([message, facts]) =>
+      message === "worker placement stage" && facts.stage === "repository_preparation_interrupted",
+  );
+  expect(events).toHaveLength(1);
+  expect(events[0]![1]).toMatchObject({
+    sessionId: REQUEST.sessionId,
+    cancellationOwner: "session_lifecycle",
+    preparationPhase: "background",
+    innerDiagnosticCode: "ABORT_ERR",
+  });
+  expect(JSON.stringify(events)).not.toContain("synthetic-private-stop-reason");
+  background.resolve();
+  await interruption.released;
 });
 
 it.each(["completed", "failed"] as const)(

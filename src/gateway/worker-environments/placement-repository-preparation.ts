@@ -69,6 +69,12 @@ export async function prepareActiveRepository(params: {
     ownerEpoch: placement.activeOwnerEpoch,
     expectedGeneration: placement.generation,
   };
+  let preparationPhase:
+    | "intent"
+    | "source_validation"
+    | "workspace_sync"
+    | "post_sync_validation"
+    | "ready_publication" = "intent";
   try {
     assertCurrent();
     const intent = await params.environments.prepareProjectIntent(request.profileId, {
@@ -93,6 +99,7 @@ export async function prepareActiveRepository(params: {
         }),
     });
     assertCurrent();
+    preparationPhase = "source_validation";
     params.environments.assertPreparedIntentCurrent(request.profileId, intent);
     await params.environments.revalidatePreparedIntentRepository(
       request.profileId,
@@ -109,17 +116,20 @@ export async function prepareActiveRepository(params: {
     ) {
       throw new Error("Repository admission changed its exact source or pinned head");
     }
+    preparationPhase = "workspace_sync";
     const result = await params.sync({ ...repository, baseCommit: admitted.baseCommit });
     assertCurrent();
     if (result.mode !== "repository") {
       throw new Error("Repository synchronization returned no branch proof");
     }
+    preparationPhase = "post_sync_validation";
     await params.environments.revalidatePreparedIntentRepository(
       request.profileId,
       intent,
       request.repositoryPreparationSignal,
     );
     assertCurrent();
+    preparationPhase = "ready_publication";
     const ready = await params.placements.settleRepository(
       { ...owner, status: "ready", manifestRef: result.manifestRef },
       assertCurrent,
@@ -132,6 +142,9 @@ export async function prepareActiveRepository(params: {
       environmentId: placement.environmentId,
       ownerEpoch: placement.activeOwnerEpoch,
       diagnosticCode: "operation_failed",
+      preparationPhase,
+      preparationSignalAborted: request.repositoryPreparationSignal?.aborted ?? false,
+      operatorSignalAborted: request.operatorAuthority?.signal?.aborted ?? false,
       error,
     });
     try {

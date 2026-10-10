@@ -6,6 +6,7 @@ import { createDeferred } from "../../../test/helpers/promise.js";
 import { createAdmittedRunOperatorAuthority } from "../../agents/admitted-run-context.js";
 import { openOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
 import { closeStateDatabaseForTest } from "../../test-utils/database-cleanup.js";
+import * as diagnostics from "./placement-diagnostics.js";
 import { createPlacementFailureActions } from "./placement-dispatch-failure.js";
 import { createWorkerPlacementDispatchStartup } from "./placement-dispatch-startup.js";
 import { REQUEST } from "./placement-dispatch-test-fixtures.js";
@@ -37,6 +38,7 @@ it.each(["failed", "revoked"] as const)(
       const entered = createDeferred();
       const background: Promise<void>[] = [];
       const release = vi.fn();
+      const stage = vi.spyOn(diagnostics, "recordWorkerPlacementStage");
       let current = true;
       const authority = createAdmittedRunOperatorAuthority({
         profileId: "fixture",
@@ -145,6 +147,16 @@ it.each(["failed", "revoked"] as const)(
       });
       expect(tunnel.settleRepositoryWorkspace).toHaveBeenCalledWith("failed");
       expect(release).toHaveBeenCalledOnce();
+      expect(stage).toHaveBeenCalledWith(
+        REQUEST.sessionId,
+        "workspace_sync_failed",
+        expect.objectContaining({
+          preparationPhase: "intent",
+          preparationSignalAborted: false,
+          operatorSignalAborted: false,
+        }),
+      );
+      stage.mockRestore();
     } finally {
       await closeStateDatabaseForTest();
       await fs.rm(root, { recursive: true, force: true });
