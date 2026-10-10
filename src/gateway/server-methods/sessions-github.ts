@@ -11,6 +11,7 @@ import {
 import { raceWithTimeout } from "../../../packages/retry/src/index.js";
 import { resolveGitHubHost } from "../../agents/github-host-runtime.js";
 import type { GitHubIdentityPreparationObserver } from "../../agents/github-identity-preparation-timing.js";
+import { resolveConfiguredGitHubToolIdentity } from "../../agents/github-tool-identity.js";
 import {
   captureGatewayToolCallerAssertion,
   getGatewayToolCallerIdentity,
@@ -23,6 +24,7 @@ import { prepareControlUiSessionPrRead } from "../control-ui-session-pr-read.js"
 import {
   factoryPublicationPreflightCredential,
   prepareCurrentGitHubPublicationOptionsIdentity,
+  currentGitHubPublicationConfig,
   hasSupportedGitHubPublicationTarget,
   type PublicationSessionIdentity,
 } from "../github-publication-availability.js";
@@ -548,11 +550,19 @@ export const sessionsGitHubHandlers: GatewayRequestHandlers = {
           read.currentSession();
           enter("personal_status");
           const service = options.context.githubOAuthService?.personal;
-          if (read.personal.kind === "eligible" && !service) {
+          const action = read.personal.kind === "eligible" ? read.personal.action : null;
+          const configuredBot = () =>
+            (["agent", "system"] as const).some((scope) =>
+              resolveConfiguredGitHubToolIdentity({
+                config: currentGitHubPublicationConfig(),
+                agentId: read.session.agentId,
+                scope,
+              }),
+            );
+          if (action && !configuredBot() && !service) {
             throw new Error("GitHub connections are unavailable; retry after Gateway startup.");
           }
-          const action = read.personal.kind === "eligible" ? read.personal.action : null;
-          let personal = action ? await service!.status(action) : null;
+          let personal = action && !configuredBot() ? await service!.status(action) : null;
           const session = read.currentSession();
           const assertResponseCurrent = () => {
             deadline.signal.throwIfAborted();
@@ -584,6 +594,9 @@ export const sessionsGitHubHandlers: GatewayRequestHandlers = {
               shared = null;
             }
             assertResponseCurrent();
+          }
+          if (configuredBot()) {
+            personal = null;
           }
           options.respond(true, { personal, shared, pendingPersonal, latestShared });
         });

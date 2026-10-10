@@ -1,4 +1,8 @@
-import { prepareGitHubReadIdentity } from "../agents/github-tool-identity.js";
+import { tryResolveAmbientOwnerAgentId } from "../agents/agent-scope.js";
+import {
+  prepareGitHubReadIdentity,
+  resolveConfiguredGitHubToolIdentity,
+} from "../agents/github-tool-identity.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { getActiveSecretsRuntimeConfigSnapshot } from "../secrets/runtime-state.js";
 import { factoryGitHubActorEnvironment } from "./factory-github-actor.js";
@@ -7,6 +11,7 @@ import {
   readFactoryGitHubToken,
   type FactoryGitHubProofClaim,
 } from "./factory-github-proof.js";
+import { requestCurrentGitHubOAuthRefresh } from "./github-oauth-lifecycle.js";
 import type { GatewayClient } from "./server-methods/shared-types.js";
 import type { GatewayRequestContext } from "./server-methods/types.js";
 
@@ -20,7 +25,10 @@ export async function prepareGatewayProjectGitHubIdentity(params: {
   sessionKey?: string;
   factoryCredential?: { claim: FactoryGitHubProofClaim; assertCurrent: () => void };
 }) {
-  if (params.config.gateway?.projects?.nativeGitHubSearch !== true) {
+  const managed = (["agent", "system"] as const).some((scope) =>
+    resolveConfiguredGitHubToolIdentity({ config: params.config, agentId: params.agentId, scope }),
+  );
+  if (!managed && params.config.gateway?.projects?.nativeGitHubSearch !== true) {
     return undefined;
   }
   const purpose =
@@ -63,14 +71,32 @@ export async function prepareGatewayProjectGitHubIdentity(params: {
       : undefined,
     getCurrentConfig: params.context.getRuntimeConfig,
     assertActive,
-    // A protected identity executable owns token refresh and revalidation.
-    refresh: async () => {},
+    refresh: () => requestCurrentGitHubOAuthRefresh(params.agentId),
   });
-  if (
-    process.env.FACTORY_AUTH_MODE === "github" &&
-    identity.selection.source !== "system-detected"
-  ) {
-    throw new Error("Factory GitHub repository access requires its native broker identity.");
-  }
+  assertActive();
   return identity;
+}
+
+/** Project picker/clone have no session agent; use only an unambiguous configured owner. */
+export async function prepareConfiguredProjectGitHubIdentity(params: {
+  config: OpenClawConfig;
+  getCurrentConfig: () => OpenClawConfig;
+  assertCurrent: () => void;
+}) {
+  const agentId = tryResolveAmbientOwnerAgentId(params.config) ?? "";
+  if (
+    !(["agent", "system"] as const).some((scope) =>
+      resolveConfiguredGitHubToolIdentity({ config: params.config, agentId, scope }),
+    )
+  ) {
+    return undefined;
+  }
+  return prepareGitHubReadIdentity({
+    config: params.config,
+    sourceConfig: getActiveSecretsRuntimeConfigSnapshot()?.sourceConfig ?? params.config,
+    agentId,
+    getCurrentConfig: params.getCurrentConfig,
+    assertActive: params.assertCurrent,
+    refresh: () => requestCurrentGitHubOAuthRefresh(agentId),
+  });
 }

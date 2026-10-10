@@ -175,7 +175,6 @@ async function prepareWorkerGitHub(
           lifecycleRevision: workspace.loaded.entry.lifecycleRevision ?? null,
           assertCurrent: assertAuthority,
         }),
-        { usage: "execution" },
       );
     let identity: Awaited<ReturnType<typeof prepareCurrentGitHubPublicationIdentity>>;
     const identityStartedAt = performance.now();

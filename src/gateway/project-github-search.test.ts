@@ -74,6 +74,21 @@ describe("project GitHub search", () => {
     },
   );
 
+  it("keeps required bot authentication on rejected discovery reads", async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async (_input, init) => {
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer synthetic-required-bot");
+      return json({}, 401);
+    });
+    await expect(
+      searchRemoteProjects("required-bot-search", {
+        token: "synthetic-required-bot",
+        requireAuthentication: true,
+        fetchImpl,
+      }),
+    ).rejects.toMatchObject({ statusCode: 401 });
+    expect(fetchImpl).toHaveBeenCalled();
+  });
+
   it.each([302, 401])("rechecks reader authority before retrying HTTP %s", async (status) => {
     let current = true;
     const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async (input) => {

@@ -1,12 +1,18 @@
+import fs from "node:fs/promises";
+import path from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
+import * as oauthClient from "../agents/github-oauth-client.js";
 import * as nativeIdentity from "../agents/github-read-identity.js";
 import * as githubIdentity from "../agents/github-tool-identity.js";
+import * as configRuntime from "../config/config.js";
 import * as profiles from "../state/user-profile-list.js";
 import { redeemFactoryGitHubProof } from "./factory-github-proof.js";
 import * as oauthLifecycle from "./github-oauth-lifecycle.js";
 import {
   factoryPublicationPreflightCredential,
   prepareCurrentGitHubPublicationIdentity,
+  prepareCurrentGitHubPublicationOptionsIdentity,
 } from "./github-publication-availability.js";
 
 afterEach(() => {
@@ -141,5 +147,82 @@ it.each(["missing", "ambiguous", "revoked"] as const)(
     );
     expect(release).toHaveBeenCalledOnce();
     expect(read).toHaveBeenCalledTimes(state === "revoked" ? 1 : 0);
+  },
+);
+
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+it.each(["publication", "options"] as const)(
+  "uses the selected bot for Factory %s while retaining human authority",
+  async (usage) => {
+    vi.stubEnv("FACTORY_AUTH_MODE", "github");
+    vi.stubEnv("OPENCLAW_STATE_DIR", tempDirs.make("selected-bot-publication-"));
+    const profileId = "ghp_11111111111111111111111111111111";
+    let config = { tools: { github: { profileId } } };
+    vi.spyOn(configRuntime, "getRuntimeConfig").mockImplementation(() => config);
+    vi.spyOn(oauthLifecycle, "requestCurrentGitHubOAuthRefresh").mockResolvedValue();
+    const directory = githubIdentity.resolveManagedGitHubProfileDir({
+      agentId: "main",
+      scope: "system",
+      profileId,
+    });
+    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+    await fs.writeFile(
+      path.join(directory, "hosts.yml"),
+      "github.com:\n  oauth_token: synthetic-bot-token\n",
+      { mode: 0o600 },
+    );
+    const native = vi
+      .spyOn(nativeIdentity, "readNativeGitHubToken")
+      .mockRejectedValue(new Error("must not borrow native credentials"));
+    let current = true;
+    const assertCurrent = () => {
+      if (!current) throw new Error("human authority revoked");
+    };
+    const actor = { profileId: "human-profile", sessionKey: "agent:main:own", assertCurrent };
+    const credential = factoryPublicationPreflightCredential({
+      agentId: "main",
+      sessionKey: actor.sessionKey,
+      sessionId: "same-session",
+      lifecycleRevision: "same-life",
+      assertCurrent,
+    });
+    const verify = vi
+      .spyOn(oauthClient, "verifyGitHubCredential")
+      .mockImplementation(async (token) => {
+        expect(token).toBe("synthetic-bot-token");
+        return {
+          status: "available",
+          scopes: [],
+          account: { accountId: 202, login: "system-bot", avatarUrl: null },
+        };
+      });
+    const prepare = () =>
+      usage === "publication"
+        ? prepareCurrentGitHubPublicationIdentity("main", actor, credential)
+        : prepareCurrentGitHubPublicationOptionsIdentity("main", actor, credential);
+    expect(await prepare()).toMatchObject({
+      source: "system-configured",
+      account: { accountId: 202, login: "system-bot" },
+    });
+    verify.mockImplementation(async () => {
+      current = false;
+      return {
+        status: "available",
+        scopes: [],
+        account: { accountId: 202, login: "system-bot", avatarUrl: null },
+      };
+    });
+    await expect(prepare()).rejects.toThrow("human authority revoked");
+    current = true;
+    verify.mockImplementation(async () => {
+      config = { tools: { github: { profileId: "ghp_22222222222222222222222222222222" } } };
+      return {
+        status: "available",
+        scopes: [],
+        account: { accountId: 202, login: "system-bot", avatarUrl: null },
+      };
+    });
+    await expect(prepare()).rejects.toThrow("GitHub publication identity changed");
+    expect(native).not.toHaveBeenCalled();
   },
 );

@@ -117,17 +117,26 @@ export async function prepareCurrentGitHubPublicationIdentity(
   agentId: string,
   actor?: FactoryPublicationActor,
   credential?: FactoryPublicationCredential,
-  options?: { usage: "execution" },
 ): Promise<PreparedGitHubPublicationIdentity> {
   actor?.assertCurrent?.();
+  credential?.assertCurrent();
   await requestCurrentGitHubOAuthRefresh(agentId);
   actor?.assertCurrent?.();
   const snapshot = publicationConfigSnapshot();
-  const managedExecution =
-    options?.usage === "execution" &&
-    (["agent", "system"] as const).some((scope) =>
-      resolveConfiguredGitHubToolIdentity({ config: snapshot.config, agentId, scope }),
-    );
+  const managedExecution = (["agent", "system"] as const).some((scope) =>
+    resolveConfiguredGitHubToolIdentity({ config: snapshot.config, agentId, scope }),
+  );
+  const assertCurrent = () => {
+    actor?.assertCurrent?.();
+    credential?.assertCurrent();
+    if (currentGitHubPublicationConfig() !== snapshot.config) {
+      throw new Error("GitHub publication identity changed.");
+    }
+    if (process.env.FACTORY_AUTH_MODE === "github" && (!actor || !credential)) {
+      throw new Error("GitHub publication requires current actor and credential authority.");
+    }
+  };
+  assertCurrent();
   const prepare = (
     env?: NodeJS.ProcessEnv,
     readNativeCredential?: (env: NodeJS.ProcessEnv) => Promise<string | undefined>,
@@ -138,18 +147,12 @@ export async function prepareCurrentGitHubPublicationIdentity(
       agentId,
       env,
       readNativeCredential,
+      assertCurrent,
     });
   const identity = managedExecution
     ? await prepare()
     : await withFactoryPublicationIdentity(actor, credential, prepare);
-  actor?.assertCurrent?.();
-  if (
-    process.env.FACTORY_AUTH_MODE === "github" &&
-    identity.source !== "system-detected" &&
-    !managedExecution
-  ) {
-    throw new Error("Factory GitHub publication requires its native broker identity.");
-  }
+  assertCurrent();
   return identity;
 }
 
@@ -167,30 +170,45 @@ export async function prepareCurrentGitHubPublicationOptionsIdentity(
   const snapshot = publicationConfigSnapshot();
   observeGitHubIdentityPreparation(observePreparation, "credential_proof", "started");
   let proofPrepared = false;
-  const identity = await withFactoryPublicationIdentity(
-    actor,
-    credential,
-    (env, readNativeCredential) => {
-      proofPrepared = true;
-      observeGitHubIdentityPreparation(observePreparation, "credential_proof", "resolved");
-      return prepareGitHubPublicationOptionsIdentity({
-        config: snapshot.config,
-        sourceConfig: snapshot.sourceConfig,
-        agentId,
-        env,
-        readNativeCredential,
-        observePreparation,
-      });
-    },
+  const prepare = (
+    env?: NodeJS.ProcessEnv,
+    readNativeCredential?: (env: NodeJS.ProcessEnv) => Promise<string | undefined>,
+  ) => {
+    proofPrepared = true;
+    observeGitHubIdentityPreparation(observePreparation, "credential_proof", "resolved");
+    return prepareGitHubPublicationOptionsIdentity({
+      config: snapshot.config,
+      sourceConfig: snapshot.sourceConfig,
+      agentId,
+      env,
+      readNativeCredential,
+      observePreparation,
+      assertCurrent,
+    });
+  };
+  const managed = (["agent", "system"] as const).some((scope) =>
+    resolveConfiguredGitHubToolIdentity({ config: snapshot.config, agentId, scope }),
+  );
+  const assertCurrent = () => {
+    actor?.assertCurrent?.();
+    credential?.assertCurrent();
+    if (currentGitHubPublicationConfig() !== snapshot.config) {
+      throw new Error("GitHub publication identity changed.");
+    }
+    if (process.env.FACTORY_AUTH_MODE === "github" && (!actor || !credential)) {
+      throw new Error("GitHub publication requires current actor and credential authority.");
+    }
+  };
+  assertCurrent();
+  const identity = await (
+    managed ? prepare() : withFactoryPublicationIdentity(actor, credential, prepare)
   ).catch((error: unknown) => {
     if (!proofPrepared) {
       observeGitHubIdentityPreparation(observePreparation, "credential_proof", "rejected");
     }
     throw error;
   });
-  if (process.env.FACTORY_AUTH_MODE === "github" && identity.source !== "system-detected") {
-    throw new Error("Factory GitHub publication requires its native broker identity.");
-  }
+  assertCurrent();
   return identity;
 }
 
@@ -531,10 +549,7 @@ export async function prepareGitHubPublicationAvailability(
         throw new Error("GitHub publication session changed during availability.");
       }
     };
-    const equivalent =
-      preparation &&
-      (process.env.FACTORY_AUTH_MODE !== "github" ||
-        preparation.identity.source === "system-detected");
+    const equivalent = preparation;
     const identity = equivalent
       ? preparation.identity
       : await prepareCurrentGitHubPublicationIdentity(

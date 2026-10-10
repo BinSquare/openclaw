@@ -53,6 +53,7 @@ import {
   authorizeOperatorScopesForMethod,
   authorizeOperatorScopesForRequiredScope,
 } from "../method-scopes.js";
+import { prepareConfiguredProjectGitHubIdentity } from "../project-github-identity.js";
 import { readFactoryProjectToken } from "../project-github-proof.js";
 import { searchRemoteProjects } from "../project-github-search.js";
 import {
@@ -523,13 +524,24 @@ export function createProjectsHandlers(service: ProjectWorktreeService): Gateway
           }
         };
         assertCurrent();
-        const token = factoryEnv
-          ? await readFactoryProjectToken(
-              { client, context, signal, hasCurrentClientAuthority, assertCurrent },
-              "project-add",
-              params.gitUrl,
-            )
-          : githubApiToken(process.env, cfg);
+        const identity = await prepareConfiguredProjectGitHubIdentity({
+          config: cfg,
+          getCurrentConfig: context.getRuntimeConfig,
+          assertCurrent,
+        });
+        const assertCredentialCurrent = () => {
+          assertCurrent();
+          identity?.assertSelected();
+        };
+        const token = identity
+          ? identity.token
+          : factoryEnv
+            ? await readFactoryProjectToken(
+                { client, context, signal, hasCurrentClientAuthority, assertCurrent },
+                "project-add",
+                params.gitUrl,
+              )
+            : githubApiToken(process.env, cfg);
         assertCurrent();
         if (factoryEnv && !token) {
           throw new Error("Verified GitHub repository access is unavailable.");
@@ -538,7 +550,7 @@ export function createProjectsHandlers(service: ProjectWorktreeService): Gateway
           true,
           await materializeProjectClone(
             { cfg, gitUrl: params.gitUrl, name: params.name },
-            { signal, token, assertCurrent },
+            { signal, token, assertCurrent: assertCredentialCurrent },
           ),
           undefined,
         );
@@ -608,29 +620,41 @@ export function createProjectsHandlers(service: ProjectWorktreeService): Gateway
           }
         };
         assertCurrent();
-        const nativeToken = factoryEnv
-          ? await readFactoryProjectToken(
-              { client, context, signal, hasCurrentClientAuthority, assertCurrent },
-              "project-search",
-              params.query,
-            )
-          : cfg.gateway?.projects?.nativeGitHubSearch === true
-            ? await readCachedNativeGitHubToken(process.env)
-            : undefined;
+        const identity = await prepareConfiguredProjectGitHubIdentity({
+          config: cfg,
+          getCurrentConfig: context.getRuntimeConfig,
+          assertCurrent,
+        });
+        const assertCredentialCurrent = () => {
+          assertCurrent();
+          identity?.assertSelected();
+        };
+        const nativeToken = identity
+          ? identity.token
+          : factoryEnv
+            ? await readFactoryProjectToken(
+                { client, context, signal, hasCurrentClientAuthority, assertCurrent },
+                "project-search",
+                params.query,
+              )
+            : cfg.gateway?.projects?.nativeGitHubSearch === true
+              ? await readCachedNativeGitHubToken(process.env)
+              : undefined;
         if (factoryEnv && !nativeToken) {
           throw new Error("Verified GitHub repository access is unavailable.");
         }
         assertCurrent();
         const result = await searchRemoteProjects(params.query, {
-          assertCurrent,
+          assertCurrent: assertCredentialCurrent,
           signal,
           host,
           apiBaseUrl,
-          ...(factoryEnv || cfg.gateway?.projects?.nativeGitHubSearch === true
+          requireAuthentication: Boolean(identity),
+          ...(identity || factoryEnv || cfg.gateway?.projects?.nativeGitHubSearch === true
             ? { token: nativeToken ?? "" }
             : {}),
         });
-        assertCurrent();
+        assertCredentialCurrent();
         respond(true, result, undefined);
       },
       (error) => {

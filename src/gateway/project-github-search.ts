@@ -164,6 +164,7 @@ export async function searchRemoteProjects(
     fetchImpl?: typeof fetch;
     now?: number;
     token?: string;
+    requireAuthentication?: boolean;
     host?: string;
     apiBaseUrl?: string;
     assertCurrent?: () => void;
@@ -233,7 +234,7 @@ export async function searchRemoteProjects(
             apiBaseUrl,
           ),
         );
-      return optionalAuth
+      return optionalAuth && !options.requireAuthentication
         ? gitHubPublicApi.withOptionalGitHubAuth(token, readJson)
         : readJson(token);
     };

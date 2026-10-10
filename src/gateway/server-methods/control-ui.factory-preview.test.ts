@@ -1,7 +1,10 @@
+import fs from "node:fs/promises";
+import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core/expect";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 import * as oauth from "../../agents/github-oauth-client.js";
 import * as nativeIdentity from "../../agents/github-read-identity.js";
+import { resolveManagedGitHubProfileDir } from "../../agents/github-tool-identity.js";
 import { setRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
 import {
   createPluginRegistryFixture,
@@ -22,6 +25,7 @@ import {
   redeemFactoryGitHubProof,
   type FactoryGitHubProofVerdict,
 } from "../factory-github-proof.js";
+import * as oauthLifecycle from "../github-oauth-lifecycle.js";
 import { gitHubPublicApi } from "../github-public-api.js";
 import { createGatewayMethodRegistry } from "../methods/registry.js";
 import { handleGatewayRequest } from "../server-methods.js";
@@ -67,9 +71,13 @@ afterEach(() => {
 });
 
 describe("registered Factory session GitHub preview", () => {
-  it.each(["issue", "pull"] as const)(
-    "redeems the real reader's session proof before reading a literal Enterprise %s",
-    async (kind) => {
+  it.each([
+    { kind: "issue", bot: false },
+    { kind: "pull", bot: false },
+    { kind: "pull", bot: true },
+  ] as const)(
+    "reads a literal Enterprise $kind using the selected credential (bot=$bot)",
+    async ({ kind, bot }) => {
       vi.stubEnv("FACTORY_AUTH_MODE", "github");
       await withFixture("operator.read", async (f) => {
         // The admitted WebSocket fixture retains the actual registered client and current access grant.
@@ -94,10 +102,28 @@ describe("registered Factory session GitHub preview", () => {
           repositoryWorkspaceId: repository.workspaceId,
           lifecycleRevision: "preview-lifecycle",
         });
+        if (bot) {
+          const profileId = "ghp_11111111111111111111111111111111";
+          f.cfg.tools = { ...f.cfg.tools, github: { profileId } };
+          setRuntimeConfigSnapshot(f.cfg);
+          const directory = resolveManagedGitHubProfileDir({
+            agentId: "main",
+            scope: "system",
+            profileId,
+          });
+          await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+          await fs.writeFile(
+            path.join(directory, "hosts.yml"),
+            `${host}:\n  oauth_token: synthetic-bot-reader\n`,
+            { mode: 0o600 },
+          );
+          vi.spyOn(oauthLifecycle, "requestCurrentGitHubOAuthRefresh").mockResolvedValue();
+        }
         const number = kind === "pull" ? 17420 : 17436;
         const url = `https://${host}/bic/lobster/${kind === "pull" ? "pull" : "issues"}/${number}`;
         const claims: FactoryGitHubProofVerdict[] = [];
         vi.spyOn(nativeIdentity, "readNativeGitHubToken").mockImplementation(async (env) => {
+          expect(bot).toBe(false);
           expect(env?.GH_TOKEN).toBeUndefined();
           const claim = redeemFactoryGitHubProof(env?.[FACTORY_GITHUB_PROOF_ENV] ?? "");
           claims.push(claim);
@@ -125,7 +151,7 @@ describe("registered Factory session GitHub preview", () => {
           const target = new URL(input instanceof Request ? input.url : String(input));
           expect(target.origin).toBe(`https://api.${host}`);
           expect(new Headers(init?.headers).get("authorization")).toBe(
-            "Bearer synthetic-reader-token",
+            bot ? "Bearer synthetic-bot-reader" : "Bearer synthetic-reader-token",
           );
           const payload = target.pathname.endsWith("/commits")
             ? []
@@ -200,7 +226,11 @@ describe("registered Factory session GitHub preview", () => {
           ok: true,
           payload: { title: "Synthetic private item", url },
         });
-        expect(claims.length).toBeGreaterThan(0);
+        if (bot) {
+          expect(claims).toHaveLength(0);
+        } else {
+          expect(claims.length).toBeGreaterThan(0);
+        }
         expect(fetchImpl).toHaveBeenCalled();
       });
     },
