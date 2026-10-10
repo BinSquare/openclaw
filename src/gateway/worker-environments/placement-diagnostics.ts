@@ -65,6 +65,7 @@ type PlacementAwaitPhase =
 
 type PlacementStage =
   | `${"reclaim_" | "dispatch_" | ""}${PlacementAwaitPhase}_${"started" | "completed" | "failed"}`
+  | "node_tunnel_retired"
   | "repository_preparation_interrupted"
   | "dispatch_received"
   | "dispatch_joined"
@@ -183,6 +184,15 @@ export function recordWorkerPlacementStage(
       | "ready_publication";
     preparationSignalAborted?: boolean;
     operatorSignalAborted?: boolean;
+    rpcPhase?: "node_lookup" | "invoke" | "response";
+    failureKind?: "exception" | "response";
+    cancellationSource?: "tunnel_owner" | "command" | "deadline" | "none";
+    dispatchStarted?: boolean;
+    tunnelRetirementReason?:
+      | "owner_stop"
+      | "provider-destroying"
+      | "provider-destroyed"
+      | "workspace_drain_failed";
   } = {},
 ) {
   try {
@@ -208,6 +218,11 @@ export function recordWorkerPlacementStage(
       preparationPhase: facts.preparationPhase,
       preparationSignalAborted: facts.preparationSignalAborted,
       operatorSignalAborted: facts.operatorSignalAborted,
+      rpcPhase: facts.rpcPhase,
+      failureKind: facts.failureKind,
+      cancellationSource: facts.cancellationSource,
+      dispatchStarted: facts.dispatchStarted,
+      tunnelRetirementReason: facts.tunnelRetirementReason,
     });
   } catch {
     // A diagnostic sink cannot decide placement admission or settlement.
