@@ -9,14 +9,17 @@ export function retireTerminalMainSessionRecoverySource(
 ): void {
   const terminalSource = entry.restartRecoveryDeliverySourceRunId;
   const retained = entry.mainRestartRecovery;
+  const intent = retained?.turnIntent;
   if (
     terminalSource &&
     hasRestartRecoveryTerminalRun(entry, terminalSource) &&
-    retained?.turnIntent &&
-    retained.turnIntent.runId !== terminalSource &&
-    retained.turnIntent.sessionKey === sessionKey &&
+    intent &&
+    intent.runId !== terminalSource &&
+    intent.sessionKey === sessionKey &&
     isCapturedMainRestartTurnCurrent(entry) &&
-    !entry.restartRecoveryRuns?.length &&
+    (entry.restartRecoveryRuns ?? []).every(
+      (run) => run.runId === intent.runId && run.lifecycleGeneration === intent.lifecycleGeneration,
+    ) &&
     !entry.activeWriterRunId &&
     !entry.lifecycleRunId &&
     !entry.restartRecoveryDeliveryRunId &&
@@ -31,7 +34,8 @@ export function retireTerminalMainSessionRecoverySource(
     !entry.restartRecoveryGoal &&
     !retained.goalIntent
   ) {
-    // Clear only source selection; preserve the fresh cycle, issuer and effect hints.
+    // Orphan capture can restore the accepted turn fence. It owns that intent,
+    // not the old terminal delivery source; retain the fence and effect hints.
     entry.restartRecoveryDeliverySourceRunId = undefined;
   }
 }

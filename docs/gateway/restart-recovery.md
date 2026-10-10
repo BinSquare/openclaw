@@ -78,7 +78,10 @@ authority, or revoked caller still prevents reconciliation.
 
 When a terminal delivery source remains beside a different current accepted
 intent, recovery observation retires only that source ID after writer, delivery
-and recovery claims are absent. The current input keeps its original issuer and
+and active recovery claims are absent. Canonical orphan capture may retain run
+fences for that exact accepted intent and captured generation; observation keeps
+those fences while retiring the unrelated terminal source. Foreign or changed
+fences prevent retirement. The current input keeps its original issuer and
 custody; older interrupted inputs remain held. A changed or nonterminal source,
 revoked issuer, or unknown external effect still prevents admission.
 

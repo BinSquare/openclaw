@@ -23,6 +23,7 @@ import {
   readIssuerFixtureHistory,
 } from "./main-session-recovery-original-issuer.test-support.js";
 import * as recoveryStore from "./main-session-recovery-store.js";
+import { markOrphanedMainSessionForRecovery } from "./main-session-restart-recovery-marking.js";
 import { mainSessionRecoveryLog } from "./main-session-restart-recovery-shared.js";
 import * as restartRecovery from "./main-session-restart-recovery.js";
 
@@ -43,6 +44,8 @@ it.each([
   "wrong issuer intent",
   ...([
     "terminal source residue",
+    "terminal source captured run",
+    "terminal source foreign run",
     "changed source residue",
     "terminal source unknown effect",
   ] as const),
@@ -135,6 +138,52 @@ it.each([
         restartRecoveryTerminalRunIds: ["completed-prior-run"],
       });
     }
+    let later: Awaited<ReturnType<typeof stageSessionPendingInput>> = undefined;
+    if (mode === "terminal source captured run" || mode === "terminal source foreign run") {
+      // Canonical orphan capture repopulates the retained fence before a later turn.
+      expect(
+        await markOrphanedMainSessionForRecovery({
+          target,
+          expectedSessionId: sessionId,
+          cfg: fixture.cfg,
+        }),
+      ).toMatchObject({ marked: 1 });
+      expect(loadSessionEntry(target)?.restartRecoveryRuns).toEqual([
+        {
+          runId,
+          lifecycleGeneration:
+            loadSessionEntry(target)!.mainRestartRecovery!.turnIntent!.lifecycleGeneration,
+        },
+      ]);
+      later = await stageSessionPendingInput(scope, {
+        runId: "later-fresh-run",
+        message: {
+          role: "user",
+          content: "Later fresh turn",
+          timestamp: 3,
+          idempotencyKey: "later-fresh-run:user",
+        },
+        assertCurrent: authority.assertCurrent,
+        turnIssuerAdmission: captureGatewayTurnIssuerAdmission({
+          authority,
+          sessionKey,
+          sessionId,
+          lifecycleRevision: "original-revision",
+          runId: "later-fresh-run",
+          assertCurrent: authority.assertCurrent,
+        }),
+      });
+      if (mode === "terminal source foreign run") {
+        const entry = loadSessionEntry(target)!;
+        await replaceSessionEntry(target, {
+          ...entry,
+          restartRecoveryRuns: [
+            ...entry.restartRecoveryRuns!,
+            { runId: "foreign-run", lifecycleGeneration: "foreign-generation" },
+          ],
+        });
+      }
+    }
     if (mode === "unknown effect" || mode === "terminal source unknown effect") {
       await appendTranscriptMessage(scope, {
         message: {
@@ -192,12 +241,17 @@ it.each([
     vi.spyOn(restartRecovery, "retryRestartAbortedMainSessionRecovery").mockImplementation(
       async (request) => {
         const result = await retryActual(request);
-        if (mode === "current" || mode === "terminal source residue" || mode.startsWith("late ")) {
+        if (
+          mode === "current" ||
+          mode === "terminal source residue" ||
+          mode === "terminal source captured run" ||
+          mode.startsWith("late ")
+        ) {
           expect(result.currentInput?.kind).toBe("current-input");
         } else {
           expect(result.currentInput).toBeUndefined();
         }
-        if (mode === "changed source residue") {
+        if (mode === "changed source residue" || mode === "terminal source foreign run") {
           expect(result.authorityHold?.reason).toBe("source-mismatch");
         }
         if (mode === "late issuer revoke") {
@@ -230,7 +284,11 @@ it.each([
               }
               return await admit();
             });
-      if (mode !== "current" && mode !== "terminal source residue") {
+      if (
+        mode !== "current" &&
+        mode !== "terminal source residue" &&
+        mode !== "terminal source captured run"
+      ) {
         await expect(admission).rejects.toThrow(
           mode === "late issuer revoke"
             ? /access|role|authority/i
@@ -238,7 +296,7 @@ it.each([
               ? /changed|ownership ended/i
               : mode === "unknown effect" || mode === "terminal source unknown effect"
                 ? /paused|verified outcome/i
-                : mode === "changed source residue"
+                : mode === "changed source residue" || mode === "terminal source foreign run"
                   ? /original accepted authority|source-mismatch/i
                   : /Restart recovery failed|ownership ended/i,
         );
@@ -299,6 +357,14 @@ it.each([
         (await readSessionPendingInputStage(scope, `${runId}:user`, authority.assertCurrent))
           .existing,
       ).toMatchObject({ input_id: receipt.inputId, consumed_event_id: null });
+      if (later) {
+        expect(
+          (await readSessionPendingInputStage(scope, "later-fresh-run:user", () => {})).existing,
+        ).toMatchObject({ input_id: later.inputId, consumed_event_id: null });
+        expect(
+          loadSessionEntry(target)?.restartRecoveryRuns?.every((run) => run.runId === runId),
+        ).toBe(true);
+      }
       await receipt.runAsync!(() => appendTranscriptMessage(scope, { message: receipt.message }));
       expect(
         (await readIssuerFixtureHistory(target, sessionId)).filter(
@@ -314,6 +380,8 @@ it.each([
       if (operation?.status === "owned") {
         operation.operation.complete();
       }
+      later?.finish("interrupted");
+      await later?.settled?.();
       receipt.finish("interrupted");
       await receipt.settled?.();
       await fixture.work.runWhenIdle(() => {});
