@@ -311,11 +311,6 @@ function capturePlacementObservation(pathname: string, sessionId?: string) {
   return { authority, observation, owner, assertUsable };
 }
 
-/** Omit the session to fence non-local placements, including creations after an empty read. */
-function observePlacementAuthority(pathname: string, sessionId?: string) {
-  return capturePlacementObservation(pathname, sessionId).authority;
-}
-
 /** Refresh only unconsumed reads; retained observations and uncertain writes stay fenced. */
 export async function preparePlacementAuthorityRead<T>(
   pathname: string,
@@ -488,7 +483,7 @@ export async function preparePlacementWorkspaceResultAuthority(
   const claim = structuredClone(requestedClaim);
   claim.sessionId = required(claim.sessionId, "session id");
   const publicationSequence = owner.published.get(claim.sessionId) ?? 0;
-  const observation = observePlacementAuthority(pathname, claim.sessionId);
+  const { authority: observation } = capturePlacementObservation(pathname, claim.sessionId);
   try {
     const projection = await read([claim.sessionId]);
     context.admission.assertCurrent();
