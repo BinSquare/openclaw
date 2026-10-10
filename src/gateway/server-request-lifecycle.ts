@@ -17,6 +17,7 @@ import {
   retainGatewayRootWorkAdmissionContinuation,
 } from "../process/gateway-work-admission.js";
 import { AsyncWorkScope, getAsyncWorkSignal } from "../shared/async-work-scope.js";
+import { isGatewaySuspendedReaderMethod } from "./methods/core-method-policy.js";
 import { canSelectQuestion } from "./question-access.js";
 import type { GatewayRequestContext, GatewayRequestOptions } from "./server-methods/types.js";
 
@@ -27,20 +28,6 @@ const SUSPEND_CONTROL_METHODS = new Set([
   "gateway.suspend.handoff",
   "gateway.suspend.reader",
 ]);
-
-// Resolution uses the same frozen, access-scoped projection as session listing.
-const SUSPENDED_READER_METHODS = new Set([
-  "users.self",
-  "chat.history",
-  "chat.startup",
-  "sessions.list",
-  "sessions.describe",
-  "sessions.resolve",
-]);
-
-export function isGatewaySuspendedReaderMethod(method: string): boolean {
-  return SUSPENDED_READER_METHODS.has(method);
-}
 
 export function isGatewaySuspendControlMethod(method: string): boolean {
   return SUSPEND_CONTROL_METHODS.has(method);

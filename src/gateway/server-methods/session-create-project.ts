@@ -150,26 +150,26 @@ export function prepareSessionRepositoryWorkspace(
             ? {
                 readNativeCredential: async (_selectedEnv, admission) => {
                   assertCurrent();
-                  const env = factoryGitHubActorEnvironment(options.client, target.key);
-                  if (!env) {
+                  if (process.env.FACTORY_AUTH_MODE !== "github") {
                     throw new Error("Factory GitHub caller authority changed.");
                   }
-                  return await readFactoryGitHubToken(
-                    env,
-                    factoryGitHubClientProof({
-                      client: options.client,
-                      claim: {
-                        purpose: "session-create-project",
-                        binding: {
-                          kind: "session-create",
-                          agentId: target.agentId,
-                          sessionKey: target.key,
-                          ...(target.entry ? { sessionId: target.entry.sessionId } : {}),
-                          requestDigest: factoryGitHubRequestDigest(repository.url),
-                        },
+                  const proof = factoryGitHubClientProof({
+                    client: options.client,
+                    claim: {
+                      purpose: "session-create-project",
+                      binding: {
+                        kind: "session-create",
+                        agentId: target.agentId,
+                        sessionKey: target.key,
+                        ...(target.entry ? { sessionId: target.entry.sessionId } : {}),
+                        requestDigest: factoryGitHubRequestDigest(repository.url),
                       },
-                      assertCurrent,
-                    }),
+                    },
+                    assertCurrent,
+                  });
+                  return await readFactoryGitHubToken(
+                    factoryGitHubActorEnvironment(proof, target.key),
+                    proof,
                     admission,
                   );
                 },

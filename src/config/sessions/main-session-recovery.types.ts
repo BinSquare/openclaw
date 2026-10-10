@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { GoalRecoveryDecision } from "../../../packages/gateway-protocol/src/schema/sessions-goal.js";
 import type { SessionUnknownOutcomeDecision } from "../../../packages/gateway-protocol/src/schema/sessions-unknown-outcome.js";
 import type { GatewayAuthPolicy } from "../../gateway/auth-policy.types.js";
+import type { FactoryGitHubActor } from "../../gateway/factory-github-actor.js";
 import type { GatewayAccessGrantRef } from "../../plugins/gateway-access-policy.types.js";
 import { hasRestartRecoveryTerminalRun } from "./restart-recovery-state.js";
 import type { InternalSessionEntry } from "./types.js";
@@ -11,7 +12,7 @@ export type GoalRecoveryIssuerBasis = {
   version: 1;
   profileId: string;
   /** Immutable subject verified at original Factory admission, never a credential. */
-  factoryActor: Readonly<{ host: "microsoft.ghe.com"; accountId: number }>;
+  factoryActor: FactoryGitHubActor;
   assignedRole: string | null;
   rolePolicyGeneration: string | null;
   aliasBindingIds: readonly string[];

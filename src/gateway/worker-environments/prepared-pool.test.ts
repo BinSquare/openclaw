@@ -1,6 +1,6 @@
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { createDeferred } from "../../../test/helpers/promise.js";
+import { awaitGateBeforeSettlement, createDeferred } from "../../../test/helpers/promise.js";
 import {
   createGatewaySchedulerClock,
   createTestGatewayScheduler,
@@ -302,9 +302,21 @@ describe("prepared worker reserve lifecycle", () => {
     await fixture.attach(
       await fixture.ready(await fixture.seed("source-b", { projectKey: "1".repeat(64) })),
     );
-    await fixture.schedule(fixture.pool());
+    await fixture.attach(
+      await fixture.ready(await fixture.seed("source-c", { projectKey: "2".repeat(64) })),
+    );
+    const prepareIntent = vi.fn<PoolOptions["prepareIntent"]>(
+      async (_profileId, { projectPath }) => ({
+        providerId: fixture.provider.id,
+        profileSnapshot: fixture.profile(path.basename(projectPath!)),
+        preparationKey: PREPARATION_KEY,
+      }),
+    );
+    await fixture.schedule(fixture.pool({ prepareIntent }));
     const reserved = fixture.reserves();
     expect(reserved).toHaveLength(3);
+    // The shared cap bounds source admission work as well as committed rows.
+    expect(prepareIntent).toHaveBeenCalledTimes(2);
     const uncertain = reserved[0]!;
     await fixture.store.transition({
       environmentId: uncertain.environmentId,
@@ -453,6 +465,47 @@ describe("prepared worker reserve lifecycle", () => {
     expect(fixture.reserves()).toEqual([]);
     expect(reconcile).not.toHaveBeenCalled();
   });
+
+  it.each(["policy", "intent"] as const)(
+    "rechecks ordinary refill %s at the reserve database admission",
+    async (change) => {
+      await fixture.attach(await fixture.ready(await fixture.seed("source")));
+      const entered = createDeferred();
+      const release = createDeferred();
+      fixture.releases.push(() => release.resolve());
+      const ensure = fixture.store.ensurePreparedIntent.bind(fixture.store);
+      vi.spyOn(fixture.store, "ensurePreparedIntent").mockImplementationOnce(async (request) => {
+        entered.resolve();
+        await release.promise;
+        return ensure(request);
+      });
+      let intentCurrent = true;
+      const owner = fixture.pool({
+        assertIntentCurrent: () => {
+          if (!intentCurrent) {
+            throw new Error("preparation authority changed");
+          }
+        },
+      });
+      const maintaining = fixture.schedule(owner);
+      const rejected = expect(maintaining).rejects.toThrow(
+        change === "policy" ? "admission policy changed" : "preparation authority changed",
+      );
+      await awaitGateBeforeSettlement(
+        entered.promise,
+        maintaining,
+        "reserve admission not reached",
+      );
+      if (change === "policy") {
+        fixture.config.cloudWorkers!.preparedPool = { maxTotal: 0 };
+      } else {
+        intentCurrent = false;
+      }
+      release.resolve();
+      await rejected;
+      expect(fixture.reserves()).toEqual([]);
+    },
+  );
 
   it("runs only two preparations concurrently and drains admitted work after shutdown", async () => {
     fixture.developmentProfile.readyWorkers = 3;
@@ -750,9 +803,12 @@ describe("prepared worker reserve lifecycle", () => {
       finishDestroy.resolve();
     };
     fixture.releases.push(release);
-    const inspect = vi.fn(async () => {
-      inspected.resolve();
-      await finishInspection.promise;
+    const inspect = vi.fn<typeof fixture.provider.inspect>(async ({ leaseId }) => {
+      // Reserve cleanup also inspects; only the unrelated reconciliation is slow.
+      if (leaseId === "lease:slow-inspection") {
+        inspected.resolve();
+        await finishInspection.promise;
+      }
       return { status: "active" as const };
     });
     fixture.provider.inspect = inspect;
@@ -817,7 +873,9 @@ describe("prepared worker reserve lifecycle", () => {
         wakes.push(time.advanceBy(IDLE_TIMEOUT_MS));
         await Promise.resolve();
         expect(maintainProviders).toHaveBeenCalledTimes(sweep + 1);
-        expect(inspect).toHaveBeenCalledOnce();
+        expect(
+          inspect.mock.calls.filter(([lease]) => lease.leaseId === "lease:slow-inspection"),
+        ).toHaveLength(1);
         if (sweep < 2) {
           await destroyed.promise;
           expect(fixture.store.get(id)?.state).toBe("destroyed");
@@ -838,7 +896,12 @@ describe("prepared worker reserve lifecycle", () => {
       expect(closeArtifacts).toHaveBeenCalledOnce();
       expect(fixture.store.get("reserve-2")?.state).toBe("destroyed");
       await time.advanceBy(IDLE_TIMEOUT_MS);
-      expect(inspect).toHaveBeenCalledOnce();
+      expect(inspect.mock.calls.map(([lease]) => lease.leaseId)).toEqual([
+        "lease:slow-inspection",
+        "lease:reserve-0",
+        "lease:reserve-1",
+        "lease:reserve-2",
+      ]);
       expect(maintainProviders).toHaveBeenCalledTimes(3);
     } finally {
       release();
@@ -884,7 +947,10 @@ describe("prepared worker reserve lifecycle", () => {
     await entered.promise;
     expect(guard).not.toHaveBeenCalled();
     expect(fixture.provider.provision).not.toHaveBeenCalled();
-    expect(fixture.provider.inspect).not.toHaveBeenCalled();
+    expect(fixture.provider.inspect).toHaveBeenCalledExactlyOnceWith({
+      leaseId: reserve.leaseId,
+      profile: {},
+    });
     let stopped = false;
     const stopping = fixture.service.stop().then(() => {
       stopped = true;

@@ -41,7 +41,6 @@ import {
 import { isTrustedSecretSurfaceUnavailableError } from "../../secrets/runtime-degraded-state.js";
 import { readCurrentUserProfileAliases } from "../../state/user-profile-list.js";
 import { configuredDefaultRepository } from "../configured-default-repository.js";
-import { factoryGitHubActorEnvironment } from "../factory-github-actor.js";
 import { readGatewayAccessRevision } from "../gateway-access-revision.js";
 import {
   CONTROL_UI_GITHUB_CREDENTIAL_UNAVAILABLE_MESSAGE,
@@ -53,7 +52,8 @@ import {
   authorizeOperatorScopesForMethod,
   authorizeOperatorScopesForRequiredScope,
 } from "../method-scopes.js";
-import { prepareFactoryProjectIdentity, readFactoryProjectToken } from "../project-github-proof.js";
+import { prepareConfiguredProjectGitHubIdentity } from "../project-github-identity.js";
+import { prepareFactoryProjectCredential } from "../project-github-proof.js";
 import { searchRemoteProjects } from "../project-github-search.js";
 import {
   getSessionRowProjection,
@@ -499,45 +499,42 @@ export function createProjectsHandlers(service: ProjectWorktreeService): Gateway
       }
       try {
         const cfg = context.getRuntimeConfig();
-        const factoryEnv = factoryGitHubActorEnvironment(client, client?.connId ?? "");
-        const factoryProfileId = client?.authenticatedUserProfile?.profileId;
-        const assertCurrent = () => {
+        const assertRequesterCurrent = () => {
           signal?.throwIfAborted();
           if (hasCurrentClientAuthority?.() === false || context.getRuntimeConfig() !== cfg) {
             throw new Error("Project requester authority changed during preparation");
           }
-          if (
-            factoryEnv &&
-            (factoryGitHubActorEnvironment(client, client?.connId ?? "")
-              ?.OPENCLAW_FACTORY_ACTOR_ID !== factoryEnv.OPENCLAW_FACTORY_ACTOR_ID ||
-              client?.connId !== factoryEnv.OPENCLAW_FACTORY_SESSION_KEY ||
-              client?.authenticatedUserProfile?.profileId !== factoryProfileId)
-          ) {
-            throw new Error("Factory project requester changed during preparation");
-          }
         };
-        assertCurrent();
-        const identity = await prepareFactoryProjectIdentity(
-          { client, context, signal, hasCurrentClientAuthority, assertCurrent },
-          { config: cfg, getCurrentConfig: context.getRuntimeConfig, assertCurrent },
+        const factoryCredential = prepareFactoryProjectCredential(
+          {
+            client,
+            context,
+            signal,
+            hasCurrentClientAuthority,
+            assertCurrent: assertRequesterCurrent,
+          },
           "project-add",
           params.gitUrl,
         );
+        const assertCurrent = factoryCredential?.assertCurrent ?? assertRequesterCurrent;
+        assertCurrent();
+        const identity = await prepareConfiguredProjectGitHubIdentity({
+          config: cfg,
+          getCurrentConfig: context.getRuntimeConfig,
+          assertCurrent,
+          readNativeCredential: factoryCredential?.readNativeCredential,
+        });
         const assertCredentialCurrent = () => {
           assertCurrent();
           identity?.assertSelected();
         };
         const token = identity
           ? identity.token
-          : factoryEnv
-            ? await readFactoryProjectToken(
-                { client, context, signal, hasCurrentClientAuthority, assertCurrent },
-                "project-add",
-                params.gitUrl,
-              )
+          : factoryCredential
+            ? await factoryCredential.readNativeCredential(process.env)
             : githubApiToken(process.env, cfg);
         assertCurrent();
-        if (factoryEnv && !token) {
+        if (factoryCredential && !token) {
           throw new Error("Verified GitHub repository access is unavailable.");
         }
         respond(
@@ -591,21 +588,10 @@ export function createProjectsHandlers(service: ProjectWorktreeService): Gateway
         const { params, respond, context, client, signal, hasCurrentClientAuthority } = options;
         const authority = readGatewayRequestMutationAuthority(options);
         const cfg = context.getRuntimeConfig();
-        const factoryEnv = factoryGitHubActorEnvironment(client, client?.connId ?? "");
-        const factoryProfileId = client?.authenticatedUserProfile?.profileId;
         const host = resolveConfiguredGitHubHost(cfg);
         const apiBaseUrl = resolveConfiguredGitHubApiBaseUrl(cfg);
-        const assertCurrent = () => {
+        const assertRequesterCurrent = () => {
           authority.assertCurrent();
-          if (
-            factoryEnv &&
-            (factoryGitHubActorEnvironment(client, client?.connId ?? "")
-              ?.OPENCLAW_FACTORY_ACTOR_ID !== factoryEnv.OPENCLAW_FACTORY_ACTOR_ID ||
-              client?.connId !== factoryEnv.OPENCLAW_FACTORY_SESSION_KEY ||
-              client?.authenticatedUserProfile?.profileId !== factoryProfileId)
-          ) {
-            throw new Error("Factory project requester changed during preparation");
-          }
           if (context.getRuntimeConfig() !== cfg) {
             throw new gitHubPublicApi.ControlUiGitHubError(
               502,
@@ -613,29 +599,37 @@ export function createProjectsHandlers(service: ProjectWorktreeService): Gateway
             );
           }
         };
-        assertCurrent();
-        const identity = await prepareFactoryProjectIdentity(
-          { client, context, signal, hasCurrentClientAuthority, assertCurrent },
-          { config: cfg, getCurrentConfig: context.getRuntimeConfig, assertCurrent },
+        const factoryCredential = prepareFactoryProjectCredential(
+          {
+            client,
+            context,
+            signal,
+            hasCurrentClientAuthority,
+            assertCurrent: assertRequesterCurrent,
+          },
           "project-search",
           params.query,
         );
+        const assertCurrent = factoryCredential?.assertCurrent ?? assertRequesterCurrent;
+        assertCurrent();
+        const identity = await prepareConfiguredProjectGitHubIdentity({
+          config: cfg,
+          getCurrentConfig: context.getRuntimeConfig,
+          assertCurrent,
+          readNativeCredential: factoryCredential?.readNativeCredential,
+        });
         const assertCredentialCurrent = () => {
           assertCurrent();
           identity?.assertSelected();
         };
         const nativeToken = identity
           ? identity.token
-          : factoryEnv
-            ? await readFactoryProjectToken(
-                { client, context, signal, hasCurrentClientAuthority, assertCurrent },
-                "project-search",
-                params.query,
-              )
+          : factoryCredential
+            ? await factoryCredential.readNativeCredential(process.env)
             : cfg.gateway?.projects?.nativeGitHubSearch === true
               ? await readCachedNativeGitHubToken(process.env)
               : undefined;
-        if (factoryEnv && !nativeToken) {
+        if (factoryCredential && !nativeToken) {
           throw new Error("Verified GitHub repository access is unavailable.");
         }
         assertCurrent();
@@ -646,7 +640,7 @@ export function createProjectsHandlers(service: ProjectWorktreeService): Gateway
           apiBaseUrl,
           requireAuthentication: Boolean(identity),
           appInstallation: identity?.selection.executionKind === "app-installation",
-          ...(identity || factoryEnv || cfg.gateway?.projects?.nativeGitHubSearch === true
+          ...(identity || factoryCredential || cfg.gateway?.projects?.nativeGitHubSearch === true
             ? { token: nativeToken ?? "" }
             : {}),
         });

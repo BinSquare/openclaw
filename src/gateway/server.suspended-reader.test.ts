@@ -24,6 +24,7 @@ import { createGatewaySuspendedReaderFixture } from "./server-close.metadata.tes
 import { gatewayKernelLogs } from "./server-kernel.js";
 import type { GatewayReaderReceipt } from "./server-public.js";
 import { loadSessionEntry } from "./session-utils.js";
+import { reserveGatewayTestListener } from "./test-helpers.listener.js";
 
 // The frozen plain-JS consumer lives outside the native compiler's source root.
 type PairedReader = {
@@ -63,10 +64,9 @@ it("joins native writer custody before the registered reader receipt and retains
       fileURLToPath(new URL("../../../../lobster/teamclaw-release-lobster-16598", import.meta.url)),
     );
   }
-  const readerFixture = await createGatewaySuspendedReaderFixture({
-    port: 18789,
-    ...(pairedSelected ? { roleName: "administrator" } : {}),
-  });
+  const readerFixture = await createGatewaySuspendedReaderFixture(
+    pairedSelected ? { port: 18789, roleName: "administrator" } : {},
+  );
   const {
     fixture,
     lock,
@@ -89,7 +89,10 @@ it("joins native writer custody before the registered reader receipt and retains
     enteredWriterJoin,
     finishWriterJoin,
   } = readerFixture;
-  expect(port).toBe(18789);
+  // Only the frozen external paired-proof contract requires a fixed listener.
+  if (pairedSelected) {
+    expect(port).toBe(18789);
+  }
   const closeErrors = vi.spyOn(gatewayKernelLogs.log, "error");
   let writerSettled = false;
   let paired: PairedReader | undefined;
@@ -375,7 +378,7 @@ it("joins native writer custody before the registered reader receipt and retains
       expect(frozenStatus.ok, JSON.stringify(frozenStatus)).toBe(true);
       const sdkStatus = await callGatewayFromCli(
         "gateway.suspend.status",
-        { url: "ws://127.0.0.1:18789", password: privatePassword, timeout: "10000", json: true },
+        { url: `ws://127.0.0.1:${port}`, password: privatePassword, timeout: "10000", json: true },
         { suspensionId: payload.suspensionId },
         {
           progress: false,
@@ -513,6 +516,13 @@ it("joins native writer custody before the registered reader receipt and retains
       expect(JSON.stringify(retained.payload)).toContain("Retain this accepted turn");
       expect((await reconnected.request("sessions.list", {})).ok).toBe(true);
       expect((await reconnected.request("sessions.describe", { key: sessionKey })).ok).toBe(true);
+      // Read scope does not admit methods whose full path was not audited for frozen state.
+      for (const method of ["config.get", "sessions.preview", "plugins.list"]) {
+        expect(await reconnected.request(method, {})).toMatchObject({
+          ok: false,
+          error: { code: "UNAVAILABLE" },
+        });
+      }
       const avatarUrl = `http://127.0.0.1:${port}/api/users/${profile.id}/avatar`;
       const image = await fetch(avatarUrl, { headers });
       expect(image.status).toBe(200);
@@ -610,7 +620,13 @@ it("joins native writer custody before the registered reader receipt and retains
       await readerFixture.cleanup();
     }
     if (writerSettled) {
-      await expect(fetch(`http://127.0.0.1:${port}/startupz`, { headers })).rejects.toThrow();
+      // Rebinding proves the exact listener closed; a proxy may answer closed HTTP endpoints.
+      const releasedListener = await reserveGatewayTestListener(port);
+      try {
+        expect(releasedListener.port).toBe(port);
+      } finally {
+        await releasedListener.closeUnadopted();
+      }
     }
     expect(
       closeErrors.mock.calls.filter(([message]) =>

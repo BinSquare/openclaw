@@ -405,6 +405,7 @@ test("projects.searchRemote uses the opted-in native system GitHub identity", as
       host: "github.com",
       apiBaseUrl: "https://api.github.com",
       requireAuthentication: false,
+      appInstallation: false,
     });
   } finally {
     search.mockRestore();

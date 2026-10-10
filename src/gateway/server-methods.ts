@@ -29,6 +29,7 @@ import {
 import { errorShapeFromError } from "./error-shape.js";
 import { createExpectedProfileBinding } from "./expected-profile.js";
 import { ADMIN_SCOPE } from "./method-scopes.js";
+import { isGatewaySuspendedReaderMethod } from "./methods/core-method-policy.js";
 import {
   createCoreGatewayMethodDescriptors,
   createGatewayMethodDescriptorsFromHandlers,
@@ -62,7 +63,6 @@ import type {
 import type { GatewayRequestEntry } from "./server-request-entry.js";
 import {
   isGatewayRootlessRequestAllowed,
-  isGatewaySuspendedReaderMethod,
   isGatewaySuspendControlMethod,
   runGatewayPendingWorkContinuation,
   runWithGatewayObservationScope,

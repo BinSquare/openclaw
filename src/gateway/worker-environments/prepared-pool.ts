@@ -14,7 +14,7 @@ import {
   isSupersededPresenceReserve,
   matchingPreparedPoolPresenceDemand,
 } from "./prepared-pool-presence.js";
-import type { PreparedWorkerPoolOptions } from "./prepared-pool.types.js";
+import type { PreparedPoolAdmission, PreparedWorkerPoolOptions } from "./prepared-pool.types.js";
 import { readWorkerProjectSnapshot } from "./project-preparation.js";
 import { deriveEnvironmentIntent } from "./service-contract.js";
 import type { WorkerEnvironmentRecord } from "./store.js";
@@ -59,7 +59,38 @@ export function createPreparedWorkerPool(options: PreparedWorkerPoolOptions) {
     const project = poolProject(record);
     return project ? JSON.stringify([record.providerId, record.profileId, project.key]) : undefined;
   };
-  const presence = createPreparedPoolPresence({ ...options, schedule: () => schedule() });
+  // Demand owners retain their lifetime and live-authority guards; all reserves
+  // use this intent construction and the store's transactional capacity admission.
+  const admission: PreparedPoolAdmission = {
+    policy: configuredPolicy,
+    reserve: ({
+      profileId,
+      intent,
+      projectKey,
+      preparationKey,
+      demandAtMs,
+      expiresAtMs,
+      limits,
+      assertCurrent,
+    }) =>
+      store.ensurePreparedIntent({
+        intent: {
+          ...deriveEnvironmentIntent(`prepared:${randomUUID()}`),
+          providerId: intent.providerId,
+          profileId,
+          profileSnapshot: intent.profileSnapshot,
+          preparation: { purpose: "reserve", key: preparationKey, demandAtMs, expiresAtMs },
+        },
+        projectKey,
+        ...limits,
+        assertCurrent,
+      }),
+  };
+  const presence = createPreparedPoolPresence({
+    ...options,
+    admission,
+    schedule: () => schedule(),
+  });
   // Failed claims inherit only the original preparation window; success records
   // a separate fact that survives teardown and placement retirement.
   const demandAt = (record: WorkerEnvironmentRecord) =>
@@ -503,21 +534,14 @@ export function createPreparedWorkerPool(options: PreparedWorkerPoolOptions) {
         readWorkerProjectSnapshot(intent.profileSnapshot.project)!;
       for (let index = 0; index < generation.slots!; index += 1) {
         current();
-        const admitted = await store.ensurePreparedIntent({
-          intent: {
-            ...deriveEnvironmentIntent(`prepared:${randomUUID()}`),
-            providerId: intent.providerId,
-            profileId: source.profileId,
-            profileSnapshot: intent.profileSnapshot,
-            preparation: {
-              purpose: "reserve",
-              key: intent.preparationKey!,
-              demandAtMs,
-              expiresAtMs,
-            },
-          },
+        const admitted = await admission.reserve({
+          intent,
+          profileId: source.profileId,
+          preparationKey: intent.preparationKey!,
+          demandAtMs,
+          expiresAtMs,
           projectKey: project.key,
-          ...limits,
+          limits,
           assertCurrent: () => {
             if (!isGenerationCurrent(generation)) {
               throw new Error("Prepared worker contents changed before allocation");
@@ -581,7 +605,7 @@ export function createPreparedWorkerPool(options: PreparedWorkerPoolOptions) {
     current();
     // Repository admission has one owner and one in-flight operation, but cannot
     // hold inventory cleanup or independently authorized project refill hostage.
-    const admission = (presenceInFlight ??= (async () => {
+    const presenceAdmission = (presenceInFlight ??= (async () => {
       try {
         do {
           presenceRequested = false;
@@ -600,7 +624,7 @@ export function createPreparedWorkerPool(options: PreparedWorkerPoolOptions) {
         presenceInFlight = undefined;
       }
     })());
-    const results = await Promise.allSettled([admission, scheduleInventory()]);
+    const results = await Promise.allSettled([presenceAdmission, scheduleInventory()]);
     for (const result of results) {
       if (result.status === "rejected") {
         throw result.reason;

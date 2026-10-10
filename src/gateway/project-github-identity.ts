@@ -31,44 +31,39 @@ export async function prepareGatewayProjectGitHubIdentity(params: {
   if (!managed && params.config.gateway?.projects?.nativeGitHubSearch !== true) {
     return undefined;
   }
-  const purpose =
-    params.factoryCredential?.claim.purpose === "session-item-read"
-      ? "session-item-read"
-      : undefined;
-  const factoryEnv = factoryGitHubActorEnvironment(params.client, params.sessionKey ?? "", purpose);
-  const profileId = params.client?.authenticatedUserProfile?.profileId;
-  const assertActive = () => {
+  const credential = params.factoryCredential;
+  const assertCallerCurrent = () => {
     params.assertActive();
-    params.factoryCredential?.assertCurrent();
-    if (
-      factoryEnv &&
-      (factoryGitHubActorEnvironment(params.client, params.sessionKey ?? "", purpose)
-        ?.OPENCLAW_FACTORY_ACTOR_ID !== factoryEnv.OPENCLAW_FACTORY_ACTOR_ID ||
-        params.client?.authenticatedUserProfile?.profileId !== profileId)
-    ) {
-      throw new Error("Factory project requester changed during preparation");
-    }
+    credential?.assertCurrent();
   };
-  if (factoryEnv && !params.factoryCredential) {
+  const factory = process.env.FACTORY_AUTH_MODE === "github";
+  if (factory && !credential) {
     throw new Error("Factory GitHub repository access requires current caller authority.");
   }
-  const credential = factoryEnv ? params.factoryCredential : undefined;
+  const factoryProof =
+    factory && credential
+      ? factoryGitHubClientProof({
+          client: params.client,
+          claim: credential.claim,
+          assertCurrent: () => {
+            assertCallerCurrent();
+            if (process.env.FACTORY_AUTH_MODE !== "github") {
+              throw new Error("Factory project requester changed during preparation");
+            }
+          },
+        })
+      : undefined;
+  const assertActive = factoryProof?.assertCurrent ?? assertCallerCurrent;
+  const factoryEnv = factoryProof
+    ? factoryGitHubActorEnvironment(factoryProof, params.sessionKey ?? "")
+    : undefined;
   const identity = await prepareGitHubReadIdentity({
     config: params.config,
     sourceConfig: getActiveSecretsRuntimeConfigSnapshot()?.sourceConfig ?? params.config,
     agentId: params.agentId,
     env: factoryEnv ?? process.env,
-    readNativeCredential: credential
-      ? (currentEnv, admission) =>
-          readFactoryGitHubToken(
-            currentEnv,
-            factoryGitHubClientProof({
-              client: params.client,
-              claim: credential.claim,
-              assertCurrent: assertActive,
-            }),
-            admission,
-          )
+    readNativeCredential: factoryProof
+      ? (currentEnv, admission) => readFactoryGitHubToken(currentEnv, factoryProof, admission)
       : undefined,
     getCurrentConfig: params.context.getRuntimeConfig,
     assertActive,

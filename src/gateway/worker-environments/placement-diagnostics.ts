@@ -4,6 +4,7 @@ import {
   readErrorName,
 } from "@openclaw/normalization-core/error-coercion";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
+import { createStageTimingTracker } from "../../shared/stage-timing.js";
 
 const log = createSubsystemLogger("gateway/worker-placement");
 export const MAX_PREPARED_CANDIDATE_OBSERVATIONS = 8;
@@ -237,25 +238,37 @@ export async function recordWorkerPlacementAwait<T>(
   facts: NonNullable<Parameters<typeof recordWorkerPlacementStage>[2]> = {},
   scope: "reclaim" | "dispatch" | "placement" = "reclaim",
 ): Promise<T> {
-  const startedAt = performance.now();
   const prefix = scope === "placement" ? "" : scope === "dispatch" ? "dispatch_" : "reclaim_";
-  recordWorkerPlacementStage(sessionId, `${prefix}${phase}_started`, facts);
-  try {
-    const result = await operation();
-    recordWorkerPlacementStage(sessionId, `${prefix}${phase}_completed`, {
-      ...facts,
-      elapsedMs: performance.now() - startedAt,
-    });
-    return result;
-  } catch (error) {
-    recordWorkerPlacementStage(sessionId, `${prefix}${phase}_failed`, {
-      ...facts,
-      elapsedMs: performance.now() - startedAt,
-      diagnosticCode: "operation_failed",
-      error,
-    });
-    throw error;
-  }
+  let failure: unknown;
+  const timing = createStageTimingTracker(
+    () => performance.now(),
+    (span) => {
+      if (span.status === "entry") {
+        recordWorkerPlacementStage(sessionId, `${prefix}${phase}_started`, facts);
+        return;
+      }
+      recordWorkerPlacementStage(
+        sessionId,
+        `${prefix}${phase}_${span.status === "success" ? "completed" : "failed"}`,
+        {
+          ...facts,
+          // Placement diagnostics retain sub-millisecond monotonic durations.
+          elapsedMs: span.endedAt - span.startedAt,
+          ...(span.status === "error"
+            ? { diagnosticCode: "operation_failed", error: failure }
+            : {}),
+        },
+      );
+    },
+  );
+  return timing.measure(phase, async () => {
+    try {
+      return await operation();
+    } catch (error) {
+      failure = error;
+      throw error;
+    }
+  });
 }
 
 export function recordPreparedCandidateRejection(

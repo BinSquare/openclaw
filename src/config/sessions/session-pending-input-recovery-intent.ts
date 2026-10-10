@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
+import { isFactoryGitHubActor } from "../../gateway/factory-github-actor.js";
 import type {
   PendingInputRecoveryIntent,
   TurnRecoveryIntent,
@@ -20,7 +21,6 @@ export function readPendingInputRecoveryIntent(
     const value = asOptionalRecord(JSON.parse(row.recovery_intent_json));
     const intent = asOptionalRecord(value?.intent);
     const issuer = asOptionalRecord(intent?.issuer);
-    const actor = asOptionalRecord(issuer?.factoryActor);
     if (
       value?.version !== 1 ||
       typeof value?.queued !== "boolean" ||
@@ -36,11 +36,7 @@ export function readPendingInputRecoveryIntent(
       !issuer ||
       issuer.version !== 1 ||
       typeof issuer.profileId !== "string" ||
-      !actor ||
-      actor.host !== "microsoft.ghe.com" ||
-      typeof actor.accountId !== "number" ||
-      !Number.isSafeInteger(actor.accountId) ||
-      actor.accountId <= 0 ||
+      !isFactoryGitHubActor(issuer.factoryActor) ||
       !asOptionalRecord(issuer.authPrincipal) ||
       !(issuer.rolePolicyGeneration === null || typeof issuer.rolePolicyGeneration === "string")
     ) {

@@ -386,12 +386,15 @@ export async function exerciseReclaimedFactoryCredential(
           });
           await placements.startDispatch(REQUEST);
         } else if (variant === "workspace changed during lookup") {
-          await repositoryStore.bindBase({
+          // Base/checkpoint progress keeps credential authority; change the requested ref.
+          const changed = await repositoryStore.advanceToPublishedHead({
             workspaceId: repository.workspaceId,
             expectedRevision: repository.revision,
-            baseCommit: "a".repeat(40),
+            branch: repository.branch,
+            headCommit: "a".repeat(40),
             assertCurrent,
           });
+          expect(changed.requestedRef).not.toBe(repository.requestedRef);
         }
         return {
           stdout: Buffer.from("synthetic-reclaimed-token"),

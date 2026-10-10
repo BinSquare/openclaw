@@ -86,6 +86,7 @@ export async function startCodexAttemptRuntime(resources: CodexAttemptResources)
       assertCurrent: connection.assertCurrent,
       authority: connection.authority,
       attemptClientFactory,
+      executionPlan: connection.executionPlan,
       callerOwnedAttemptClient,
       bindingStore,
       runtime: connection.options.runtime,

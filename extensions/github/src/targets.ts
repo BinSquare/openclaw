@@ -1,13 +1,9 @@
+import { normalizeGitHubHost } from "openclaw/plugin-sdk/github-host";
 import { getRuntimeConfigSnapshot } from "openclaw/plugin-sdk/runtime-config-snapshot";
 import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 
 export function githubWebHost(): string {
-  const host =
-    getRuntimeConfigSnapshot()?.gateway?.github?.host?.trim().toLowerCase() || "github.com";
-  if (!/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/u.test(host) || host.includes("..")) {
-    throw new Error("gateway.github.host must be a hostname");
-  }
-  return host;
+  return normalizeGitHubHost(getRuntimeConfigSnapshot()?.gateway?.github?.host);
 }
 
 export type GitHubItemTarget = {

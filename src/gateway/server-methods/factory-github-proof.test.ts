@@ -112,15 +112,6 @@ it("binds authenticated read-only item previews without granting publication aut
   const client = createOperatorClient({ profileId: "person-read", scopes: ["operator.read"] });
   client.authenticatedFactoryGitHubAccountId = 1358766;
   client.internal = { authenticatedOperator: true };
-  expect(
-    factoryGitHubActorEnvironment(client, "agent:main:room", "session-item-read"),
-  ).toMatchObject({
-    OPENCLAW_FACTORY_ACTOR_ID: "1358766",
-    OPENCLAW_FACTORY_SESSION_KEY: "agent:main:room",
-    GH_TOKEN: undefined,
-    GH_ENTERPRISE_TOKEN: undefined,
-  });
-  expect(() => factoryGitHubActorEnvironment(client, "agent:main:room")).toThrow();
   let current = true;
   const read = {
     purpose: "session-item-read" as const,
@@ -141,6 +132,12 @@ it("binds authenticated read-only item previews without granting publication aut
         throw new Error("Original item access revoked");
       }
     },
+  });
+  expect(factoryGitHubActorEnvironment(proofInput, "agent:main:room")).toMatchObject({
+    OPENCLAW_FACTORY_ACTOR_ID: "1358766",
+    OPENCLAW_FACTORY_SESSION_KEY: "agent:main:room",
+    GH_TOKEN: undefined,
+    GH_ENTERPRISE_TOKEN: undefined,
   });
   const issued = issueFactoryGitHubProof(proofInput);
   expect(await rpc(issued.proof)).toHaveBeenCalledWith(
@@ -279,27 +276,59 @@ it("consumes stale or expired proof without returning actor authority", async ()
   );
 });
 
-it("rejects an actor change after the authenticated client was captured", () => {
-  const client = brokerClient({
-    authenticatedFactoryGitHubAccountId: 101,
-    authenticatedUserProfile: {
-      profileId: "person-1",
-      displayName: null,
-      hasAvatar: false,
-      updatedAt: 0,
-    },
-  });
-  const input = factoryGitHubClientProof({
-    client,
-    claim: {
-      purpose: "project-add",
-      binding: { kind: "connection", connectionId: "connection-1", requestDigest: "digest-1" },
-    },
-    assertCurrent: () => {},
-  });
-  client.authenticatedFactoryGitHubAccountId = 202;
-  expect(input.assertCurrent).toThrow("authority changed");
-});
+it.each(["actor", "profile", "scopes", "invalidation", "connection"] as const)(
+  "rejects a captured client's %s change at proof redemption",
+  async (change) => {
+    vi.stubEnv("FACTORY_AUTH_MODE", "github");
+    const connection = new AbortController();
+    const client = brokerClient({
+      connectionSignal: connection.signal,
+      authenticatedFactoryGitHubAccountId: 101,
+      authenticatedUserProfile: {
+        profileId: "person-1",
+        displayName: null,
+        hasAvatar: false,
+        updatedAt: 0,
+      },
+    });
+    const input = factoryGitHubClientProof({
+      client,
+      claim: {
+        purpose: "project-add",
+        binding: { kind: "connection", connectionId: "connection-1", requestDigest: "digest-1" },
+      },
+      assertCurrent: () => {},
+    });
+    const issued = issueFactoryGitHubProof(input);
+    switch (change) {
+      case "actor":
+        client.authenticatedFactoryGitHubAccountId = 202;
+        break;
+      case "profile":
+        client.authenticatedUserProfile = {
+          profileId: "person-2",
+          displayName: null,
+          hasAvatar: false,
+          updatedAt: 0,
+        };
+        break;
+      case "scopes":
+        client.connect.scopes = ["operator.read"];
+        break;
+      case "invalidation":
+        client.invalidated = true;
+        break;
+      case "connection":
+        connection.abort();
+        break;
+    }
+    expect(await rpc(issued.proof)).toHaveBeenCalledWith(
+      false,
+      undefined,
+      expect.objectContaining({ code: "FORBIDDEN" }),
+    );
+  },
+);
 
 describe("native broker lookup", () => {
   let state: OpenClawTestState;

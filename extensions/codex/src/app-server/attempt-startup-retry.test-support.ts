@@ -10,6 +10,7 @@ import {
   resolveCodexComputerUseConfig,
   type CodexPluginConfig,
 } from "./config.js";
+import { resolveCodexExecutionPlan } from "./execution-plan.js";
 import { createCodexTestHostCapabilities } from "./host-capability.test-support.js";
 import { testCodexAppServerBindingStore } from "./session-binding.test-helpers.js";
 import { getLeasedSharedCodexAppServerClient } from "./shared-client.js";
@@ -33,6 +34,7 @@ export function startFixtureAttempt(
   return startCodexAttemptThread({
     bindingStore: testCodexAppServerBindingStore,
     attemptClientFactory,
+    executionPlan: resolveCodexExecutionPlan({ pluginConfig: fixture.pluginConfig, target: null }),
     appServer: resolveCodexAppServerRuntimeOptions({ pluginConfig: fixture.pluginConfig }),
     pluginConfig: fixture.pluginConfig,
     computerUseConfig: resolveCodexComputerUseConfig({ pluginConfig: fixture.pluginConfig }),

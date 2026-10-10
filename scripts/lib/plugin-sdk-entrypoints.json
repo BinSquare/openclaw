@@ -116,6 +116,7 @@
   "gateway-config-runtime",
   "gateway-method-runtime",
   "gateway-runtime",
+  "github-host",
   "github-worker-runtime",
   "websocket-runtime",
   "cli-argv",

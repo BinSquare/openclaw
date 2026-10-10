@@ -9,9 +9,16 @@ import {
   GitHubCredentialLookupError,
   readNativeGitHubToken,
 } from "../agents/github-read-identity.js";
+import type { PreparedRepositoryWorkspace } from "../state/session-repository-workspaces.js";
 import { prepareUserProfileIdentity } from "../state/user-profile-list.js";
 import type { PreparedUserProfileIdentity } from "../state/user-profiles.types.js";
+import {
+  factoryGitHubActorEnvironment,
+  isFactoryGitHubActor,
+  type FactoryGitHubActor,
+} from "./factory-github-actor.js";
 import { readFactoryRepositoryAdmission } from "./factory-github-repository-admission.js";
+import { GatewayOperatorAccessDeniedError } from "./operator-access-policy.js";
 import type { GatewayClient } from "./server-methods/client-types.js";
 
 const AUDIENCE = "lobster.github.system-token" as const;
@@ -87,6 +94,7 @@ export function factoryGitHubClientProof(input: {
   const readOnly = input.claim.purpose === "session-item-read";
   const assertCurrent = () => {
     input.assertCurrent();
+    client?.connectionSignal?.throwIfAborted();
     if (
       client?.invalidated ||
       client?.connect.role !== "operator" ||
@@ -95,7 +103,6 @@ export function factoryGitHubClientProof(input: {
         !(readOnly && client.connect.scopes?.includes("operator.read"))) ||
       (readOnly &&
         (!client.connId ||
-          client.connectionSignal?.aborted ||
           client.internal?.authenticatedOperator !== true ||
           client.internal.syntheticClient ||
           client.internal.agentRuntimeIdentity ||
@@ -107,7 +114,7 @@ export function factoryGitHubClientProof(input: {
     }
   };
   assertCurrent();
-  if (!actorId || !profileId) {
+  if (!actorId || !Number.isSafeInteger(actorId) || actorId <= 0 || !profileId) {
     throw new Error("Factory GitHub requires a verified actor profile.");
   }
   return { actorId, profileId, claim: input.claim, assertCurrent };
@@ -249,13 +256,7 @@ export async function withFactoryGitHubProof<T>(
       assertCurrent,
     });
     const env = {
-      ...(input.env ?? process.env),
-      GH_TOKEN: undefined,
-      GH_ENTERPRISE_TOKEN: undefined,
-      GITHUB_TOKEN: undefined,
-      GITHUB_ENTERPRISE_TOKEN: undefined,
-      OPENCLAW_FACTORY_ACTOR_ID: String(actorId),
-      OPENCLAW_FACTORY_SESSION_KEY: sessionKey,
+      ...factoryGitHubActorEnvironment({ actorId, assertCurrent }, sessionKey, input.env),
       [FACTORY_GITHUB_PROOF_ENV]: issued.proof,
     };
     assertCurrent();
@@ -351,13 +352,7 @@ export function factoryGitHubDispatchCredentialReader(
     assertCurrent();
     const basis = authority.captureRestartRecoveryIssuer?.();
     const actor = basis?.factoryActor;
-    if (
-      !actor ||
-      actor.host !== "microsoft.ghe.com" ||
-      !Number.isSafeInteger(actor.accountId) ||
-      actor.accountId <= 0 ||
-      basis?.profileId !== authority.profileId
-    ) {
+    if (!isFactoryGitHubActor(actor) || basis?.profileId !== authority.profileId) {
       throw new Error("Verified original Factory actor is unavailable");
     }
     const actorId = actor.accountId;
@@ -375,4 +370,82 @@ export function factoryGitHubDispatchCredentialReader(
       }),
       admission,
     );
+}
+
+/** Adapt a restored original issuer to its exact accepted repository, never a live client. */
+export function factoryGitHubRecoveryDispatchCredentialReader(params: {
+  target: Parameters<
+    NonNullable<AdmittedRunOperatorAuthority["createFactoryGitHubDispatchCredentialReader"]>
+  >[0];
+  issuerAuthority: AdmittedRunOperatorAuthority;
+  actor: FactoryGitHubActor;
+  session: { agentId: string; sessionKey: string; sessionId: string };
+  workspaceId: string | undefined;
+  repository: PreparedRepositoryWorkspace | undefined;
+  readSessionWorkspaceId: () => string | undefined;
+  assertCurrent: () => void;
+  assertGoalCurrent: () => Promise<string | undefined>;
+}): import("../agents/github-credential-reader.js").GitHubCredentialReader {
+  const { target, workspaceId, repository } = params;
+  const deny = (): never => {
+    throw new GatewayOperatorAccessDeniedError();
+  };
+  const assertTargetCurrent = () => {
+    params.assertCurrent();
+    target.assertCurrent();
+    if (
+      target.agentId !== params.session.agentId ||
+      target.sessionKey !== params.session.sessionKey ||
+      target.sessionId !== params.session.sessionId ||
+      new URL(target.repositoryUrl).hostname !== params.actor.host
+    ) {
+      deny();
+    }
+  };
+  assertTargetCurrent();
+  if (!workspaceId || !repository) {
+    throw new GatewayOperatorAccessDeniedError();
+  }
+  const assertRepositoryFactsCurrent = () => {
+    const current = repository.current();
+    if (
+      !current ||
+      params.readSessionWorkspaceId() !== workspaceId ||
+      current.workspaceId !== workspaceId ||
+      current.agentId !== target.agentId ||
+      current.sessionKey !== target.sessionKey ||
+      current.url !== target.repositoryUrl
+    ) {
+      deny();
+    }
+  };
+  const assertRepositoryCurrent = async () => {
+    assertTargetCurrent();
+    const beforeWorkspaceId = await params.assertGoalCurrent();
+    assertTargetCurrent();
+    assertRepositoryFactsCurrent();
+    if (beforeWorkspaceId !== workspaceId) {
+      deny();
+    }
+    if ((await params.assertGoalCurrent()) !== workspaceId) {
+      deny();
+    }
+  };
+  const reader = factoryGitHubDispatchCredentialReader({
+    ...target,
+    issuerAuthority: params.issuerAuthority,
+    assertCurrent: () => {
+      assertTargetCurrent();
+      assertRepositoryFactsCurrent();
+    },
+  });
+  if (!reader) {
+    throw new GatewayOperatorAccessDeniedError();
+  }
+  return async (env, admission) => {
+    await assertRepositoryCurrent();
+    const token = await reader(env, admission);
+    await assertRepositoryCurrent();
+    return token;
+  };
 }

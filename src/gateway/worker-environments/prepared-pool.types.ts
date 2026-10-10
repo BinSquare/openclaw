@@ -5,6 +5,26 @@ import type { PreparedPoolPresenceOptions } from "./prepared-pool-presence.js";
 import type { createWorkerProviderIntent } from "./provider-intent.js";
 import type { WorkerEnvironmentRecord, WorkerEnvironmentStore } from "./store.js";
 
+export type PreparedPoolPolicy = {
+  providerId: string | undefined;
+  target: number;
+  maxTotal: number;
+};
+
+export type PreparedPoolAdmission = {
+  policy: (profileId: string) => PreparedPoolPolicy;
+  reserve: (input: {
+    profileId: string;
+    intent: WorkerProviderPreparedIntent;
+    projectKey: string;
+    preparationKey: string;
+    demandAtMs: number;
+    expiresAtMs: number;
+    limits: Pick<PreparedPoolPolicy, "target" | "maxTotal">;
+    assertCurrent: () => void;
+  }) => Promise<WorkerEnvironmentRecord | undefined>;
+};
+
 export type PreparedWorkerPoolOptions = {
   store: WorkerEnvironmentStore;
   getConfig: () => OpenClawConfig;

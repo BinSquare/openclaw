@@ -16,6 +16,7 @@ import {
   resolveCodexAppServerRuntimeOptions,
   resolveCodexComputerUseConfig,
 } from "./config.js";
+import { resolveCodexExecutionPlan } from "./execution-plan.js";
 import { createCodexTestHostCapabilities } from "./host-capability.test-support.js";
 import { testCodexAppServerBindingStore } from "./session-binding.test-helpers.js";
 import {
@@ -83,6 +84,10 @@ export function createAttemptThreadStarter(
         overrides?.appServer ??
         resolveCodexAppServerRuntimeOptions({ pluginConfig: effectivePluginConfig }),
       pluginConfig: effectivePluginConfig,
+      executionPlan: resolveCodexExecutionPlan({
+        pluginConfig: effectivePluginConfig,
+        target: overrides?.sandbox,
+      }),
       computerUseConfig: resolveCodexComputerUseConfig({ pluginConfig: effectivePluginConfig }),
       startupAuthProfileId: undefined,
       startupAuthBindingFingerprint: undefined,

@@ -457,7 +457,8 @@
     "!dist/plugin-sdk/compiled-subprocess-testing.d.ts",
     "!dist/plugin-sdk/compiled-subprocess-testing.js",
     "!dist/plugin-sdk/memory-host-search.d.ts",
-    "!dist/plugin-sdk/github-worker-runtime.d.ts"
+    "!dist/plugin-sdk/github-worker-runtime.d.ts",
+    "!dist/plugin-sdk/github-host.d.ts"
   ],
   "type": "module",
   "main": "dist/index.js",
@@ -878,6 +879,9 @@
     "./plugin-sdk/gateway-runtime": {
       "types": "./dist/plugin-sdk/gateway-runtime.d.ts",
       "default": "./dist/plugin-sdk/gateway-runtime.js"
+    },
+    "./plugin-sdk/github-host": {
+      "default": "./dist/plugin-sdk/github-host.js"
     },
     "./plugin-sdk/github-worker-runtime": {
       "default": "./dist/plugin-sdk/github-worker-runtime.js"

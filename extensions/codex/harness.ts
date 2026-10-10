@@ -15,6 +15,7 @@ import { resolveMergedModelProviderConfig } from "openclaw/plugin-sdk/provider-c
 import { asOptionalRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { CODEX_NATIVE_TOOL_REQUIREMENTS } from "./native-tool-policy.js";
 import { readCodexPluginConfig } from "./src/app-server/config-parsing.js";
+import { resolveCodexExecutionPlan } from "./src/app-server/execution-plan.js";
 import { readCodexRuntimeModelId } from "./src/app-server/model-runtime.js";
 import { sessionBindingIdentity } from "./src/app-server/session-binding-record.js";
 import type { CodexAppServerBindingStore } from "./src/app-server/session-binding.js";
@@ -138,8 +139,10 @@ export function createCodexAppServerAgentHarness(
       mode: "remote-exec",
       devicePlacement: {
         requiredNodeCommands: [
-          readCodexPluginConfig(resolveAttemptPluginConfig(undefined)).appServer
-            ?.workerHostedCloud === true
+          resolveCodexExecutionPlan({
+            pluginConfig: readCodexPluginConfig(resolveAttemptPluginConfig(undefined)),
+            target: "paired-node",
+          }).appServer === "worker"
             ? resolveCodexWorkerAppServerCommand(process.env, true)
             : "codex.exec-server.stdio.v1",
         ],

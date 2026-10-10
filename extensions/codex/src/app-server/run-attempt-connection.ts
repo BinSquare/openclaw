@@ -29,8 +29,6 @@ import {
 } from "./binding-connection.js";
 import {
   canUseCodexModelBackedApprovalsReviewerForModel,
-  isCodexPairedNodeRemoteExecPlacementSandbox,
-  isCodexRemoteExecPlacementSandbox,
   readCodexPluginConfig,
   readCodexRequirementsToml,
   resolveCodexAppServerHomeScope,
@@ -39,6 +37,7 @@ import {
   resolveOpenClawExecPolicyForCodexAppServer,
   type CodexAppServerRuntimeOptions,
 } from "./config.js";
+import { resolveCodexExecutionPlan } from "./execution-plan.js";
 import { isCodexAppServerProxyLaunch } from "./launch-args.js";
 import { resolveCodexNativeHookRelayEvents } from "./native-hook-relay.js";
 import { isCodexAppServerProfilerEnabled } from "./profiler-flag.js";
@@ -115,9 +114,8 @@ export async function prepareCodexAttemptConnection({ params, options }: CodexRu
           sessionKey: sandboxSessionKey,
           workspaceDir: resolvedWorkspace,
         });
-  const workerHostedCloud =
-    pluginConfig.appServer?.workerHostedCloud === true &&
-    isCodexPairedNodeRemoteExecPlacementSandbox(sandbox);
+  const executionPlan = resolveCodexExecutionPlan({ pluginConfig, target: sandbox });
+  const workerHostedCloud = executionPlan.appServer === "worker";
   // Upstream cannot remove registered environments, so node leases own one disposable client.
   const attemptClientFactory =
     options.clientFactory ??
@@ -136,7 +134,7 @@ export async function prepareCodexAttemptConnection({ params, options }: CodexRu
             assertCurrent: clientOptions.assertCurrent ?? params.hostCapabilities.assertActive,
           });
         }
-      : isCodexPairedNodeRemoteExecPlacementSandbox(sandbox)
+      : executionPlan.appServer === "isolated"
         ? createIsolatedCodexAppServerClient
         : getLeasedSharedCodexAppServerClient);
   preDynamicStartupStages.mark("sandbox");
@@ -150,7 +148,7 @@ export async function prepareCodexAttemptConnection({ params, options }: CodexRu
   });
   const agentDir = params.agentDir ?? resolveAgentDir(params.config ?? {}, sessionAgentId);
   const preparedEnvironment = params.hostCapabilities.preparedEnvironment?.();
-  const remoteExec = isCodexRemoteExecPlacementSandbox(sandbox);
+  const { remoteExec } = executionPlan;
   const assertLocalTargetSupported = (unsupported: boolean) => {
     if (preparedEnvironment?.localProcessEnv && unsupported) {
       throw new Error(
@@ -358,7 +356,7 @@ export async function prepareCodexAttemptConnection({ params, options }: CodexRu
           authProfileStore: params.authProfileStore,
           agentDir,
           homeScope: appServerHomeScope,
-          requirePreparedAuth: isCodexRemoteExecPlacementSandbox(sandbox),
+          requirePreparedAuth: remoteExec,
           config: params.config,
           subscriptionProfileRequiredError:
             "Prepared Codex subscription route requires a forwarded OpenAI OAuth or token profile.",
@@ -665,6 +663,7 @@ export async function prepareCodexAttemptConnection({ params, options }: CodexRu
       fastModeAutoProgressState,
       preDynamicStartupStages,
       attemptClientFactory,
+      executionPlan,
       callerOwnedAttemptClient:
         workerHostedCloud || attemptClientFactory === createIsolatedCodexAppServerClient,
       runtimeArtifactRequest,

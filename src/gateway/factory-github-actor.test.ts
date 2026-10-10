@@ -1,42 +1,39 @@
-import { afterEach, expect, it, vi } from "vitest";
+import { expect, it } from "vitest";
 import { factoryGitHubActorEnvironment } from "./factory-github-actor.js";
-import type { GatewayClient } from "./server-methods/client-types.js";
 
-afterEach(() => vi.unstubAllEnvs());
-
-it("binds repository effects to the verified operator and current session", () => {
-  vi.stubEnv("FACTORY_AUTH_MODE", "github");
-  const client: GatewayClient = {
-    authenticatedFactoryGitHubAccountId: 1186191,
-    authenticatedUserProfile: {
-      profileId: "person",
-      displayName: null,
-      hasAvatar: false,
-      updatedAt: 1,
-    },
-    connect: {
-      minProtocol: 1,
-      maxProtocol: 1,
-      client: { id: "openclaw-control-ui", version: "test", platform: "test", mode: "webchat" },
-      role: "operator",
-      scopes: ["operator.read", "operator.write"],
+it("projects current prepared actor facts without forwarding ambient credentials", () => {
+  let current = true;
+  const authority = {
+    actorId: 1186191,
+    assertCurrent: () => {
+      if (!current) {
+        throw new Error("original authority revoked");
+      }
     },
   };
-  expect(factoryGitHubActorEnvironment(client, "agent:main:own-session")).toMatchObject({
+  const env = {
+    GH_TOKEN: "synthetic-ambient-token",
+    GH_ENTERPRISE_TOKEN: "synthetic-enterprise-token",
+    GITHUB_TOKEN: "synthetic-github-token",
+    GITHUB_ENTERPRISE_TOKEN: "synthetic-github-enterprise-token",
+    OPENCLAW_FACTORY_GITHUB_PROOF: "stale-proof",
+    OPENCLAW_FACTORY_ACTOR_ID: "another-actor",
+    OPENCLAW_FACTORY_SESSION_KEY: "another-session",
+    PATH: "/synthetic/bin",
+  };
+  expect(factoryGitHubActorEnvironment(authority, "agent:main:own-session", env)).toEqual({
+    PATH: "/synthetic/bin",
+    GH_TOKEN: undefined,
+    GH_ENTERPRISE_TOKEN: undefined,
+    GITHUB_TOKEN: undefined,
+    GITHUB_ENTERPRISE_TOKEN: undefined,
+    OPENCLAW_FACTORY_GITHUB_PROOF: undefined,
     OPENCLAW_FACTORY_ACTOR_ID: "1186191",
     OPENCLAW_FACTORY_SESSION_KEY: "agent:main:own-session",
   });
-  expect(() =>
-    factoryGitHubActorEnvironment(
-      { ...client, authenticatedFactoryGitHubAccountId: undefined },
-      "agent:main:own-session",
-    ),
-  ).toThrow();
-  expect(() =>
-    factoryGitHubActorEnvironment(
-      { ...client, connect: { ...client.connect, scopes: ["operator.read"] } },
-      "agent:main:own-session",
-    ),
-  ).toThrow();
-  expect(() => factoryGitHubActorEnvironment(client, "")).toThrow();
+  expect(() => factoryGitHubActorEnvironment(authority, "")).toThrow();
+  current = false;
+  expect(() => factoryGitHubActorEnvironment(authority, "agent:main:own-session", env)).toThrow(
+    "original authority revoked",
+  );
 });

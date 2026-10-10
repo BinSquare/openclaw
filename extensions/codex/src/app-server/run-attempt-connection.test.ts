@@ -573,22 +573,25 @@ describe("prepareCodexAttemptConnection", () => {
   it.each([
     {
       name: "paired-device remote execution",
+      workerHostedCloud: false,
       placement: { placementExecutionMode: "remote-exec", placementNodeId: "paired-device-1" },
       expectedFactory: createIsolatedCodexAppServerClient,
     },
     {
-      name: "SSH remote execution",
+      name: "SSH remote execution with worker hosting enabled",
+      workerHostedCloud: true,
       placement: { placementExecutionMode: "remote-exec" },
       expectedFactory: getLeasedSharedCodexAppServerClient,
     },
     {
-      name: "local sandbox execution",
+      name: "local sandbox execution with worker hosting enabled",
+      workerHostedCloud: true,
       placement: {},
       expectedFactory: getLeasedSharedCodexAppServerClient,
     },
   ])(
     "selects the correct app-server ownership for $name",
-    async ({ placement, expectedFactory }) => {
+    async ({ placement, expectedFactory, workerHostedCloud }) => {
       const sessionFile = path.join(
         tempDir,
         `client-ownership-${placement.placementNodeId ?? "other"}.jsonl`,
@@ -626,10 +629,28 @@ describe("prepareCodexAttemptConnection", () => {
 
       const connection = await prepareCodexAttemptConnection({
         params,
-        options: { bindingStore: testCodexAppServerBindingStore },
+        options: {
+          bindingStore: testCodexAppServerBindingStore,
+          pluginConfig: { appServer: { workerHostedCloud } },
+        },
       });
 
-      expect(connection.attemptClientFactory).toBe(expectedFactory);
+      try {
+        expect(connection.attemptClientFactory).toBe(expectedFactory);
+        expect(connection.callerOwnedAttemptClient).toBe(
+          expectedFactory === createIsolatedCodexAppServerClient,
+        );
+        expect(connection.effectiveCwd).toBe(workspaceDir);
+        if (placement.placementExecutionMode === "remote-exec") {
+          expect(connection.startupPreparedAuth).toMatchObject({
+            kind: "api-key",
+            apiKey: "prepared-test-key",
+          });
+        }
+      } finally {
+        connection.cancellation.dispose();
+        connection.releaseModelExecution();
+      }
     },
   );
 

@@ -11,6 +11,8 @@ export type CoreGatewayMethodSpec = Partial<GatewayReadSharing> & {
   since?: string;
   advertise?: false;
   startup?: true;
+  /** Audited to run under frozen read admission; read scope alone is insufficient. */
+  suspendedReader?: true;
   lifetime?: GatewayMethodDescriptor["lifetime"];
   controlPlaneWrite?: true;
   compatibilityRestored?: true;
@@ -25,6 +27,7 @@ type CoreGatewayMethodPolicy = Pick<
   | "shareMaxAgeMs"
   | "advertise"
   | "startup"
+  | "suspendedReader"
   | "lifetime"
   | "controlPlaneWrite"
   | "compatibilityRestored"

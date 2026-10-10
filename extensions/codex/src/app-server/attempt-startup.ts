@@ -34,8 +34,8 @@ import {
   resolveCodexAppServerExecutionCwd,
   resolveCodexExternalSandboxPolicyForOpenClawSandbox,
   resolveCodexSandboxEnvironmentSelection,
-  shouldRequireCodexSandboxExecServerEnvironment,
 } from "./dynamic-tool-build.js";
+import type { CodexExecutionPlan } from "./execution-plan.js";
 import {
   buildCodexAppServerRuntimeFingerprint,
   buildCodexPluginAppCacheKey,
@@ -90,6 +90,7 @@ export async function startCodexAttemptThread(params: {
   assertCurrent?: () => void;
   authority?: CodexBindingAuthority;
   attemptClientFactory: CodexAppServerClientFactory;
+  executionPlan: CodexExecutionPlan;
   callerOwnedAttemptClient?: boolean;
   bindingStore: CodexAppServerBindingStore;
   runtime?: PluginRuntime;
@@ -379,7 +380,7 @@ export async function startCodexAttemptThread(params: {
             try {
               params.assertCurrent?.();
               const sandboxEnvironmentRequired =
-                shouldRequireCodexSandboxExecServerEnvironment(params);
+                params.executionPlan.requiresSandboxExecServer(params);
               startupSandboxEnvironment = sandboxEnvironmentRequired
                 ? await ensureCodexSandboxExecServerEnvironment({
                     client: activeStartupClient,

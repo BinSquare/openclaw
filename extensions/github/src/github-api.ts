@@ -4,6 +4,10 @@ import {
   createDiagnosticTraceContextFromActiveScope,
   createSubsystemLogger,
 } from "openclaw/plugin-sdk/diagnostic-runtime";
+import {
+  GITHUB_PUBLIC_API_BASE_URL,
+  normalizeGitHubApiBaseUrl,
+} from "openclaw/plugin-sdk/github-host";
 import { readResponseWithLimit } from "openclaw/plugin-sdk/response-limit-runtime";
 import { parseRetryAfterHeaderSeconds } from "openclaw/plugin-sdk/retry-runtime";
 import {
@@ -16,27 +20,10 @@ import { createStageTimingTracker } from "openclaw/plugin-sdk/time-runtime";
 
 export { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 
-const DEFAULT_GITHUB_API_BASE_URL = "https://api.github.com";
 // Shipped public constant names the default service, independent of the selected Enterprise API.
-export const GITHUB_API_ORIGIN = DEFAULT_GITHUB_API_BASE_URL;
+export const GITHUB_API_ORIGIN = GITHUB_PUBLIC_API_BASE_URL;
 
-function resolveGitHubApiBaseUrl(value: string | undefined): string {
-  const raw = value?.trim() || DEFAULT_GITHUB_API_BASE_URL;
-  const parsed = new URL(raw);
-  if (
-    parsed.protocol !== "https:" ||
-    parsed.username ||
-    parsed.password ||
-    parsed.search ||
-    parsed.hash ||
-    !["/", "", "/api/v3", "/api/v3/"].includes(parsed.pathname)
-  ) {
-    throw new Error("gateway.github.apiBaseUrl must be an HTTPS GitHub API base URL");
-  }
-  return parsed.origin + (parsed.pathname.startsWith("/api/v3") ? "/api/v3" : "");
-}
-
-export const GITHUB_API_BASE_URL = DEFAULT_GITHUB_API_BASE_URL;
+export const GITHUB_API_BASE_URL = GITHUB_PUBLIC_API_BASE_URL;
 function githubGraphqlUrl(baseUrl: string): string {
   return baseUrl.endsWith("/api/v3") ? `${baseUrl.slice(0, -3)}/graphql` : `${baseUrl}/graphql`;
 }
@@ -44,7 +31,7 @@ function githubGraphqlUrl(baseUrl: string): string {
 export const GITHUB_GRAPHQL_URL = githubGraphqlUrl(GITHUB_API_BASE_URL);
 
 export function resolveGitHubApiUrls(apiBaseUrl: string | undefined) {
-  const baseUrl = resolveGitHubApiBaseUrl(apiBaseUrl);
+  const baseUrl = normalizeGitHubApiBaseUrl(apiBaseUrl);
   return { baseUrl, graphqlUrl: githubGraphqlUrl(baseUrl) };
 }
 
@@ -290,7 +277,7 @@ export async function fetchGitHubApi(
   if (typeof callerSignal !== "function") {
     callerSignal?.throwIfAborted();
   }
-  const baseUrl = resolveGitHubApiBaseUrl(apiBaseUrl);
+  const baseUrl = normalizeGitHubApiBaseUrl(apiBaseUrl);
   const apiBase = new URL(baseUrl);
   const graphqlUrl = githubGraphqlUrl(baseUrl);
   const initialUrl = safeGitHubApiUrl(rawUrl, apiBase, graphqlUrl);
@@ -512,7 +499,7 @@ export async function readGitHubGraphQLResponse(
 ): Promise<unknown> {
   const credentialScope =
     responseRequestScopes.get(response)?.credentialScope ??
-    `${DEFAULT_GITHUB_API_BASE_URL}:${githubApiCredentialCacheScope(token)}`;
+    `${GITHUB_PUBLIC_API_BASE_URL}:${githubApiCredentialCacheScope(token)}`;
   const value =
     response.status === 403 && !isGitHubRateLimitResponse(response)
       ? await readGitHubJsonBody(response, maxBytes)

@@ -1,4 +1,5 @@
 import { createSubsystemLogger } from "../../logging/subsystem.js";
+import { createStageTimingTracker } from "../../shared/stage-timing.js";
 import type { WorkerEnvironmentRecord } from "./store.js";
 
 const log = createSubsystemLogger("gateway/worker-provision");
@@ -45,7 +46,6 @@ export async function withWorkerProvisionStage<T>(
   run: () => Promise<T>,
   leaseId = record.leaseId,
 ): Promise<T> {
-  const startedAt = performance.now();
   const identity = {
     environmentId: record.environmentId,
     provisionOperationId: record.provisionOperationId,
@@ -53,23 +53,37 @@ export async function withWorkerProvisionStage<T>(
     sessionId: record.attachedSessionIds[0] ?? null,
     stage,
   };
-  log.info("worker provision stage", { ...identity, elapsedMs: 0, outcome: "started" });
-  try {
-    const result = await run();
-    log.info("worker provision stage", {
-      ...identity,
-      elapsedMs: Math.round(performance.now() - startedAt),
-      outcome: "completed",
-    });
-    return result;
-  } catch (error) {
-    const name = error instanceof Error ? error.name : "unknown";
-    log.warn("worker provision stage", {
-      ...identity,
-      elapsedMs: Math.round(performance.now() - startedAt),
-      outcome: "failed",
-      errorCode: /^[A-Za-z][A-Za-z0-9]{0,39}$/.test(name) ? name : "unknown",
-    });
-    throw error;
-  }
+  let errorCode = "unknown";
+  const timing = createStageTimingTracker(
+    () => performance.now(),
+    (phase) => {
+      if (phase.status === "error") {
+        log.warn("worker provision stage", {
+          ...identity,
+          elapsedMs: phase.durationMs,
+          outcome: "failed",
+          errorCode,
+        });
+      } else {
+        log.info("worker provision stage", {
+          ...identity,
+          elapsedMs: phase.status === "entry" ? 0 : phase.durationMs,
+          outcome: phase.status === "entry" ? "started" : "completed",
+        });
+      }
+    },
+  );
+  return timing.measure(stage, async () => {
+    try {
+      return await run();
+    } catch (error) {
+      try {
+        const name = error instanceof Error ? error.name : "unknown";
+        errorCode = /^[A-Za-z][A-Za-z0-9]{0,39}$/.test(name) ? name : "unknown";
+      } catch {
+        // Error metadata is untrusted and cannot replace the operation's failure.
+      }
+      throw error;
+    }
+  });
 }

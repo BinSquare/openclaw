@@ -1,17 +1,14 @@
-import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import type { OpenClawConfig } from "../../config/types.js";
-import { normalizeCapabilityProviderId } from "../../plugins/provider-registry-shared.js";
 import { readImageReserveProject } from "./image-reserve.js";
 import {
   readWorkerProjectPreparation,
   type WorkerProviderPreparedIntent,
 } from "./preparation-identity.js";
 import type { PreparedPoolPresenceDemand } from "./prepared-pool-presence.types.js";
+import type { PreparedPoolAdmission, PreparedPoolPolicy } from "./prepared-pool.types.js";
 import { readWorkerProjectSnapshot } from "./project-preparation.js";
 import { readRepositoryWorkerProjectSnapshot } from "./repository-project-source.js";
 import type { RepositoryWorkerProjectSnapshot } from "./repository-project-source.schema.js";
-import { deriveEnvironmentIntent } from "./service-contract.js";
 import type { WorkerEnvironmentRecord, WorkerEnvironmentStore } from "./store.js";
 
 const HUMAN_PRESENCE_RETIRE_AFTER_MS = 15 * 60 * 1_000;
@@ -59,7 +56,7 @@ export type EffectivePreparedDemand = Pick<
 
 export type PreparedPoolPresenceOptions = {
   store: WorkerEnvironmentStore;
-  getConfig: () => OpenClawConfig;
+  admission: PreparedPoolAdmission;
   prepareIntent: (
     profileId: string,
     options: {
@@ -92,7 +89,7 @@ export type PreparedPoolPresenceOptions = {
 };
 
 export function createPreparedPoolPresence(options: PreparedPoolPresenceOptions) {
-  const { store, signal, now } = options;
+  const { store, signal, now, admission } = options;
   let humanPresent = false;
   let humanPresenceObserved = false;
   let humanPresenceChangedAtMs = now();
@@ -103,7 +100,7 @@ export function createPreparedPoolPresence(options: PreparedPoolPresenceOptions)
   let standing:
     | {
         source: StandingImageDemandSource;
-        policy: { providerId: string; target: number; maxTotal: number };
+        policy: PreparedPoolPolicy;
         intent: WorkerProviderPreparedIntent;
         demand: EffectivePreparedDemand;
       }
@@ -112,24 +109,12 @@ export function createPreparedPoolPresence(options: PreparedPoolPresenceOptions)
   const current = () => signal.throwIfAborted();
   const standingSource = () =>
     process.env.FACTORY_AUTH_MODE === "github" ? options.resolveStandingImageDemand?.() : undefined;
-  const workerPolicy = (profileId: string) => {
-    const config = options.getConfig().cloudWorkers;
-    const profile = config?.profiles?.[profileId];
-    const providerId = profile && normalizeCapabilityProviderId(profile.provider);
-    return profile && providerId
-      ? {
-          providerId,
-          target: profile.readyWorkers ?? 1,
-          maxTotal: config?.preparedPool?.maxTotal ?? 4,
-        }
-      : undefined;
-  };
   const readStanding = () => {
     if (
       !standing ||
       signal.aborted ||
       !isDeepStrictEqual(standing.source, standingSource()) ||
-      !isDeepStrictEqual(standing.policy, workerPolicy(standing.source.profileId))
+      !isDeepStrictEqual(standing.policy, admission.policy(standing.source.profileId))
     ) {
       return undefined;
     }
@@ -146,14 +131,14 @@ export function createPreparedPoolPresence(options: PreparedPoolPresenceOptions)
     state: EffectivePreparedDemand,
     assertSourceCurrent: () => void,
   ) => {
-    const limits = workerPolicy(state.profileId);
-    if (!limits || limits.providerId !== intent.providerId) {
+    const limits = admission.policy(state.profileId);
+    if (!limits.providerId || limits.providerId !== intent.providerId) {
       throw new Error("Prepared-pool worker profile changed during preparation");
     }
     const assertCurrent = () => {
       current();
       assertSourceCurrent();
-      if (!isDeepStrictEqual(limits, workerPolicy(state.profileId))) {
+      if (!isDeepStrictEqual(limits, admission.policy(state.profileId))) {
         throw new Error("Prepared-pool admission limits changed");
       }
       options.assertIntentCurrent(state.profileId, intent);
@@ -165,21 +150,14 @@ export function createPreparedPoolPresence(options: PreparedPoolPresenceOptions)
       ...limits,
     });
     for (let index = 0; index < slots; index += 1) {
-      const admitted = await store.ensurePreparedIntent({
-        intent: {
-          ...deriveEnvironmentIntent(`prepared:${randomUUID()}`),
-          providerId: limits.providerId,
-          profileId: state.profileId,
-          profileSnapshot: intent.profileSnapshot,
-          preparation: {
-            purpose: "reserve",
-            key: state.preparationKey,
-            demandAtMs: state.demandAtMs,
-            expiresAtMs: PRESENCE_RESERVE_EXPIRY_MS,
-          },
-        },
+      const admitted = await admission.reserve({
+        intent,
+        profileId: state.profileId,
+        preparationKey: state.preparationKey,
+        demandAtMs: state.demandAtMs,
+        expiresAtMs: PRESENCE_RESERVE_EXPIRY_MS,
         projectKey: state.project.key,
-        ...limits,
+        limits,
         assertCurrent,
       });
       assertCurrent();
@@ -189,8 +167,8 @@ export function createPreparedPoolPresence(options: PreparedPoolPresenceOptions)
     }
   };
   const maintainStanding = async (source: StandingImageDemandSource) => {
-    const limits = workerPolicy(source.profileId);
-    if (!limits || limits.target <= 0 || limits.maxTotal <= 0) {
+    const limits = admission.policy(source.profileId);
+    if (!limits.providerId || limits.target <= 0 || limits.maxTotal <= 0) {
       standing = undefined;
       return undefined;
     }
@@ -198,7 +176,7 @@ export function createPreparedPoolPresence(options: PreparedPoolPresenceOptions)
       current();
       if (
         !isDeepStrictEqual(source, standingSource()) ||
-        !isDeepStrictEqual(limits, workerPolicy(source.profileId))
+        !isDeepStrictEqual(limits, admission.policy(source.profileId))
       ) {
         throw new Error("Standing image demand changed during preparation");
       }

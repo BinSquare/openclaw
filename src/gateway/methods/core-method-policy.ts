@@ -78,6 +78,11 @@ export function isCoreGatewayMethodClassified(method: string): boolean {
   return CORE_GATEWAY_METHOD_SPEC_BY_NAME.has(method);
 }
 
+/** Only explicitly audited core readers may enter the frozen Gateway lifetime. */
+export function isGatewaySuspendedReaderMethod(method: string): boolean {
+  return CORE_GATEWAY_METHOD_SPEC_BY_NAME.get(method)?.suspendedReader === true;
+}
+
 export function createCoreGatewayMethodDescriptors(
   handlers: Record<string, GatewayMethodHandler>,
 ): GatewayMethodDescriptorInput[] {

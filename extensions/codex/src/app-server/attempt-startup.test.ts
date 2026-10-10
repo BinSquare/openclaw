@@ -690,6 +690,43 @@ describe("startCodexAttemptThread", () => {
     expect(harness.stdinDestroyed).toBe(true);
   });
 
+  it("keeps worker-native startup out of exec-server registration", async () => {
+    const harness = createCodexLifecycleHarness({
+      respond: (method) => {
+        if (method === "config/read") {
+          return { config: {}, origins: {}, layers: [] };
+        }
+        if (method === "configRequirements/read") {
+          return { requirements: null };
+        }
+        if (method === "thread/start") {
+          return threadStartResult("worker-native-thread");
+        }
+        throw new Error(`unexpected worker-native request: ${method}`);
+      },
+    });
+    const sandbox = {
+      ...createSandboxContext({}),
+      placementExecutionMode: "remote-exec",
+      placementNodeId: "worker-node",
+    };
+    const { run } = startThreadWithHarness(5_000, undefined, {
+      harness,
+      pluginConfig: { appServer: { command: "codex", workerHostedCloud: true } },
+      sandbox,
+      sandboxExecServerEnabled: true,
+    });
+    const result = await run;
+    try {
+      expect(result.thread.threadId).toBe("worker-native-thread");
+      expect(result.sandboxEnvironment).toBeUndefined();
+      expect(readHarnessRequestMethods(harness)).not.toContain("environment/add");
+    } finally {
+      result.turnRoute.release();
+      result.releaseSharedClientLease();
+    }
+  });
+
   it("retires each fresh paired-node app-server and its registered environment", async () => {
     const runtime = createPairedAttemptRuntime();
     const clients = [

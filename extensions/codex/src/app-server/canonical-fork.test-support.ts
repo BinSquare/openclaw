@@ -27,6 +27,7 @@ import {
   resolveCodexSupervisionAppServerRuntimeOptions,
   type CodexPluginConfig,
 } from "./config.js";
+import { resolveCodexExecutionPlan } from "./execution-plan.js";
 import { acquireCodexNativeConfigFence } from "./native-config-fence.js";
 import { buildCodexAppServerConnectionFingerprint } from "./plugin-app-cache-key.js";
 import type { CodexAttemptRuntime } from "./run-attempt-runtime.js";
@@ -268,6 +269,7 @@ export async function createCanonicalForkFixture(params: {
           await options.beforeStartup?.(host.invalidate);
           startup = await startCodexAttemptThread({
             attemptClientFactory: getLeasedSharedCodexAppServerClient,
+            executionPlan: resolveCodexExecutionPlan({ pluginConfig, target: null }),
             bindingStore,
             buildAttemptParams: () => attempt,
             pluginConfig,

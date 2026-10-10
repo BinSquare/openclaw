@@ -33,7 +33,8 @@ import {
   captureGatewayDeviceRevocation,
   onGatewayDeviceSourceRevoked,
 } from "./device-revocation.js";
-import { factoryGitHubDispatchCredentialReader } from "./factory-github-proof.js";
+import { isFactoryGitHubActor } from "./factory-github-actor.js";
+import { factoryGitHubRecoveryDispatchCredentialReader } from "./factory-github-proof.js";
 import {
   resumeGatewayOperatorAccessGrant,
   GatewayOperatorAccessDeniedError,
@@ -97,11 +98,7 @@ export async function restoreGatewayGoalRecoveryAuthority(params: {
     !isRecord(basis) ||
     basis.version !== 1 ||
     typeof basis.profileId !== "string" ||
-    !isRecord(basis.factoryActor) ||
-    basis.factoryActor.host !== "microsoft.ghe.com" ||
-    typeof basis.factoryActor.accountId !== "number" ||
-    !Number.isSafeInteger(basis.factoryActor.accountId) ||
-    basis.factoryActor.accountId <= 0 ||
+    !isFactoryGitHubActor(basis.factoryActor) ||
     !(basis.assignedRole === null || typeof basis.assignedRole === "string") ||
     !(basis.rolePolicyGeneration === null || typeof basis.rolePolicyGeneration === "string") ||
     !strings(basis.aliasBindingIds) ||
@@ -501,69 +498,23 @@ export async function restoreGatewayGoalRecoveryAuthority(params: {
         sandboxRequired: capturedSourcePolicy.sandbox === "required",
         agents: capturedSourcePolicy.agents,
       },
-      createFactoryGitHubDispatchCredentialReader: (target) => {
-        const assertTargetCurrent = () => {
-          assertCurrent();
-          target.assertCurrent();
-          if (
-            target.agentId !== params.agentId ||
-            target.sessionKey !== params.sessionKey ||
-            target.sessionId !== intent.sessionId ||
-            new URL(target.repositoryUrl).hostname !== factoryActor.host
-          ) {
-            deny();
-          }
-        };
-        assertTargetCurrent();
-        const workspaceId = initialWorkspaceId;
-        const acceptedRepository = repository;
-        if (!workspaceId || !acceptedRepository) {
-          throw new GatewayOperatorAccessDeniedError();
-        }
-        const assertRepositoryFactsCurrent = () => {
-          const current = acceptedRepository.current();
-          const sessionFacts = session!.readCurrent(getConfig());
-          if (
-            !current ||
-            sessionFacts.target.entry.repositoryWorkspaceId !== workspaceId ||
-            current.workspaceId !== workspaceId ||
-            current.agentId !== target.agentId ||
-            current.sessionKey !== target.sessionKey ||
-            current.url !== target.repositoryUrl
-          ) {
-            deny();
-          }
-        };
-        const assertRepositoryCurrent = async () => {
-          assertTargetCurrent();
-          const beforeWorkspaceId = await assertGoalCurrent();
-          assertTargetCurrent();
-          assertRepositoryFactsCurrent();
-          if (beforeWorkspaceId !== workspaceId) {
-            deny();
-          }
-          if ((await assertGoalCurrent()) !== workspaceId) {
-            deny();
-          }
-        };
-        const reader = factoryGitHubDispatchCredentialReader({
-          ...target,
+      createFactoryGitHubDispatchCredentialReader: (target) =>
+        factoryGitHubRecoveryDispatchCredentialReader({
+          target,
           issuerAuthority: authority,
-          assertCurrent: () => {
-            assertTargetCurrent();
-            assertRepositoryFactsCurrent();
+          actor: factoryActor,
+          session: {
+            agentId: params.agentId,
+            sessionKey: params.sessionKey,
+            sessionId: intent.sessionId,
           },
-        });
-        if (!reader) {
-          throw new GatewayOperatorAccessDeniedError();
-        }
-        return async (env, admission) => {
-          await assertRepositoryCurrent();
-          const token = await reader(env, admission);
-          await assertRepositoryCurrent();
-          return token;
-        };
-      },
+          workspaceId: initialWorkspaceId,
+          repository,
+          readSessionWorkspaceId: () =>
+            session!.readCurrent(getConfig()).target.entry.repositoryWorkspaceId,
+          assertCurrent,
+          assertGoalCurrent,
+        }),
       gatewayAccessGrant: basis.grant,
       assertCurrent,
       signal: abort.signal,

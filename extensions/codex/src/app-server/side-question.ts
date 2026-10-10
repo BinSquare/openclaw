@@ -33,8 +33,6 @@ import {
 import {
   canUseCodexModelBackedApprovalsReviewerForModel,
   hasCodexMcpToolApprovalOverrides,
-  isCodexPairedNodeRemoteExecPlacementSandbox,
-  isCodexRemoteExecPlacementSandbox,
   isCodexSandboxExecServerEnabled,
   readCodexPluginConfig,
   readCodexRequirementsToml,
@@ -48,7 +46,6 @@ import {
   resolveCodexExternalSandboxPolicyForOpenClawSandbox,
   resolveCodexSandboxEnvironmentSelection,
   shouldEnableCodexAppServerNativeToolSurface,
-  shouldRequireCodexSandboxExecServerEnvironment,
 } from "./dynamic-tool-build.js";
 import {
   emitDynamicToolErrorDiagnostic,
@@ -64,6 +61,7 @@ import { routeCodexAppServerElicitationRequest } from "./elicitation-bridge.js";
 import { createCodexElicitationResponse } from "./elicitation-response.js";
 import { CodexEphemeralTurn } from "./ephemeral-turn.js";
 import { CodexNativeToolLifecycleProjector } from "./event-projector-native-tool-lifecycle.js";
+import { resolveCodexExecutionPlan } from "./execution-plan.js";
 import {
   assertCodexPreparedEndpointBinding,
   prepareCodexInferenceRoute,
@@ -171,7 +169,8 @@ export async function runCodexAppServerSideQuestion(
       "Codex /btw needs an active Codex thread. Send a normal message first, then try /btw again.",
     );
   }
-  if (isCodexPairedNodeRemoteExecPlacementSandbox(params.sandbox)) {
+  const executionPlan = resolveCodexExecutionPlan({ target: params.sandbox });
+  if (executionPlan.appServer !== "shared") {
     throw new Error(
       "Normal Codex turns are supported on nodes, but /btw is not yet bound to the active placement.",
     );
@@ -207,7 +206,7 @@ export async function runCodexAppServerSideQuestion(
         authProfileStore: preparedRuntimeAuth.authProfileStore,
         agentDir: params.agentDir,
         homeScope: resolveCodexAppServerHomeScope({ appServer: pluginConfig.appServer }),
-        requirePreparedAuth: isCodexRemoteExecPlacementSandbox(params.sandbox),
+        requirePreparedAuth: executionPlan.remoteExec,
         config: params.cfg,
         subscriptionProfileRequiredError:
           "Prepared Codex subscription route requires a scoped native OAuth or token profile.",
@@ -321,8 +320,7 @@ export async function runCodexAppServerSideQuestion(
     params.sandbox ?? undefined,
     { agentId: sideRunParams.agentId, sandboxExecServerEnabled },
   );
-  const sandboxEnvironmentRequired = shouldRequireCodexSandboxExecServerEnvironment({
-    sandbox: params.sandbox ?? undefined,
+  const sandboxEnvironmentRequired = executionPlan.requiresSandboxExecServer({
     nativeToolSurfaceEnabled,
     sandboxExecServerEnabled,
   });

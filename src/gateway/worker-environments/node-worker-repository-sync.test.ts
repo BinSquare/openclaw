@@ -71,6 +71,7 @@ it.each(["errno", "nested", "rpc", "unknown", "abort", "sink", "hostile"] as con
         credential: { ownerEpoch: record.ownerEpoch, sessionId: "session-1" },
       }),
     });
+    const clock = vi.spyOn(performance, "now").mockReturnValue(100);
     const actions = createNodeWorkerWorkspaceActions({
       environmentId: record.environmentId,
       ownerEpoch: record.ownerEpoch,
@@ -80,6 +81,7 @@ it.each(["errno", "nested", "rpc", "unknown", "abort", "sink", "hostile"] as con
       workspaceTransfer: service,
       runWorkspaceCommand: async (command) => {
         command.assertCurrent?.();
+        clock.mockReturnValue(350.25);
         throw failure;
       },
     });
@@ -107,7 +109,7 @@ it.each(["errno", "nested", "rpc", "unknown", "abort", "sink", "hostile"] as con
           ownerEpoch: record.ownerEpoch,
           generation: 17,
           diagnosticCode: "operation_failed",
-          elapsedMs: expect.any(Number),
+          elapsedMs: 250.25,
           innerDiagnosticCode:
             kind === "unknown" || kind === "hostile"
               ? undefined
@@ -123,6 +125,7 @@ it.each(["errno", "nested", "rpc", "unknown", "abort", "sink", "hostile"] as con
       expect(logged).not.toContain("private-source.git");
       expect(logged).not.toContain("stack");
     } finally {
+      clock.mockRestore();
       await service.closeAll();
     }
   },
