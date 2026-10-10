@@ -41,6 +41,11 @@ it.each([
   "late intent replacement",
   "unknown effect",
   "wrong issuer intent",
+  ...([
+    "terminal source residue",
+    "changed source residue",
+    "terminal source unknown effect",
+  ] as const),
 ] as const)("retains fresh NoGoal foreground custody without replay: %s", async (mode) => {
   await withOpenClawTestState({ label: "current-recovery-input" }, async (state) => {
     vi.stubEnv("FACTORY_AUTH_MODE", "github");
@@ -61,6 +66,21 @@ it.each([
       mainRestartRecovery: { cycleId: "original-cycle", revision: 1, chargedAttempts: 0 },
     });
     const scope = { ...target, sessionId };
+    const historical =
+      mode.startsWith("terminal source") || mode === "changed source residue"
+        ? await stageSessionPendingInput(scope, {
+            runId: "historical-interrupted-run",
+            message: {
+              role: "user",
+              content: "Historical held input",
+              timestamp: 1,
+              idempotencyKey: "historical-interrupted-run:user",
+            },
+            assertCurrent: authority.assertCurrent,
+          })
+        : undefined;
+    historical?.finish("interrupted");
+    await historical?.settled?.();
     const finishEntered = createDeferredCore();
     const releaseFinish = createDeferredCore();
     if (mode === "settling owner") {
@@ -102,7 +122,20 @@ it.each([
     );
     const dispatch = vi.spyOn(fixture.runtime.recovery, "dispatchAgent");
     const warnings = vi.spyOn(mainSessionRecoveryLog, "warn");
-    if (mode === "unknown effect") {
+    if (mode.startsWith("terminal source") || mode === "changed source residue") {
+      const entry = loadSessionEntry(target)!;
+      await replaceSessionEntry(target, {
+        ...entry,
+        restartRecoveryRuns: undefined,
+        lifecycleRunId: undefined,
+        activeWriterRunId: undefined,
+        restartRecoveryDeliveryRunId: undefined,
+        restartRecoveryDeliverySourceRunId:
+          mode === "changed source residue" ? "changed-prior-run" : "completed-prior-run",
+        restartRecoveryTerminalRunIds: ["completed-prior-run"],
+      });
+    }
+    if (mode === "unknown effect" || mode === "terminal source unknown effect") {
       await appendTranscriptMessage(scope, {
         message: {
           role: "assistant",
@@ -159,10 +192,13 @@ it.each([
     vi.spyOn(restartRecovery, "retryRestartAbortedMainSessionRecovery").mockImplementation(
       async (request) => {
         const result = await retryActual(request);
-        if (mode === "current" || mode.startsWith("late ")) {
+        if (mode === "current" || mode === "terminal source residue" || mode.startsWith("late ")) {
           expect(result.currentInput?.kind).toBe("current-input");
         } else {
           expect(result.currentInput).toBeUndefined();
+        }
+        if (mode === "changed source residue") {
+          expect(result.authorityHold?.reason).toBe("source-mismatch");
         }
         if (mode === "late issuer revoke") {
           await setCanonicalUserProfileRole(fixture.profile.id, "revoked");
@@ -194,15 +230,17 @@ it.each([
               }
               return await admit();
             });
-      if (mode !== "current") {
+      if (mode !== "current" && mode !== "terminal source residue") {
         await expect(admission).rejects.toThrow(
           mode === "late issuer revoke"
             ? /access|role|authority/i
             : mode === "late lifecycle rotation" || mode === "late intent replacement"
               ? /changed|ownership ended/i
-              : mode === "unknown effect"
+              : mode === "unknown effect" || mode === "terminal source unknown effect"
                 ? /paused|verified outcome/i
-                : /Restart recovery failed|ownership ended/i,
+                : mode === "changed source residue"
+                  ? /original accepted authority|source-mismatch/i
+                  : /Restart recovery failed|ownership ended/i,
         );
         expect(dispatch).not.toHaveBeenCalled();
         expect(loadSessionEntry(target)?.sessionId).toBe(sessionId);
@@ -219,6 +257,16 @@ it.each([
           (await readSessionPendingInputStage(scope, `${runId}:user`, () => {})).existing
             ?.consumed_event_id,
         ).toBeNull();
+        if (historical) {
+          expect(
+            (await readSessionPendingInputStage(scope, "historical-interrupted-run:user", () => {}))
+              .existing,
+          ).toMatchObject({
+            input_id: historical.inputId,
+            state: "interrupted",
+            consumed_event_id: null,
+          });
+        }
         return;
       }
       operation = await admission.catch((error: unknown) => {
@@ -234,6 +282,19 @@ it.each([
       expect(loadSessionEntry(target)?.goal).toBeUndefined();
       expect(loadSessionEntry(target)?.mainRestartRecovery?.chargedAttempts).toBe(0);
       expect(loadSessionEntry(target)?.mainRestartRecovery?.reservation).toBeUndefined();
+      if (historical) {
+        expect(
+          (await readSessionPendingInputStage(scope, "historical-interrupted-run:user", () => {}))
+            .existing,
+        ).toMatchObject({
+          state: "interrupted",
+          consumed_event_id: null,
+          input_id: historical.inputId,
+        });
+        expect(loadSessionEntry(target)?.restartRecoveryDeliverySourceRunId).not.toBe(
+          "completed-prior-run",
+        );
+      }
       expect(
         (await readSessionPendingInputStage(scope, `${runId}:user`, authority.assertCurrent))
           .existing,

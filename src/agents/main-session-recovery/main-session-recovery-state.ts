@@ -35,6 +35,7 @@ import {
   transitionMainSessionRecoveryCapacityWait,
   updateRecoveryState,
 } from "./main-session-recovery-state-transitions.js";
+import { retireTerminalMainSessionRecoverySource } from "./main-session-recovery-terminal-source.js";
 import type {
   MainSessionRecoveryCommand,
   MainSessionRecoveryTransitionResult,
@@ -321,6 +322,7 @@ export function transitionMainSessionRecovery(
       };
     }
     case "observe": {
+      retireTerminalMainSessionRecoverySource(entry, command.sessionKey);
       if (
         hasMainSessionRecoveryClaim(entry) &&
         entry.abortedLastRun === true &&

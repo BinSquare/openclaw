@@ -168,6 +168,7 @@ export async function commitMainSessionRecovery(params: {
       const previousRecoveryState = entry.mainRestartRecovery;
       const previousRecoveryRuns = entry.restartRecoveryRuns;
       const previousDeliveryRunId = entry.restartRecoveryDeliveryRunId;
+      const previousDeliverySourceRunId = entry.restartRecoveryDeliverySourceRunId;
       const command =
         (params.command.kind === "claim_foreground" ||
           params.command.kind === "observe" ||
@@ -180,6 +181,7 @@ export async function commitMainSessionRecovery(params: {
         previousRecoveryState !== entry.mainRestartRecovery ||
         previousRecoveryRuns !== entry.restartRecoveryRuns ||
         previousDeliveryRunId !== entry.restartRecoveryDeliveryRunId ||
+        previousDeliverySourceRunId !== entry.restartRecoveryDeliverySourceRunId ||
         (transition.kind !== "foreground_validated" &&
           transition.kind !== "no_change" &&
           transition.kind !== "observed" &&

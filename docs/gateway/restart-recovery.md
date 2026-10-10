@@ -76,6 +76,12 @@ active and idle. This preflight retains the worker and interrupted inputs; it do
 not archive, reset, reclaim, or replay them. A settling turn, replaced placement
 authority, or revoked caller still prevents reconciliation.
 
+When a terminal delivery source remains beside a different current accepted
+intent, recovery observation retires only that source ID after writer, delivery
+and recovery claims are absent. The current input keeps its original issuer and
+custody; older interrupted inputs remain held. A changed or nonterminal source,
+revoked issuer, or unknown external effect still prevents admission.
+
 Captured goal metadata preserves intent but does not retain the original caller's
 authority. Captured goals without a durable, verified issuer binding remain held
 by startup recovery; the Gateway cannot substitute its System caller. Their goal,
