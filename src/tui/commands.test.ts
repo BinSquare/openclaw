@@ -74,6 +74,14 @@ describe("getSlashCommands", () => {
     ]);
   });
 
+  it("offers /fast ultrafast", () => {
+    const fast = getSlashCommands().find((candidate) => candidate.name === "fast");
+
+    expect(fast?.getArgumentCompletions?.("u")).toEqual([
+      { value: "ultrafast", label: "ultrafast" },
+    ]);
+  });
+
   it.each([
     { command: "think", alias: "t", level: "max" },
     { command: "verbose", alias: "v", level: "full" },
@@ -235,7 +243,7 @@ describe("helpText", () => {
 
     expect(output).toContain("/model <provider/model|default>");
     expect(output).toMatch(/\/think <[^>]+\|default>/u);
-    expect(output).toContain("/fast <status|auto|on|off|default>");
+    expect(output).toMatch(/\/fast <[^>]+\|default>/u);
   });
 
   it("shows required arguments in shared command help", () => {
