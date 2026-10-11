@@ -1,70 +1,13 @@
-name: Composer remaining contract comparison
+name: Composer Home content diagnostic
 on:
   push:
     branches: [solid2/w-chat-5-evidence]
 permissions:
   contents: read
 concurrency:
-  group: composer-final-contract-comparison
+  group: composer-home-content-diagnostic
   cancel-in-progress: false
 jobs:
-  compare:
-    name: Contract comparison (${{ matrix.label }})
-    runs-on: blacksmith-16vcpu-ubuntu-2404
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      max-parallel: 2
-      matrix:
-        include:
-          - label: head
-            source: f07d1401ab94efa7e4128b13a6219004a7c8b248
-          - label: base
-            source: ed684fc775159cb4a3294667789c4e9e86e9293e
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          ref: ${{ matrix.source }}
-          persist-credentials: false
-      - uses: ./.github/actions/setup-node-env
-        with:
-          node-version: 24.x
-          install-bun: "false"
-          cache-mode: restore
-          dependency-cache: "true"
-          restore-test-caches: "true"
-      - uses: ./.github/actions/setup-playwright-chromium
-        with:
-          cache-mode: restore
-      - name: Compare remaining failures
-        env:
-          OPENCLAW_CAPTURE_UI_PROOF: "1"
-          OPENCLAW_UI_E2E_ARTIFACT_DIR: .artifacts/inherited-proof/screenshots
-          OPENCLAW_UI_E2E_DIAGNOSTIC_DIR: .artifacts/inherited-proof/diagnostics
-        run: |
-          set -euo pipefail
-          mkdir -p .artifacts/inherited-proof
-          git rev-parse HEAD | tee .artifacts/inherited-proof/source.txt
-          node scripts/run-vitest.mjs run --config test/vitest/vitest.ui-e2e.config.ts --configLoader runner --maxWorkers 1 \
-            ui/src/e2e/chat-composer-pointer-activation.e2e.test.ts \
-            ui/src/e2e/chat-scroll.e2e.test.ts \
-            ui/src/e2e/chat-flow.queue-edit.e2e.test.ts \
-            ui/src/e2e/chat-flow.queue-reorder.e2e.test.ts \
-            ui/src/e2e/chat-goal-recovery.e2e.test.ts \
-            ui/src/e2e/session-progress-disclosure.e2e.test.ts \
-            ui/src/e2e/model-provider-usage-outcomes.e2e.test.ts \
-            ui/src/e2e/session-progress-polish.e2e.test.ts 2>&1 | tee .artifacts/inherited-proof/results.log
-      - name: Verify source remained unchanged
-        if: always()
-        run: git diff --exit-code && git diff --cached --exit-code
-      - name: Upload comparison logs and diagnostics
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: composer-contract-${{ matrix.label }}-${{ github.run_id }}
-          path: .artifacts/inherited-proof
-          if-no-files-found: warn
-          retention-days: 7
   home-diagnostic:
     name: Home progress diagnostic (head only)
     runs-on: blacksmith-16vcpu-ubuntu-2404
@@ -96,7 +39,7 @@ jobs:
           s = p.read_text()
           helper_marker = "      try {\n        // The dock requires advertised history/send capabilities"
           assert s.count(helper_marker) == 1
-          s = s.replace(helper_marker, '      const captureHomeDiagnostic = async (label: string) => {\n        const snapshot = await page.evaluate(() => {\n          const host = document.querySelector("openclaw-home-session");\n          const pane = host?.querySelector("openclaw-chat-pane") as (HTMLElement & {\n            presented?: boolean;\n            visuallyPresented?: boolean;\n            compact?: boolean;\n            progressCard?: { card?: unknown };\n            progressCardPresentation?: { card?: unknown; identity?: string } | null;\n            progressCardInitialLoading?: boolean;\n          }) | null;\n          const shell = host?.querySelector(".chat-composer");\n          return {\n            paneFound: Boolean(pane),\n            presented: pane?.presented,\n            visuallyPresented: pane?.visuallyPresented,\n            compact: pane?.compact,\n            card: pane?.progressCard?.card,\n            presentation: pane?.progressCardPresentation ? { card: pane.progressCardPresentation.card, identity: pane.progressCardPresentation.identity } : null,\n            initialLoading: pane?.progressCardInitialLoading,\n            progressFloats: host?.querySelectorAll(".agent-chat__progress-float").length,\n            progressCards: host?.querySelectorAll("[data-progress-card-placement]").length,\n            composerVisible: Boolean(shell?.getClientRects().length),\n            childText: host?.textContent?.slice(-2500),\n          };\n        });\n        console.log("[home-progress-diagnostic]", label, JSON.stringify(snapshot));\n        const directory = ".artifacts/home-diagnostic";\n        await mkdir(directory, { recursive: true });\n        await writeFile(path.join(directory, `${reducedMotion}-${mobile}-${label}.png`),\n          await page.screenshot({ fullPage: false }));\n      };\n' + helper_marker)
+          s = s.replace(helper_marker, '      const captureHomeDiagnostic = async (label: string) => {\n        const snapshot = await page.evaluate(() => {\n          const host = document.querySelector("openclaw-home-session");\n          const pane = host?.querySelector("openclaw-chat-pane") as (HTMLElement & {\n            presented?: boolean;\n            visuallyPresented?: boolean;\n            compact?: boolean;\n            progressCard?: { card?: unknown };\n            progressCardPresentation?: { card?: unknown; identity?: string } | null;\n            progressCardInitialLoading?: boolean;\n          }) | null;\n          const shell = host?.querySelector(".agent-chat__composer-shell");\n          const float = host?.querySelector<HTMLElement>(".agent-chat__progress-float");\n          const footer = float?.closest(".chat-footer__context");\n          const layout = (element: Element | null | undefined) => element ? { hidden: element.hasAttribute("hidden"), display: getComputedStyle(element).display, visibility: getComputedStyle(element).visibility, rects: element.getClientRects().length } : null;\n          return {\n            paneFound: Boolean(pane),\n            presented: pane?.presented,\n            visuallyPresented: pane?.visuallyPresented,\n            compact: pane?.compact,\n            card: pane?.progressCard?.card,\n            presentation: pane?.progressCardPresentation ? { card: pane.progressCardPresentation.card, identity: pane.progressCardPresentation.identity } : null,\n            initialLoading: pane?.progressCardInitialLoading,\n            floatClass: float?.className,\n            floatHtml: float?.outerHTML.slice(0, 3000),\n            floatLayout: layout(float),\n            footerLayout: layout(footer),\n            shellLayout: layout(shell),\n            litContents: float?.querySelectorAll(".chat-composer-lit-content").length,\n            litHtml: float?.querySelector(".chat-composer-lit-content")?.innerHTML.slice(0, 3000),\n            progressFloats: host?.querySelectorAll(".agent-chat__progress-float").length,\n            progressCards: host?.querySelectorAll("[data-progress-card-placement]").length,\n            composerVisible: Boolean(shell?.getClientRects().length),\n            childText: host?.textContent?.slice(-2500),\n          };\n        });\n        console.log("[home-progress-diagnostic]", label, JSON.stringify(snapshot));\n        const directory = ".artifacts/home-diagnostic";\n        await mkdir(directory, { recursive: true });\n        await writeFile(path.join(directory, `${reducedMotion}-${mobile}-${label}.png`),\n          await page.screenshot({ fullPage: false }));\n      };\n' + helper_marker)
           startup_marker = '        await openProgressHomeDock(page);\n        await gateway.waitForRequest("chat.startup", { match: { sessionKey } });'
           assert s.count(startup_marker) == 1
           s = s.replace(startup_marker, startup_marker + '\n        await captureHomeDiagnostic("after-startup");')
@@ -121,7 +64,7 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: composer-home-diagnostic-${{ github.run_id }}
+          name: composer-home-content-${{ github.run_id }}
           path: .artifacts/home-diagnostic
           if-no-files-found: warn
           retention-days: 7
