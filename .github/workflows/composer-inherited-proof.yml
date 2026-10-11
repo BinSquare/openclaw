@@ -1,17 +1,77 @@
-name: Composer Home content diagnostic
+name: Composer Home candidate proof
 on:
   push:
     branches: [solid2/w-chat-5-evidence]
 permissions:
   contents: read
 concurrency:
-  group: composer-home-content-diagnostic
+  group: composer-home-candidate-proof
   cancel-in-progress: false
 jobs:
-  home-diagnostic:
-    name: Home progress diagnostic (head only)
+  home-candidate:
+    name: Home stable child-owner candidate
     runs-on: blacksmith-16vcpu-ubuntu-2404
-    timeout-minutes: 20
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: f07d1401ab94efa7e4128b13a6219004a7c8b248
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          path: .evidence
+          persist-credentials: false
+      - name: Verify and apply the exact candidate
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts/home-candidate
+          git rev-parse HEAD > .artifacts/home-candidate/source.txt
+          echo "d4a29358b9d7cd7f6c6aec932fb30f670a9aac3cfe5b2b393e0ba9b35b14a491  .evidence/home-progress-candidate.patch" | sha256sum --check
+          echo "72ac4d6964acb70fea7d7b66e710dca5190a8996b415b50517b7680df75241c2  ui/src/pages/chat/components/chat-composer-regions.tsx" | sha256sum --check
+          git apply --check .evidence/home-progress-candidate.patch
+          git apply .evidence/home-progress-candidate.patch
+          git diff --binary > .artifacts/home-candidate/applied.patch
+          sha256sum .evidence/home-progress-candidate.patch ui/src/pages/chat/components/chat-composer-regions.tsx > .artifacts/home-candidate/candidate.sha256
+      - uses: ./.github/actions/setup-node-env
+        with:
+          node-version: 24.x
+          install-bun: "false"
+          cache-mode: restore
+          dependency-cache: "true"
+          restore-test-caches: "true"
+      - uses: ./.github/actions/setup-playwright-chromium
+        with:
+          cache-mode: restore
+      - name: Exercise the four failing Home progress suites
+        env:
+          OPENCLAW_CAPTURE_UI_PROOF: "1"
+          OPENCLAW_UI_E2E_ARTIFACT_DIR: .artifacts/home-candidate/screenshots
+          OPENCLAW_UI_E2E_DIAGNOSTIC_DIR: .artifacts/home-candidate/diagnostics
+        run: |
+          set -euo pipefail
+          node scripts/run-vitest.mjs run --config test/vitest/vitest.ui-e2e.config.ts --configLoader runner --maxWorkers 1 \
+            ui/src/e2e/session-progress-motion.e2e.test.ts \
+            ui/src/e2e/session-progress-scroll.e2e.test.ts \
+            ui/src/e2e/session-progress-disclosure.e2e.test.ts \
+            ui/src/e2e/session-progress-polish.e2e.test.ts 2>&1 | tee .artifacts/home-candidate/results.log
+      - name: Verify only the candidate changed
+        if: always()
+        run: |
+          test "$(git diff --name-only)" = ui/src/pages/chat/components/chat-composer-regions.tsx
+          git diff --cached --exit-code
+          cmp .artifacts/home-candidate/applied.patch <(git diff --binary)
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: composer-home-candidate-${{ github.run_id }}
+          path: .artifacts/home-candidate
+          if-no-files-found: warn
+          retention-days: 7
+  pointer-diagnostic:
+    name: Native pointer focus diagnostic (unpatched head)
+    runs-on: blacksmith-16vcpu-ubuntu-2404
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -27,44 +87,38 @@ jobs:
       - uses: ./.github/actions/setup-playwright-chromium
         with:
           cache-mode: restore
-      - name: Add bounded diagnostic snapshots only to the remote test
+      - name: Add native pointer and textarea identity capture
         run: |
           set -euo pipefail
-          mkdir -p .artifacts/home-diagnostic
-          git rev-parse HEAD > .artifacts/home-diagnostic/source.txt
-          sha256sum ui/src/e2e/session-progress-motion.e2e.test.ts > .artifacts/home-diagnostic/test-before.sha256
+          mkdir -p .artifacts/pointer-diagnostic
+          git rev-parse HEAD > .artifacts/pointer-diagnostic/source.txt
+          sha256sum ui/src/e2e/chat-composer-pointer-activation.e2e.test.ts > .artifacts/pointer-diagnostic/test-before.sha256
           python3 - <<'PY_DIAGNOSTIC'
           from pathlib import Path
-          p = Path("ui/src/e2e/session-progress-motion.e2e.test.ts")
+          p = Path("ui/src/e2e/chat-composer-pointer-activation.e2e.test.ts")
           s = p.read_text()
-          helper_marker = "      try {\n        // The dock requires advertised history/send capabilities"
-          assert s.count(helper_marker) == 1
-          s = s.replace(helper_marker, '      const captureHomeDiagnostic = async (label: string) => {\n        const snapshot = await page.evaluate(() => {\n          const host = document.querySelector("openclaw-home-session");\n          const pane = host?.querySelector("openclaw-chat-pane") as (HTMLElement & {\n            presented?: boolean;\n            visuallyPresented?: boolean;\n            compact?: boolean;\n            progressCard?: { card?: unknown };\n            progressCardPresentation?: { card?: unknown; identity?: string } | null;\n            progressCardInitialLoading?: boolean;\n          }) | null;\n          const shell = host?.querySelector(".agent-chat__composer-shell");\n          const float = host?.querySelector<HTMLElement>(".agent-chat__progress-float");\n          const footer = float?.closest(".chat-footer__context");\n          const layout = (element: Element | null | undefined) => element ? { hidden: element.hasAttribute("hidden"), display: getComputedStyle(element).display, visibility: getComputedStyle(element).visibility, rects: element.getClientRects().length } : null;\n          return {\n            paneFound: Boolean(pane),\n            presented: pane?.presented,\n            visuallyPresented: pane?.visuallyPresented,\n            compact: pane?.compact,\n            card: pane?.progressCard?.card,\n            presentation: pane?.progressCardPresentation ? { card: pane.progressCardPresentation.card, identity: pane.progressCardPresentation.identity } : null,\n            initialLoading: pane?.progressCardInitialLoading,\n            floatClass: float?.className,\n            floatHtml: float?.outerHTML.slice(0, 3000),\n            floatLayout: layout(float),\n            footerLayout: layout(footer),\n            shellLayout: layout(shell),\n            litContents: float?.querySelectorAll(".chat-composer-lit-content").length,\n            litHtml: float?.querySelector(".chat-composer-lit-content")?.innerHTML.slice(0, 3000),\n            progressFloats: host?.querySelectorAll(".agent-chat__progress-float").length,\n            progressCards: host?.querySelectorAll("[data-progress-card-placement]").length,\n            composerVisible: Boolean(shell?.getClientRects().length),\n            childText: host?.textContent?.slice(-2500),\n          };\n        });\n        console.log("[home-progress-diagnostic]", label, JSON.stringify(snapshot));\n        const directory = ".artifacts/home-diagnostic";\n        await mkdir(directory, { recursive: true });\n        await writeFile(path.join(directory, `${reducedMotion}-${mobile}-${label}.png`),\n          await page.screenshot({ fullPage: false }));\n      };\n' + helper_marker)
-          startup_marker = '        await openProgressHomeDock(page);\n        await gateway.waitForRequest("chat.startup", { match: { sessionKey } });'
-          assert s.count(startup_marker) == 1
-          s = s.replace(startup_marker, startup_marker + '\n        await captureHomeDiagnostic("after-startup");')
-          cleanup_marker = "      } finally {\n        await page.close();"
-          assert s.count(cleanup_marker) == 1
-          s = s.replace(cleanup_marker, '      } finally {\n        await captureHomeDiagnostic("before-close");\n        await page.close();')
+          marker = "      await send.tap();"
+          assert s.count(marker) == 1
+          s = s.replace(marker, '      await textarea.evaluate((node) => {\n        const diagnosticWindow = window as Window & {\n          composerDiagnostic?: { original: HTMLTextAreaElement; event?: Event };\n        };\n        const state = { original: node as HTMLTextAreaElement, event: undefined as Event | undefined };\n        diagnosticWindow.composerDiagnostic = state;\n        window.addEventListener("pointerdown", (event) => { state.event = event; }, { once: true });\n      });\n' + marker + "\n" + '      console.log("[pointer-diagnostic]", await page.evaluate(() => {\n        const state = (window as Window & {\n          composerDiagnostic?: { original: HTMLTextAreaElement; event?: Event };\n        }).composerDiagnostic;\n        const current = document.querySelector(".agent-chat__input textarea");\n        return {\n          defaultPrevented: state?.event?.defaultPrevented,\n          cancelable: state?.event?.cancelable,\n          activeTag: document.activeElement?.tagName,\n          activeClass: document.activeElement?.className,\n          activeAriaLabel: document.activeElement?.getAttribute("aria-label"),\n          originalConnected: state?.original.isConnected,\n          sameTextarea: state?.original === current,\n          currentFocused: document.activeElement === current,\n        };\n      }));\n      await page.screenshot({ path: ".artifacts/pointer-diagnostic/after-tap.png", fullPage: false });\n')
           p.write_text(s)
           PY_DIAGNOSTIC
-          git diff -- ui/src/e2e/session-progress-motion.e2e.test.ts > .artifacts/home-diagnostic/diagnostic-test.patch
-          sha256sum ui/src/e2e/session-progress-motion.e2e.test.ts > .artifacts/home-diagnostic/test-after.sha256
-      - name: Capture Home owner and renderer state
+          git diff -- ui/src/e2e/chat-composer-pointer-activation.e2e.test.ts > .artifacts/pointer-diagnostic/diagnostic-test.patch
+          sha256sum ui/src/e2e/chat-composer-pointer-activation.e2e.test.ts > .artifacts/pointer-diagnostic/test-after.sha256
+      - name: Diagnose native touch focus
         env:
-          OPENCLAW_UI_E2E_DIAGNOSTIC_DIR: .artifacts/home-diagnostic/failures
+          OPENCLAW_UI_E2E_DIAGNOSTIC_DIR: .artifacts/pointer-diagnostic/failures
         run: |
           set -euo pipefail
-          node scripts/run-vitest.mjs run --config test/vitest/vitest.ui-e2e.config.ts --configLoader runner --maxWorkers 1 ui/src/e2e/session-progress-motion.e2e.test.ts -t 'scrubs embedded Home' 2>&1 | tee .artifacts/home-diagnostic/results.log
+          node scripts/run-vitest.mjs run --config test/vitest/vitest.ui-e2e.config.ts --configLoader runner --maxWorkers 1 ui/src/e2e/chat-composer-pointer-activation.e2e.test.ts -t 'Android-like tap' 2>&1 | tee .artifacts/pointer-diagnostic/results.log
       - name: Verify only the diagnostic test changed
         if: always()
         run: |
-          test "$(git diff --name-only)" = ui/src/e2e/session-progress-motion.e2e.test.ts
+          test "$(git diff --name-only)" = ui/src/e2e/chat-composer-pointer-activation.e2e.test.ts
           git diff --cached --exit-code
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: composer-home-content-${{ github.run_id }}
-          path: .artifacts/home-diagnostic
+          name: composer-pointer-diagnostic-${{ github.run_id }}
+          path: .artifacts/pointer-diagnostic
           if-no-files-found: warn
           retention-days: 7

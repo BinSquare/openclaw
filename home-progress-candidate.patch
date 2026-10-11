@@ -1,0 +1,38 @@
+diff --git a/ui/src/pages/chat/components/chat-composer-regions.tsx b/ui/src/pages/chat/components/chat-composer-regions.tsx
+index a22f0c0490b03..9cde16604942c 100644
+--- a/ui/src/pages/chat/components/chat-composer-regions.tsx
++++ b/ui/src/pages/chat/components/chat-composer-regions.tsx
+@@ -46,7 +46,7 @@ export function SolidProgressContent(props: {
+     revision();
+     return props.binding?.isPresented() ?? true;
+   };
+-  return <>{presented() ? props.children : undefined}</>;
++  return <Show when={presented()}>{() => props.children}</Show>;
+ }
+ 
+ export function ComposerInputScope(props: {
+@@ -114,12 +114,12 @@ export function ComposerGoal(view: {
+   requestUpdate: () => void;
+ }) {
+   return (
+-    <Show when={view.composer.selectedSession?.goal}>
++    <Show when={view.composer.selectedSession?.goal} keyed>
+       {(goal) => (
+         <div class="agent-chat__goal-float">
+           <ChatGoal
+-            goal={goal()}
+-            expanded={view.state.goalExpandedId === goal().id}
++            goal={goal}
++            expanded={view.state.goalExpandedId === goal.id}
+             canAct={
+               view.composer.connected &&
+               view.composer.canSend &&
+@@ -132,7 +132,7 @@ export function ComposerGoal(view: {
+               view.composer.onGoalSubmit ? (selected) => view.controller.begin(selected) : undefined
+             }
+             onExpandedChange={(expanded) => {
+-              view.state.goalExpandedId = expanded ? goal().id : null;
++              view.state.goalExpandedId = expanded ? goal.id : null;
+               view.requestUpdate();
+             }}
+           />
