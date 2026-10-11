@@ -14,7 +14,15 @@ import type {
 } from "./device-pairing-read.types.js";
 import type { PairedDevice } from "./device-pairing.types.js";
 
-export class DevicePairingPublicationUnavailableError extends Error {}
+export class DevicePairingPublicationUnavailableError extends Error {
+  constructor(
+    message: string,
+    readonly publicationState: "absent" | "blocked" | "incomplete" = "incomplete",
+  ) {
+    super(message);
+    this.name = "DevicePairingPublicationUnavailableError";
+  }
+}
 
 type Publication = {
   identity: string;
@@ -216,6 +224,7 @@ function readPublishedPairing(
   ) {
     throw new DevicePairingPublicationUnavailableError(
       "Device pairing authority requires a current worker publication",
+      !publication ? "absent" : publication.blocked ? "blocked" : "incomplete",
     );
   }
   return publication.rows.get(deviceId);

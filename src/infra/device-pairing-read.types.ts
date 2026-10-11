@@ -4,14 +4,15 @@ import type {
 } from "./device-bootstrap.worker-types.js";
 import type { DevicePairingPendingRequest, PairedDevice } from "./device-pairing.types.js";
 
-export type DevicePairingReadCommand =
-  | { type: "devicePairing.list"; nowMs: number; publishedRevision?: string }
+export type DevicePairingReadCommand = { publishedRevision?: string } & (
+  | { type: "devicePairing.list"; nowMs: number }
   | { type: "devicePairing.lookup"; deviceId: string }
   | { type: "devicePairing.pending"; requestId: string; nowMs: number }
   | {
       type: "devicePairing.bootstrapContext";
       input: DeviceBootstrapBoundContextInput;
-    };
+    }
+);
 
 export type DevicePairingBinding = { identity: string; generation?: string };
 export type DevicePairingBindingFact = {
@@ -29,6 +30,7 @@ export type DevicePairingReadReply = {
   sourceAdmitted: true;
   revision: string;
   bindings: DevicePairingBindingFact[] | undefined;
+  bindingsComplete?: boolean;
 } & (
   | {
       type: "devicePairing.list";

@@ -1,5 +1,7 @@
 import type { WorkerAdmissionHandshake } from "../../../packages/gateway-protocol/src/schema/worker-admission.js";
 import { racePromiseWithAbortSignal } from "../../infra/abort-signal.js";
+import { DevicePairingPublicationUnavailableError } from "../../infra/device-pairing-publication.js";
+import { createSubsystemLogger } from "../../logging/subsystem.js";
 import type {
   WorkerLease,
   WorkerNodeEnrollment,
@@ -423,6 +425,18 @@ export function createWorkerNodeProvisioning(options: WorkerNodeProvisioningOpti
         }
       }
     } catch (error) {
+      if (error instanceof DevicePairingPublicationUnavailableError) {
+        createSubsystemLogger("gateway/worker-environments").warn(
+          "worker_pairing_publication_unavailable",
+          {
+            environmentId: record.environmentId,
+            ownerEpoch: record.ownerEpoch,
+            provisionOperationId: record.provisionOperationId,
+            stage: "post-enrollment-bundle-install",
+            publicationState: error.publicationState,
+          },
+        );
+      }
       await cancellation?.settleStopIntent();
       return await options.failBootstrap(record, lease.leaseId, provider, error, nodePatch);
     }
