@@ -226,7 +226,7 @@ export type WorkerPlacementDispatchRequest = WorkerSessionPlacementDispatchIdent
     profileSnapshot: WorkerProfile;
   };
   /** Transient, current-caller native read; never persisted in a placement. */
-  readNativeCredential?: (env: NodeJS.ProcessEnv) => Promise<string | undefined>;
+  readNativeCredential?: import("../../agents/github-credential-reader.js").GitHubCredentialReader;
   /** Original admitted source for automatic recovery/redispatch; never persisted. */
   operatorAuthority?: import("../../agents/admitted-run-context.js").AdmittedRunOperatorAuthority;
   /** In-process admission custody; the session lifecycle joins background preparation. */
@@ -270,14 +270,14 @@ export type WorkerPlacementMoveDestination = Pick<
 export type WorkerPlacementReclaimRequest = WorkerSessionPlacementIdentity & {
   recoverToGateway?: SessionsReclaimParams["recoverToGateway"];
   /** Exact live caller proof for bounded source reads, never stored in the move intent. */
-  readNativeCredential?: (env: NodeJS.ProcessEnv) => Promise<string | undefined>;
+  readNativeCredential?: import("../../agents/github-credential-reader.js").GitHubCredentialReader;
 };
 
 export type WorkerPlacementMoveRequest = WorkerSessionPlacementIdentity & {
   source: WorkerPlacementMoveSource;
   target: WorkerPlacementMoveTarget;
   abandonSource?: true;
-  readNativeCredential?: (env: NodeJS.ProcessEnv) => Promise<string | undefined>;
+  readNativeCredential?: import("../../agents/github-credential-reader.js").GitHubCredentialReader;
 };
 
 /** Closure-bound request authority; in-process only and never part of durable placement intent. */

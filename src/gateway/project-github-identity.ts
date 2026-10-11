@@ -59,7 +59,7 @@ export async function prepareGatewayProjectGitHubIdentity(params: {
     agentId: params.agentId,
     env: factoryEnv ?? process.env,
     readNativeCredential: credential
-      ? (currentEnv) =>
+      ? (currentEnv, admission) =>
           readFactoryGitHubToken(
             currentEnv,
             factoryGitHubClientProof({
@@ -67,6 +67,7 @@ export async function prepareGatewayProjectGitHubIdentity(params: {
               claim: credential.claim,
               assertCurrent: assertActive,
             }),
+            admission,
           )
       : undefined,
     getCurrentConfig: params.context.getRuntimeConfig,
@@ -82,6 +83,7 @@ export async function prepareConfiguredProjectGitHubIdentity(params: {
   config: OpenClawConfig;
   getCurrentConfig: () => OpenClawConfig;
   assertCurrent: () => void;
+  readNativeCredential?: import("../agents/github-credential-reader.js").GitHubCredentialReader;
 }) {
   const agentId = tryResolveAmbientOwnerAgentId(params.config) ?? "";
   if (
@@ -95,6 +97,7 @@ export async function prepareConfiguredProjectGitHubIdentity(params: {
     config: params.config,
     sourceConfig: getActiveSecretsRuntimeConfigSnapshot()?.sourceConfig ?? params.config,
     agentId,
+    readNativeCredential: params.readNativeCredential,
     getCurrentConfig: params.getCurrentConfig,
     assertActive: params.assertCurrent,
     refresh: () => requestCurrentGitHubOAuthRefresh(agentId),

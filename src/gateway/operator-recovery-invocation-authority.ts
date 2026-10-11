@@ -557,9 +557,9 @@ export async function restoreGatewayGoalRecoveryAuthority(params: {
         if (!reader) {
           throw new GatewayOperatorAccessDeniedError();
         }
-        return async (env) => {
+        return async (env, admission) => {
           await assertRepositoryCurrent();
-          const token = await reader(env);
+          const token = await reader(env, admission);
           await assertRepositoryCurrent();
           return token;
         };

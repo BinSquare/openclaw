@@ -51,7 +51,7 @@ export type WorkerProviderIntentPreparationOptions = {
   runSetupScript?: boolean;
   signal?: AbortSignal;
   setupAuthorized?: boolean;
-  readNativeCredential?: (env: NodeJS.ProcessEnv) => Promise<string | undefined>;
+  readNativeCredential?: import("../../agents/github-credential-reader.js").GitHubCredentialReader;
   imageReserve?: boolean;
   assertCurrent?: () => void;
 };

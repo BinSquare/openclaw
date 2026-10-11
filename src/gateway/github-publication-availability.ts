@@ -100,7 +100,10 @@ export function factoryPublicationNativeReader(
   if (!actor || !credential) {
     throw new Error("GitHub publication requires current actor and credential authority.");
   }
-  return async (env: NodeJS.ProcessEnv) =>
+  return async (
+    env: NodeJS.ProcessEnv,
+    admission?: import("../agents/github-credential-reader.js").GitHubRepositoryAdmissionRequest,
+  ) =>
     await withFactoryPublicationIdentity(
       actor,
       credential,
@@ -108,7 +111,7 @@ export function factoryPublicationNativeReader(
         if (!readNativeCredential) {
           throw new Error("Factory GitHub credential authority is unavailable.");
         }
-        return await readNativeCredential({ ...env, ...proofEnv });
+        return await readNativeCredential({ ...env, ...proofEnv }, admission);
       },
     );
 }
@@ -126,6 +129,11 @@ export async function prepareCurrentGitHubPublicationIdentity(
   const managedExecution = (["agent", "system"] as const).some((scope) =>
     resolveConfiguredGitHubToolIdentity({ config: snapshot.config, agentId, scope }),
   );
+  const appExecution =
+    (
+      resolveConfiguredGitHubToolIdentity({ config: snapshot.config, agentId, scope: "agent" }) ??
+      resolveConfiguredGitHubToolIdentity({ config: snapshot.config, agentId, scope: "system" })
+    )?.kind === "app-installation";
   const assertCurrent = () => {
     actor?.assertCurrent?.();
     credential?.assertCurrent();
@@ -139,7 +147,7 @@ export async function prepareCurrentGitHubPublicationIdentity(
   assertCurrent();
   const prepare = (
     env?: NodeJS.ProcessEnv,
-    readNativeCredential?: (env: NodeJS.ProcessEnv) => Promise<string | undefined>,
+    readNativeCredential?: import("../agents/github-credential-reader.js").GitHubCredentialReader,
   ) =>
     prepareGitHubPublicationIdentity({
       config: snapshot.config,
@@ -149,9 +157,10 @@ export async function prepareCurrentGitHubPublicationIdentity(
       readNativeCredential,
       assertCurrent,
     });
-  const identity = managedExecution
-    ? await prepare()
-    : await withFactoryPublicationIdentity(actor, credential, prepare);
+  const identity =
+    managedExecution && !appExecution
+      ? await prepare()
+      : await withFactoryPublicationIdentity(actor, credential, prepare);
   assertCurrent();
   return identity;
 }
@@ -172,7 +181,7 @@ export async function prepareCurrentGitHubPublicationOptionsIdentity(
   let proofPrepared = false;
   const prepare = (
     env?: NodeJS.ProcessEnv,
-    readNativeCredential?: (env: NodeJS.ProcessEnv) => Promise<string | undefined>,
+    readNativeCredential?: import("../agents/github-credential-reader.js").GitHubCredentialReader,
   ) => {
     proofPrepared = true;
     observeGitHubIdentityPreparation(observePreparation, "credential_proof", "resolved");
@@ -201,7 +210,13 @@ export async function prepareCurrentGitHubPublicationOptionsIdentity(
   };
   assertCurrent();
   const identity = await (
-    managed ? prepare() : withFactoryPublicationIdentity(actor, credential, prepare)
+    managed &&
+    (
+      resolveConfiguredGitHubToolIdentity({ config: snapshot.config, agentId, scope: "agent" }) ??
+      resolveConfiguredGitHubToolIdentity({ config: snapshot.config, agentId, scope: "system" })
+    )?.kind !== "app-installation"
+      ? prepare()
+      : withFactoryPublicationIdentity(actor, credential, prepare)
   ).catch((error: unknown) => {
     if (!proofPrepared) {
       observeGitHubIdentityPreparation(observePreparation, "credential_proof", "rejected");

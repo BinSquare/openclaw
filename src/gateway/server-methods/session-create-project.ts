@@ -143,7 +143,7 @@ export function prepareSessionRepositoryWorkspace(
         assertCurrent: assertNativeCurrent,
         ...(process.env.FACTORY_AUTH_MODE === "github"
           ? {
-              readNativeCredential: async () => {
+              readNativeCredential: async (_selectedEnv, admission) => {
                 assertCurrent();
                 const env = factoryGitHubActorEnvironment(options.client, target.key);
                 if (!env) {
@@ -165,6 +165,7 @@ export function prepareSessionRepositoryWorkspace(
                     },
                     assertCurrent,
                   }),
+                  admission,
                 );
               },
             }

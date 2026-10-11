@@ -46,7 +46,7 @@ export type PlacementRecoveryDeps = {
   prepareGatewayMove?: (
     params: WorkerSessionPlacementIdentity & {
       assertCurrent: () => void;
-      readNativeCredential?: (env: NodeJS.ProcessEnv) => Promise<string | undefined>;
+      readNativeCredential?: import("../../agents/github-credential-reader.js").GitHubCredentialReader;
     },
   ) => Promise<void>;
 };

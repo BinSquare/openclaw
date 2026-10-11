@@ -3,6 +3,7 @@ import {
   assertAdmittedRunOperatorAuthority,
   type AdmittedRunOperatorAuthority,
 } from "../agents/admitted-run-context.js";
+import type { GitHubRepositoryAdmissionRequest } from "../agents/github-credential-reader.js";
 import { resolveGitHubHost, resolveGitHubApiBaseUrl } from "../agents/github-host-runtime.js";
 import {
   GitHubCredentialLookupError,
@@ -10,6 +11,7 @@ import {
 } from "../agents/github-read-identity.js";
 import { prepareUserProfileIdentity } from "../state/user-profile-list.js";
 import type { PreparedUserProfileIdentity } from "../state/user-profiles.types.js";
+import { readFactoryRepositoryAdmission } from "./factory-github-repository-admission.js";
 import type { GatewayClient } from "./server-methods/client-types.js";
 
 const AUDIENCE = "lobster.github.system-token" as const;
@@ -283,9 +285,20 @@ export async function withFactoryGitHubProof<T>(
 export async function readFactoryGitHubToken(
   env: NodeJS.ProcessEnv,
   input: Parameters<typeof issueFactoryGitHubProof>[0],
+  admission?: GitHubRepositoryAdmissionRequest,
 ): Promise<string | undefined> {
   return await withFactoryGitHubProof({ ...input, env }, async (proofEnv, assertCurrent) => {
     assertCurrent();
+    if (admission) {
+      await readFactoryRepositoryAdmission({
+        env: proofEnv,
+        request: admission,
+        claim: input.claim,
+        profileId: input.profileId,
+        assertCurrent,
+      });
+      return undefined;
+    }
     const token = await readNativeGitHubToken(proofEnv, false, resolveGitHubHost());
     assertCurrent();
     if (!token) {
@@ -307,7 +320,7 @@ export function factoryGitHubDispatchCredentialReader(
     | { client: GatewayClient | null | undefined; issuerAuthority?: never }
     | { client?: never; issuerAuthority: AdmittedRunOperatorAuthority }
   ),
-): ((env: NodeJS.ProcessEnv) => Promise<string | undefined>) | undefined {
+): import("../agents/github-credential-reader.js").GitHubCredentialReader | undefined {
   const repositoryUrl = params.repositoryUrl;
   if (process.env.FACTORY_AUTH_MODE !== "github" || !repositoryUrl) {
     return undefined;
@@ -349,9 +362,10 @@ export function factoryGitHubDispatchCredentialReader(
     }
     const actorId = actor.accountId;
     const profileId = authority.profileId;
-    return (env) => readFactoryGitHubToken(env, { actorId, profileId, claim, assertCurrent });
+    return (env, admission) =>
+      readFactoryGitHubToken(env, { actorId, profileId, claim, assertCurrent }, admission);
   }
-  return (env) =>
+  return (env, admission) =>
     readFactoryGitHubToken(
       env,
       factoryGitHubClientProof({
@@ -359,5 +373,6 @@ export function factoryGitHubDispatchCredentialReader(
         claim,
         assertCurrent: params.assertCurrent,
       }),
+      admission,
     );
 }

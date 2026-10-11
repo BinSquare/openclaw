@@ -114,6 +114,7 @@ export async function prepareLocalGitHubEnvironment(params: {
             }
           : {}),
         GH_HOST: host,
+        OPENCLAW_GITHUB_EXECUTION_KIND: grant.binding.executionKind ?? "",
         OPENCLAW_GATEWAY_PASSWORD: "",
         GITHUB_APP_PRIVATE_KEY: "",
         OPENCLAW_GITHUB_APP_PRIVATE_KEY: "",

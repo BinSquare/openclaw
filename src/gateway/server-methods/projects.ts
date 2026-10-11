@@ -53,8 +53,7 @@ import {
   authorizeOperatorScopesForMethod,
   authorizeOperatorScopesForRequiredScope,
 } from "../method-scopes.js";
-import { prepareConfiguredProjectGitHubIdentity } from "../project-github-identity.js";
-import { readFactoryProjectToken } from "../project-github-proof.js";
+import { prepareFactoryProjectIdentity, readFactoryProjectToken } from "../project-github-proof.js";
 import { searchRemoteProjects } from "../project-github-search.js";
 import {
   getSessionRowProjection,
@@ -62,6 +61,7 @@ import {
 } from "../session-row-projection-access.js";
 import { createSessionListEntryFilter } from "../session-sharing.js";
 import { loadCombinedSessionStoreForGatewayCore } from "../session-utils.js";
+import { projectCheckoutError } from "./projects-errors.js";
 import { startProjectsListDiagnostics } from "./projects-list-diagnostics.js";
 import { listProjectRecents } from "./projects-recents.js";
 import { readGatewayRequestMutationAuthority } from "./session-mutation-guards.js";
@@ -167,13 +167,6 @@ function sanitizeProjectRecord(project: ProjectRecord): ProjectRecord {
     ...record,
     ...(sanitizedOriginUrl ? { originUrl: sanitizedOriginUrl } : {}),
   };
-}
-
-function projectCheckoutError(error: unknown) {
-  return errorShape(
-    error instanceof ProjectCheckoutError ? ErrorCodes.INVALID_REQUEST : ErrorCodes.UNAVAILABLE,
-    formatErrorMessage(error),
-  );
 }
 
 function projectCandidatesToSummaries(candidates: readonly ProjectCandidate[]): ProjectSummary[] {
@@ -524,11 +517,12 @@ export function createProjectsHandlers(service: ProjectWorktreeService): Gateway
           }
         };
         assertCurrent();
-        const identity = await prepareConfiguredProjectGitHubIdentity({
-          config: cfg,
-          getCurrentConfig: context.getRuntimeConfig,
-          assertCurrent,
-        });
+        const identity = await prepareFactoryProjectIdentity(
+          { client, context, signal, hasCurrentClientAuthority, assertCurrent },
+          { config: cfg, getCurrentConfig: context.getRuntimeConfig, assertCurrent },
+          "project-add",
+          params.gitUrl,
+        );
         const assertCredentialCurrent = () => {
           assertCurrent();
           identity?.assertSelected();
@@ -620,11 +614,12 @@ export function createProjectsHandlers(service: ProjectWorktreeService): Gateway
           }
         };
         assertCurrent();
-        const identity = await prepareConfiguredProjectGitHubIdentity({
-          config: cfg,
-          getCurrentConfig: context.getRuntimeConfig,
-          assertCurrent,
-        });
+        const identity = await prepareFactoryProjectIdentity(
+          { client, context, signal, hasCurrentClientAuthority, assertCurrent },
+          { config: cfg, getCurrentConfig: context.getRuntimeConfig, assertCurrent },
+          "project-search",
+          params.query,
+        );
         const assertCredentialCurrent = () => {
           assertCurrent();
           identity?.assertSelected();
@@ -650,6 +645,7 @@ export function createProjectsHandlers(service: ProjectWorktreeService): Gateway
           host,
           apiBaseUrl,
           requireAuthentication: Boolean(identity),
+          appInstallation: identity?.selection.executionKind === "app-installation",
           ...(identity || factoryEnv || cfg.gateway?.projects?.nativeGitHubSearch === true
             ? { token: nativeToken ?? "" }
             : {}),

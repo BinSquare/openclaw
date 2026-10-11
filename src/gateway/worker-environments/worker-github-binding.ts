@@ -258,6 +258,9 @@ async function prepareWorkerGitHub(
         : undefined);
     const binding = parseWorkerGitHubLaunchBinding({
       token: identity.env.GH_TOKEN,
+      ...(identity.env.OPENCLAW_GITHUB_EXECUTION_KIND === "app-installation"
+        ? { executionKind: "app-installation" }
+        : {}),
       ...(githubHost === "github.com" ? {} : { host: githubHost }),
       login: identity.account.login,
       ...(workspace.kind === "none"
@@ -375,7 +378,7 @@ export async function prepareWorkerRepositoryGitHubIdentity(params: {
   assertCurrent: () => void;
   signal?: AbortSignal;
   operatorAuthority?: AdmittedRunOperatorAuthority;
-  readNativeCredential?: (env: NodeJS.ProcessEnv) => Promise<string | undefined>;
+  readNativeCredential?: import("../../agents/github-credential-reader.js").GitHubCredentialReader;
 }) {
   const caller = getGatewayToolCallerIdentity();
   const operator =

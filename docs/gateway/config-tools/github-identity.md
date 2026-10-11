@@ -171,6 +171,42 @@ Control UI issue and pull request hover previews use the selected agent's effect
 
 If a preview or detail view reports “GitHub request is no longer active,” open it again to retry. This describes the interrupted request, not a change to your GitHub account; reconnecting GitHub is unnecessary.
 
+## GitHub App execution
+
+Set `tools.github.kind` to `"app-installation"` to use a configured App installation
+for repository execution. The existing agent override takes precedence over the
+system selection. The `app` object supplies `appId`, `installationId`, `accountId`
+(the installation owner), `repositories` (`id` and `fullName`), `permissions`,
+`privateKey` (a Gateway SecretRef), and `keyVersion`. `gateway.github` continues to
+own the host and API URL. Generate a new secret-free `profileId` when the key
+version, installation or scope changes.
+
+The trusted Gateway is the only issuance owner. It verifies the App, installation
+owner, suspension, requested grants, bot identity and exact repository scope using
+App and installation endpoints. It never verifies an installation token through
+`/user`. Reads, checkout, native Codex, workers and publication use the scoped App
+access token; configured App failure refuses execution without borrowing a human,
+native, service or anonymous credential. Private run profiles retain the existing
+renewal and cleanup contract. The App key stays on the Gateway and is excluded
+from child environments and secret-store tool access.
+
+Human sign-in, repository access admission, approval and contributor attribution
+remain separate. Factory's private repository-admission endpoint returns only the
+original actor, repository, installation and exact request binding with bounded
+expiry. It never delivers the human execution bearer when App execution is
+configured. A current original caller is required after awaited work and before
+execution; expiry alone does not authorize an action. Existing interrupted effects
+and publication receipts cannot switch identities.
+
+`tools.github.status` reports the credential kind and sanitized `appInstallation`
+facts (App, installation and owner IDs, repositories, permissions, suspension and
+access expiry). These are verified issuer facts, not proof of a successful write.
+Remote permission changes are reverified within five minutes or verified token
+expiry, whichever comes first; reuse does not extend that interval. Removing the
+selection fences new uses; existing child tokens expire at GitHub and private
+execution copies are retired through their original run owner. Revoke the App at
+GitHub when remote authorization must end immediately.
+
 ## Sandbox opt-in
 
 `agents.entries.<id>.tools.github.allowInSandbox` is an optional boolean that

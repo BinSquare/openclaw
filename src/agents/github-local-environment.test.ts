@@ -100,6 +100,26 @@ describe("local native selected GitHub environment", () => {
     expect(prepared.instructions).toContain("configured-system");
     expect((await fs.stat(prepared.env.GH_CONFIG_DIR)).mode & 0o077).toBe(0);
   });
+  it("projects the admitted App signal and private bot profile for native Codex without signing material", async () => {
+    const selected = grant();
+    const appGrant = {
+      ...selected,
+      binding: {
+        ...selected.binding,
+        login: "factory[bot]",
+        executionKind: "app-installation" as const,
+      },
+    };
+    mocks.prepare.mockResolvedValue(appGrant);
+    const prepared = (await prepare())!;
+    expect(prepared.env.OPENCLAW_GITHUB_EXECUTION_KIND).toBe("app-installation");
+    const hosts = parse(
+      await fs.readFile(path.join(prepared.env.GH_CONFIG_DIR, "hosts.yml"), "utf8"),
+    );
+    expect(hosts["fixture.ghe.com"].user).toBe("factory[bot]");
+    expect(prepared.env.OPENCLAW_GITHUB_APP_PRIVATE_KEY).toBe("");
+    expect(JSON.stringify(prepared.env)).not.toContain(selectedToken);
+  });
   it("removes only the owning execution profile and leaves another execution current", async () => {
     const first = (await prepare())!;
     const second = (await prepare())!;

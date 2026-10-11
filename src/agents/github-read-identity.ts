@@ -472,7 +472,7 @@ export type GitHubIdentityPreparation = {
   agentId: string;
   env?: NodeJS.ProcessEnv;
   /** Owner-bound native credential lookup; called again when a read identity revalidates. */
-  readNativeCredential?: (env: NodeJS.ProcessEnv) => Promise<string | undefined>;
+  readNativeCredential?: import("./github-credential-reader.js").GitHubCredentialReader;
 };
 
 export function readSelectedNativeGitHubToken(
@@ -526,6 +526,7 @@ export class GitHubIdentityError extends Error {
 }
 
 export type GitHubReadIdentitySelection = Readonly<{
+  executionKind?: "app-installation";
   source: "system-detected" | "system-configured" | "agent-override";
   profileId?: string;
   accountId: number;

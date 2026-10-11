@@ -31,7 +31,7 @@ export async function materializeSessionRepositoryWorkspaceOnGateway(params: {
   agentId: string;
   assertCurrent: () => void;
   signal?: AbortSignal;
-  readNativeCredential?: (env: NodeJS.ProcessEnv) => Promise<string | undefined>;
+  readNativeCredential?: import("../agents/github-credential-reader.js").GitHubCredentialReader;
 }): Promise<void> {
   params.assertCurrent();
   const sessionFacts = await prepareSessionMutationFacts({

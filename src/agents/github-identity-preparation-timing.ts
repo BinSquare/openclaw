@@ -1,4 +1,6 @@
 export type GitHubIdentityPreparationPhase =
+  | "repository_admission"
+  | "app_installation"
   | "oauth_refresh"
   | "credential_proof"
   | "credential_read"

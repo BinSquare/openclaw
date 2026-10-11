@@ -13,6 +13,7 @@ export async function readFactoryProjectToken(
   > & { assertCurrent?: () => void },
   purpose: "project-add" | "project-search",
   request: string,
+  admission?: import("../agents/github-credential-reader.js").GitHubRepositoryAdmissionRequest,
 ) {
   const { client, context, signal, hasCurrentClientAuthority } = options;
   const connectionId = client?.connId;
@@ -45,5 +46,33 @@ export async function readFactoryProjectToken(
       },
       assertCurrent,
     }),
+    admission,
   );
+}
+
+/** Project reads retain their connection-bound human admission through the shared selector. */
+export function factoryProjectCredentialReader(
+  options: Parameters<typeof readFactoryProjectToken>[0],
+  purpose: "project-add" | "project-search",
+  request: string,
+): import("../agents/github-credential-reader.js").GitHubCredentialReader | undefined {
+  if (process.env.FACTORY_AUTH_MODE !== "github") {
+    return undefined;
+  }
+  return (_env, admission) => readFactoryProjectToken(options, purpose, request, admission);
+}
+
+export async function prepareFactoryProjectIdentity(
+  options: Parameters<typeof readFactoryProjectToken>[0],
+  params: Parameters<
+    typeof import("./project-github-identity.js").prepareConfiguredProjectGitHubIdentity
+  >[0],
+  purpose: "project-add" | "project-search",
+  request: string,
+) {
+  const { prepareConfiguredProjectGitHubIdentity } = await import("./project-github-identity.js");
+  return prepareConfiguredProjectGitHubIdentity({
+    ...params,
+    readNativeCredential: factoryProjectCredentialReader(options, purpose, request),
+  });
 }

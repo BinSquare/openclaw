@@ -432,4 +432,42 @@ describe("project GitHub search", () => {
     );
     expect(fetchImpl).toHaveBeenCalledTimes(4);
   });
+  it("discovers App installation repositories without the human affiliation endpoint", async () => {
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = requestUrl(input);
+      if (url.includes("/installation/repositories")) {
+        return Response.json({
+          total_count: 1,
+          repositories: [
+            {
+              id: 1044511,
+              name: "lobster",
+              full_name: "bic/lobster",
+              html_url: "https://github.com/bic/lobster",
+              clone_url: "https://github.com/bic/lobster.git",
+              description: "App repository",
+              private: true,
+            },
+          ],
+        });
+      }
+      if (url.includes("/user/repos")) {
+        throw new Error("Human endpoint forbidden");
+      }
+      return Response.json({ items: [] });
+    });
+    const result = await searchRemoteProjects("lobster", {
+      fetchImpl,
+      token: "synthetic-installation",
+      requireAuthentication: true,
+      appInstallation: true,
+    });
+    expect(
+      fetchImpl.mock.calls.some(([url]) => requestUrl(url).includes("/installation/repositories")),
+    ).toBe(true);
+    expect(fetchImpl.mock.calls.some(([url]) => requestUrl(url).includes("/user/repos"))).toBe(
+      false,
+    );
+    expect(result.projects.map((value) => value.fullName)).toContain("bic/lobster");
+  });
 });

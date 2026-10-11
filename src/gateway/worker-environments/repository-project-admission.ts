@@ -71,7 +71,7 @@ type AdmissionRequest = {
   getConfig: () => OpenClawConfig;
   assertCurrent: () => void;
   signal?: AbortSignal;
-  readNativeCredential?: (env: NodeJS.ProcessEnv) => Promise<string | undefined>;
+  readNativeCredential?: import("../../agents/github-credential-reader.js").GitHubCredentialReader;
   knownRecipe?: (
     project: RepositoryWorkerProjectSnapshot,
   ) => { project: RepositoryWorkerProjectSnapshot; setupRecipe?: string } | undefined;

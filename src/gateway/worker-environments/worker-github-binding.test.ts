@@ -1,3 +1,4 @@
+import { generateKeyPairSync } from "node:crypto";
 import fs from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
@@ -239,6 +240,114 @@ describe("worker GitHub launch binding", () => {
       expect(mocks.releaseProfile).toHaveBeenCalledOnce();
     },
   );
+
+  it("delivers only the scoped App bot credential while retaining original human admission, attribution and renewal", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-10T10:00:00Z"));
+    vi.stubEnv("FACTORY_AUTH_MODE", "github");
+    const privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({
+      type: "pkcs8",
+      format: "pem",
+    });
+    config.tools!.github = {
+      profileId,
+      kind: "app-installation",
+      app: {
+        appId: 13361,
+        installationId: 119386,
+        accountId: 185961,
+        repositories: [{ id: 1044511, fullName: "bic/lobster" }],
+        permissions: { contents: "write", metadata: "read" },
+        privateKey,
+        keyVersion: "synthetic-v1",
+      },
+    };
+    let issued = 0;
+    const fetcher = vi.fn(async (url: string, init: RequestInit) => {
+      if (url.includes("repository-admission")) {
+        const verdict = redeemFactoryGitHubProof(
+          String((init.headers as Record<string, string>)["x-factory-github-proof"]),
+        );
+        return Response.json({
+          version: 1,
+          kind: "repository-admission",
+          host: "github.com",
+          appId: 13361,
+          installationId: 119386,
+          repository: { id: 1044511, fullName: "bic/lobster" },
+          actor: { accountId: verdict.actorId, profileId: verdict.profileId },
+          purpose: verdict.purpose,
+          binding: verdict.binding,
+          expiresAtMs: Date.now() + 60_000,
+        });
+      }
+      if (url.endsWith("/app")) {
+        return Response.json({
+          id: 13361,
+          slug: "factory",
+          permissions: { contents: "write", metadata: "read" },
+        });
+      }
+      if (url.endsWith("/app/installations/119386")) {
+        return Response.json({
+          id: 119386,
+          app_id: 13361,
+          account: { id: 185961 },
+          suspended_at: null,
+          permissions: { contents: "write", metadata: "read" },
+        });
+      }
+      if (url.endsWith("/access_tokens")) {
+        return Response.json({
+          token: `synthetic-app-worker-${++issued}`,
+          expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+          permissions: { contents: "write", metadata: "read" },
+        });
+      }
+      if (url.includes("/users/")) {
+        return Response.json({ id: 9001, login: "factory[bot]", type: "Bot", avatar_url: null });
+      }
+      if (url.includes("/installation/repositories")) {
+        return Response.json({
+          total_count: 1,
+          repositories: [{ id: 1044511, full_name: "bic/lobster" }],
+        });
+      }
+      throw new Error("Unexpected App request");
+    });
+    vi.stubGlobal("fetch", fetcher);
+    vi.stubEnv("OPENCLAW_GATEWAY_PASSWORD", "synthetic-password");
+    const operator = createAdmittedRunOperatorAuthority({
+      profileId: "operator",
+      scopes: ["operator.write"],
+      assertCurrent: () => {},
+    });
+    const grant = await prepareWorkerGitHubBindingGrant({
+      ...session,
+      operatorAuthority: operator,
+    });
+    try {
+      expect(grant?.binding).toMatchObject({
+        token: "synthetic-app-worker-1",
+        login: "factory[bot]",
+        executionKind: "app-installation",
+        gitAuthor: { name: "Operator", email: "operator@example.test" },
+      });
+      expect(mocks.nativeToken).not.toHaveBeenCalled();
+      expect(mocks.verify).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(300_000);
+      expect(await grant?.refresh?.()).toMatchObject({
+        generation: 1,
+        token: "synthetic-app-worker-2",
+      });
+      config.tools!.github.app.keyVersion = "replaced";
+      expect(() => grant?.assertCurrent?.()).toThrow("changed");
+    } finally {
+      await grant?.revoke();
+      vi.unstubAllGlobals();
+    }
+    expect(mocks.releaseProfile).toHaveBeenCalledTimes(3);
+  });
 
   it("rejects a Factory credential lookup without current broker proof rather than issuing an App token", async () => {
     vi.stubEnv("FACTORY_AUTH_MODE", "github");

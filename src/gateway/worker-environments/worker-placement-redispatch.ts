@@ -185,7 +185,7 @@ export function createWorkerPlacementRedispatch(params: {
         assertDestinationCurrent();
       }
       let readNativeCredential:
-        | ((env: NodeJS.ProcessEnv) => Promise<string | undefined>)
+        | import("../../agents/github-credential-reader.js").GitHubCredentialReader
         | undefined;
       let dispatchTarget: WorkerSessionPlacementRecord = placement;
       if (process.env.FACTORY_AUTH_MODE === "github") {
@@ -279,9 +279,9 @@ export function createWorkerPlacementRedispatch(params: {
           if (!reader) {
             throw new Error("Factory repository redispatch credential authority is unavailable");
           }
-          readNativeCredential = async (env) => {
+          readNativeCredential = async (env, admission) => {
             await assertWorkspaceCurrent();
-            const token = await reader(env);
+            const token = await reader(env, admission);
             await assertWorkspaceCurrent();
             return token;
           };

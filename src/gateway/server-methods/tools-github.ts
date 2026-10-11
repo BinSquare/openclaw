@@ -27,7 +27,7 @@ export const toolsGitHubHandlers: GatewayRequestHandlers = {
   "tools.github.status": defineValidatedGatewayHandler(
     "tools.github.status",
     validateToolsGitHubStatusParams,
-    async ({ params, respond, context }) => {
+    async ({ params, respond, context, signal, hasCurrentClientAuthority }) => {
       const resolved = resolveAgentIdOrRespondError({
         rawAgentId: params.agentId,
         respond,
@@ -43,6 +43,15 @@ export const toolsGitHubHandlers: GatewayRequestHandlers = {
           sourceConfig: getActiveSecretsRuntimeConfigSnapshot()?.sourceConfig ?? resolved.cfg,
           agentId: resolved.agentId,
           selectedScope: params.selectedScope,
+          assertCurrent: () => {
+            signal?.throwIfAborted();
+            if (
+              hasCurrentClientAuthority?.() === false ||
+              context.getRuntimeConfig() !== resolved.cfg
+            ) {
+              throw new Error("GitHub status request is no longer current.");
+            }
+          },
         }),
       );
     },

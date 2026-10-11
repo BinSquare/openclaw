@@ -140,16 +140,19 @@ export async function prepareWorkerGitHubEnvironment(params: {
       cause: error,
     });
   }
-  const localIdentityEnv = managedGitHubIdentityEnvironment({
-    profileDir,
-    host: githubHost,
-    gitAuthor: binding.gitAuthor,
-    // Reset inherited helpers so paired-device credentials cannot override the turn identity.
-    gitConfig: [
-      ["credential.helper", ""],
-      ["credential.helper", "!gh auth git-credential"],
-    ],
-  });
+  const localIdentityEnv = {
+    ...managedGitHubIdentityEnvironment({
+      profileDir,
+      host: githubHost,
+      gitAuthor: binding.gitAuthor,
+      // Reset inherited helpers so paired-device credentials cannot override the turn identity.
+      gitConfig: [
+        ["credential.helper", ""],
+        ["credential.helper", "!gh auth git-credential"],
+      ],
+    }),
+    OPENCLAW_GITHUB_EXECUTION_KIND: binding.executionKind ?? "",
+  };
   if (process.platform === "win32") {
     const permissions = await inspectPathPermissions(profileDir);
     if (

@@ -169,6 +169,7 @@ const GitHubHostSchema = z
   .regex(/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/u)
   .refine((value) => !value.includes(".."));
 const GitHubLaunchSchema = workerProtocolObject({
+  executionKind: z.literal("app-installation").optional(),
   token: z
     .string()
     .min(1)
@@ -176,7 +177,7 @@ const GitHubLaunchSchema = workerProtocolObject({
     .refine((value) => !/[\s\p{Cc}]/u.test(value)),
   login: z
     .string()
-    .regex(/^[A-Za-z0-9-]{1,39}$/u)
+    .regex(/^[A-Za-z0-9-]{1,39}(?:\[bot\])?$/u)
     .refine((value) => value.trim() === value),
   branch: z
     .string()

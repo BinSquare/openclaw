@@ -206,6 +206,7 @@ describe("GitHub tool identity", () => {
     expect(envScrub.credentialScrubEnv).toEqual({
       GITHUB_APP_PRIVATE_KEY: "",
       OPENCLAW_GITHUB_APP_PRIVATE_KEY: "",
+      OPENCLAW_GITHUB_EXECUTION_KIND: "",
       ...(managed
         ? {
             GH_TOKEN: "",
@@ -216,7 +217,10 @@ describe("GitHub tool identity", () => {
         : {}),
       PREVIEW_SERVICE_TOKEN: "",
     });
-    expect(Object.keys(envScrub.localIdentityEnv).length).toBe(managed ? 1 : 0);
+    expect(envScrub.localIdentityEnv.GH_CONFIG_DIR).toEqual(
+      managed ? expect.any(String) : undefined,
+    );
+    expect(envScrub.localIdentityEnv.OPENCLAW_GITHUB_EXECUTION_KIND).toBe(managed ? "" : undefined);
     expect(envScrub.excludedStoreNames).toEqual([]);
 
     const storeScrub = prepareGitHubToolEnvironment({
@@ -235,6 +239,7 @@ describe("GitHub tool identity", () => {
     expect(storeScrub.credentialScrubEnv).toEqual({
       GITHUB_APP_PRIVATE_KEY: "",
       OPENCLAW_GITHUB_APP_PRIVATE_KEY: "",
+      OPENCLAW_GITHUB_EXECUTION_KIND: "",
       ...(managed
         ? {
             GH_TOKEN: "",
@@ -302,6 +307,7 @@ describe("GitHub tool identity", () => {
     expect(prepared.credentialScrubEnv).toEqual({
       GITHUB_APP_PRIVATE_KEY: "",
       OPENCLAW_GITHUB_APP_PRIVATE_KEY: "",
+      OPENCLAW_GITHUB_EXECUTION_KIND: "",
       ...expected,
     });
     expect(prepared.excludedStoreNames).toEqual(source === "store" ? [id] : []);

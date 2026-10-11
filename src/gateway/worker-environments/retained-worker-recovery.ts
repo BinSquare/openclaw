@@ -15,7 +15,7 @@ export type PrepareRetainedRecoveryCheckpoint = (
     assertCurrent: () => void;
     signal?: AbortSignal;
     operatorAuthority?: import("../../agents/admitted-run-context.js").AdmittedRunOperatorAuthority;
-    readNativeCredential?: (env: NodeJS.ProcessEnv) => Promise<string | undefined>;
+    readNativeCredential?: import("../../agents/github-credential-reader.js").GitHubCredentialReader;
   },
   workspace: Extract<WorkerSessionWorkspace, { kind: "repository" }>,
 ) => Promise<
@@ -65,7 +65,7 @@ export function createRetainedWorkerRecovery(options: {
       assertCurrent: () => void;
       signal?: AbortSignal;
       operatorAuthority?: import("../../agents/admitted-run-context.js").AdmittedRunOperatorAuthority;
-      readNativeCredential?: (env: NodeJS.ProcessEnv) => Promise<string | undefined>;
+      readNativeCredential?: import("../../agents/github-credential-reader.js").GitHubCredentialReader;
     },
   ) => {
     if (!canRecover(source)) {

@@ -34,7 +34,7 @@ export async function syncSessionRepositoryWorkspace(params: {
   assertCurrent: () => void;
   signal?: AbortSignal;
   operatorAuthority?: AdmittedRunOperatorAuthority;
-  readNativeCredential?: (env: NodeJS.ProcessEnv) => Promise<string | undefined>;
+  readNativeCredential?: import("../../agents/github-credential-reader.js").GitHubCredentialReader;
   /** Node's typed effect gate excludes all repository operations until publication. */
   repositoryOperationsBlocked?: boolean;
 }) {
