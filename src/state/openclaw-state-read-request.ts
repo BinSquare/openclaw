@@ -363,14 +363,24 @@ function commandBytes(command: OpenClawStateReadRequest["command"]): number {
       Buffer.byteLength(command.input.token) +
       Buffer.byteLength(command.input.deviceId) +
       Buffer.byteLength(command.input.publicKey) +
+      Buffer.byteLength(command.publishedRevision ?? "") +
       8
     );
   }
   if (command.type === "devicePairing.lookup") {
-    return bytes + Buffer.byteLength(command.deviceId);
+    return (
+      bytes +
+      Buffer.byteLength(command.deviceId) +
+      Buffer.byteLength(command.publishedRevision ?? "")
+    );
   }
   if (command.type === "devicePairing.pending") {
-    return bytes + Buffer.byteLength(command.requestId) + 8;
+    return (
+      bytes +
+      Buffer.byteLength(command.requestId) +
+      Buffer.byteLength(command.publishedRevision ?? "") +
+      8
+    );
   }
   if (command.type === "devicePairing.list") {
     return bytes + 8 + Buffer.byteLength(command.publishedRevision ?? "");

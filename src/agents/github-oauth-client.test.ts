@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   clearRuntimeConfigSnapshot,
   setRuntimeConfigSnapshot,
@@ -13,6 +13,25 @@ import {
   requestGitHubOAuthDeviceCode,
   verifyGitHubCredential,
 } from "./github-oauth-client.js";
+
+const info = vi.hoisted(() => vi.fn());
+vi.mock("../logging/subsystem.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../logging/subsystem.js")>();
+  return {
+    ...actual,
+    createSubsystemLogger: (name: string) =>
+      name === "agents/github-identity" ? { info } : actual.createSubsystemLogger(name),
+  };
+});
+beforeEach(() => info.mockReset());
+function expectVerification(diagnosticCode: string, httpStatus?: number) {
+  expect(info).toHaveBeenCalledWith("github identity verification", {
+    stage: "api_verification",
+    diagnosticCode,
+    ...(httpStatus === undefined ? {} : { httpStatus }),
+  });
+  expect(JSON.stringify(info.mock.calls)).not.toMatch(/synthetic-|private/);
+}
 
 const GITHUB_OAUTH_CLIENT_ID = "Ov23liUjOXHi28w2fDlH";
 const GITHUB_OAUTH_DEVICE_CODE_URL = "https://github.com/login/device/code";
@@ -366,20 +385,32 @@ describe("GitHub OAuth client", () => {
   });
 
   it.each([
-    { code: 401, headers: new Headers(), status: "unavailable" },
-    { code: 403, headers: new Headers({ "x-ratelimit-remaining": "0" }), status: "rate_limited" },
-    { code: 403, headers: new Headers({ "retry-after": "60" }), status: "rate_limited" },
-    { code: 429, headers: new Headers(), status: "rate_limited" },
-    { code: 403, headers: new Headers(), status: "unverified" },
-    { code: 500, headers: new Headers(), status: "unverified" },
+    { code: 401, headers: new Headers(), status: "unavailable", diagnostic: "unauthorized" },
+    {
+      code: 403,
+      headers: new Headers({ "x-ratelimit-remaining": "0" }),
+      status: "rate_limited",
+      diagnostic: "rate_limited",
+    },
+    {
+      code: 403,
+      headers: new Headers({ "retry-after": "60" }),
+      status: "rate_limited",
+      diagnostic: "rate_limited",
+    },
+    { code: 429, headers: new Headers(), status: "rate_limited", diagnostic: "rate_limited" },
+    { code: 403, headers: new Headers(), status: "unverified", diagnostic: "http_unverified" },
+    { code: 500, headers: new Headers(), status: "unverified", diagnostic: "http_unverified" },
+    { code: 502, headers: new Headers(), status: "unverified", diagnostic: "http_unverified" },
   ])(
     "classifies account HTTP $code as $status without reflecting diagnostics",
-    async ({ code, headers, status }) => {
+    async ({ code, headers, status, diagnostic }) => {
       vi.spyOn(globalThis, "fetch").mockResolvedValue(
         new Response("synthetic-secret-diagnostics", { status: code, headers }),
       );
       const token = `synthetic-http-${code}-${status}-${headers.get("retry-after") ?? headers.get("x-ratelimit-remaining") ?? "none"}`;
       expect(await verifyGitHubCredential(token)).toEqual({ status });
+      expectVerification(diagnostic, code);
     },
   );
 
@@ -396,6 +427,7 @@ describe("GitHub OAuth client", () => {
     async (name, body) => {
       vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(body));
       expect(await verifyGitHubCredential(`synthetic-${name}`)).toEqual({ status: "unverified" });
+      expectVerification("response_unreadable", 200);
     },
   );
 
@@ -406,6 +438,14 @@ describe("GitHub OAuth client", () => {
       status: "unverified",
     });
     expect(cancel).toHaveBeenCalled();
+    expectVerification("response_unreadable", 200);
+    info.mockClear();
+    vi.mocked(fetch).mockRejectedValueOnce(new Error("private transport detail"));
+    expect(await verifyGitHubCredential("synthetic-transport-error")).toEqual({
+      status: "unverified",
+    });
+    expectVerification("transport_unavailable");
+    info.mockClear();
     const caller = new AbortController();
     vi.mocked(fetch).mockImplementation(async (_url, init) => {
       caller.abort(new Error("synthetic-token must stay private"));
@@ -417,6 +457,7 @@ describe("GitHub OAuth client", () => {
     ).toEqual({
       status: "unverified",
     });
+    expectVerification("transport_unavailable");
   });
 
   it("requests the fixed GitHub device flow and repository workflow scopes", async () => {

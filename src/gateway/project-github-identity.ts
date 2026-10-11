@@ -1,3 +1,7 @@
+import {
+  assertAdmittedRunOperatorAuthority,
+  type AdmittedRunOperatorAuthority,
+} from "../agents/admitted-run-context.js";
 import { tryResolveAmbientOwnerAgentId } from "../agents/agent-scope.js";
 import {
   prepareGitHubReadIdentity,
@@ -23,6 +27,7 @@ export async function prepareGatewayProjectGitHubIdentity(params: {
   context: Pick<GatewayRequestContext, "getRuntimeConfig">;
   client?: GatewayClient | null;
   sessionKey?: string;
+  operatorAuthority?: AdmittedRunOperatorAuthority;
   factoryCredential?: { claim: FactoryGitHubProofClaim; assertCurrent: () => void };
 }) {
   const managed = (["agent", "system"] as const).some((scope) =>
@@ -40,19 +45,31 @@ export async function prepareGatewayProjectGitHubIdentity(params: {
   if (factory && !credential) {
     throw new Error("Factory GitHub repository access requires current caller authority.");
   }
+  if (params.operatorAuthority) {
+    assertAdmittedRunOperatorAuthority(params.operatorAuthority);
+  }
+  const assertFactoryCurrent = () => {
+    assertCallerCurrent();
+    if (process.env.FACTORY_AUTH_MODE !== "github") {
+      throw new Error("Factory project requester changed during preparation");
+    }
+  };
   const factoryProof =
     factory && credential
-      ? factoryGitHubClientProof({
-          client: params.client,
-          claim: credential.claim,
-          assertCurrent: () => {
-            assertCallerCurrent();
-            if (process.env.FACTORY_AUTH_MODE !== "github") {
-              throw new Error("Factory project requester changed during preparation");
-            }
-          },
-        })
+      ? params.operatorAuthority && credential.claim.purpose === "session-item-read"
+        ? params.operatorAuthority.captureFactoryGitHubReadProof?.({
+            claim: credential.claim,
+            assertCurrent: assertFactoryCurrent,
+          })
+        : factoryGitHubClientProof({
+            client: params.client,
+            claim: credential.claim,
+            assertCurrent: assertFactoryCurrent,
+          })
       : undefined;
+  if (factory && !factoryProof) {
+    throw new Error("Factory GitHub repository access requires its original caller identity.");
+  }
   const assertActive = factoryProof?.assertCurrent ?? assertCallerCurrent;
   const factoryEnv = factoryProof
     ? factoryGitHubActorEnvironment(factoryProof, params.sessionKey ?? "")

@@ -1,14 +1,20 @@
-import { EventEmitter, once } from "node:events";
+import { execFile } from "node:child_process";
+import { once } from "node:events";
 import fs from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { promisify } from "node:util";
+import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, expect, it, vi } from "vitest";
+import { WebSocket } from "ws";
 import { loadCodexNodeAppServerTestFixture } from "../../extensions/codex/test-api.js";
+import { rawDataToString } from "../../packages/gateway-client/src/websocket-data.js";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { resetSecretRedactionRegistryForTest } from "../logging/secret-redaction-registry.test-support.js";
 import type { OpenClawPluginNodeHostCommandContext } from "../plugins/types.node-host.js";
 import { reserveTestPortListener } from "../test-utils/port-claims.js";
+import { NODE_WORKSPACE_REPOSITORY_COMMAND } from "../worker/node-workspace-protocol.js";
 import { withNodeHostPluginInvocation } from "./invoke-plugin-context.js";
 import { captureNodeWorkerManagedIdentityTransport } from "./node-worker-environment.js";
 import { NodeWorkerWorkspaceRuntime } from "./node-worker-workspace.js";
@@ -17,9 +23,12 @@ const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 afterEach(() => {
   vi.unstubAllEnvs();
   resetSecretRedactionRegistryForTest();
+  vi.restoreAllMocks();
 });
 
-it("carries the managed workspace transport through native Codex auth.command and a model turn", async () => {
+it("carries the managed workspace transport through native Codex auth.command and a model turn", async ({
+  signal,
+}) => {
   const header = "synthetic-codex-provider-header";
   const bearer = "synthetic-codex-provider-bearer";
   const audience = "api://913b0ac3-c7f3-49c7-82d5-7a3712848c42";
@@ -35,8 +44,9 @@ it("carries the managed workspace transport through native Codex auth.command an
     NODE_USE_SYSTEM_CA: "1",
   });
   const shellProbe = `node -e 'const expected=${JSON.stringify(platformTrust)}; if(!Object.entries(expected).every(([key,value])=>process.env[key]===value))process.exit(1); console.log("CA_TRUST_PASS")'`;
+  let origin: string;
   const identityRequests: { headerMatches: boolean; purposeMatches: boolean }[] = [];
-  const modelRequests: boolean[] = [];
+  const modelRequests: Array<{ authenticated: boolean; model: unknown }> = [];
   const server = await reserveTestPortListener({
     offsets: [0],
     createListener: () =>
@@ -59,14 +69,25 @@ it("carries the managed workspace transport through native Codex auth.command an
           );
           return;
         }
+        if (url.pathname.startsWith("/repo.git/")) {
+          void fs.readFile(path.join(origin, ".git", url.pathname.slice("/repo.git/".length))).then(
+            (bytes) => res.end(bytes),
+            () => res.writeHead(404).end(),
+          );
+          return;
+        }
         if (req.method !== "POST" || url.pathname !== "/v1/responses") {
           res.writeHead(404).end();
           return;
         }
-        req.resume();
+        let body = "";
+        req.setEncoding("utf8");
+        req.on("data", (chunk: string) => {
+          body += chunk;
+        });
         req.once("end", () => {
           const authenticated = req.headers.authorization === `Bearer ${bearer}`;
-          modelRequests.push(authenticated);
+          modelRequests.push({ authenticated, model: JSON.parse(body).model });
           if (!authenticated) {
             res.writeHead(401, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: { message: "synthetic credential unavailable" } }));
@@ -74,7 +95,7 @@ it("carries the managed workspace transport through native Codex auth.command an
           }
           res.writeHead(200, { "Content-Type": "text/event-stream" });
           const item =
-            modelRequests.length === 1
+            modelRequests.length === 2
               ? {
                   type: "function_call",
                   call_id: "ca-probe",
@@ -157,11 +178,13 @@ it("carries the managed workspace transport through native Codex auth.command an
     managedIdentityTransport: captureNodeWorkerManagedIdentityTransport(process.env),
     platformTrust,
   });
+  vi.stubEnv("IDENTITY_HEADER", "caller-override");
   const owner = {
     gatewayNamespace: "codex-fixture",
     environmentId: "worker-fixture",
     sessionId: "session-fixture",
     generation: 1,
+    sessionKey: "agent:main:fixture",
   };
   const created = await workspace.exec({ ...owner, argv: ["node", "-e", ""] });
   const placement = {
@@ -176,94 +199,285 @@ it("carries the managed workspace transport through native Codex auth.command an
     fileURLToPath(new URL("../../extensions/codex/", import.meta.url)),
   );
   const command = fixture.createCodexNodeAppServerCommand();
-  const abort = new AbortController();
-  const replies = new EventEmitter();
-  const frames: string[] = [];
-  let receiver: ((message: Uint8Array) => void | Promise<void>) | undefined;
-  let listening!: () => void;
-  const ready = new Promise<void>((resolve) => {
-    listening = resolve;
-  });
-  const io = {
-    signal: abort.signal,
-    emitChunk: async () => {},
-    onInput: () => {},
-    frames: {
-      send: async (message: Uint8Array) => {
-        const raw = Buffer.from(message).toString("utf8");
-        frames.push(raw);
-        const record = JSON.parse(raw) as { id?: number; method?: string };
-        replies.emit(String(record.id), record);
-        if (record.method) {
-          replies.emit(record.method, record);
-        }
-      },
-      onMessage: (listener: typeof receiver) => {
-        receiver = listener;
-        listening();
-        return () => {
-          receiver = undefined;
-        };
-      },
-    },
-  };
+  const leases: Array<Awaited<ReturnType<typeof workspace.acquireManagedWorkspaceAsync>>> = [];
   const context: OpenClawPluginNodeHostCommandContext = {
     sendNodeEvent: async () => undefined,
-    prepareExecAuthorization: () => () => abort.signal.throwIfAborted(),
     acquireManagedWorkspaceAsync: async (request) => {
       const lease = await workspace.acquireManagedWorkspaceAsync(request);
       expect(JSON.stringify(lease)).not.toContain(header);
       expect(JSON.stringify(lease)).not.toContain("IDENTITY_HEADER");
+      vi.spyOn(lease, "release");
+      if (lease.repositoryReadiness) vi.spyOn(lease.repositoryReadiness, "wait");
+      leases.push(lease);
       return lease;
     },
   };
-  const running = withNodeHostPluginInvocation(
-    { context, sessionKey: placement.sessionKey, signal: abort.signal },
-    (bound) =>
-      command.handle(JSON.stringify({ placement, authorization: "session-full" }), io, bound),
-  );
-  void running.catch(() => {});
-  const request = async (id: number, method: string, params: unknown) => {
-    const response = once(replies, String(id));
-    await receiver?.(Buffer.from(JSON.stringify({ id, method, params })));
-    return (await response)[0] as { result?: unknown; error?: unknown };
+  const raw: string[] = [];
+  const connection = async <T>(
+    use: (
+      frames: ReturnType<typeof fixture.createNodeFrames>,
+      request: (id: number, method: string, params: unknown) => Promise<Record<string, unknown>>,
+    ) => Promise<T>,
+  ) => {
+    const frames = fixture.createNodeFrames(signal);
+    const send = frames.io.frames!.send;
+    frames.io.frames!.send = async (bytes) => {
+      raw.push(Buffer.from(bytes).toString("utf8"));
+      await send(bytes);
+    };
+    const running = withNodeHostPluginInvocation(
+      {
+        context: {
+          ...context,
+          prepareExecAuthorization: () => () => frames.io.signal.throwIfAborted(),
+        },
+        sessionKey: placement.sessionKey,
+        signal: frames.controller.signal,
+      },
+      (bound) =>
+        command.handle(
+          JSON.stringify({ placement, authorization: "session-full" }),
+          frames.io,
+          bound,
+        ),
+    );
+    void running.catch(() => {});
+    const request = async (id: number, method: string, params: unknown) => {
+      await frames.send({ id, method, params });
+      return frames.waitForMessage((message) => message.id === id);
+    };
+    try {
+      await Promise.race([frames.ready, running]);
+      expect(
+        await request(1, "initialize", fixture.buildCodexAppServerInitializeParams()),
+      ).toHaveProperty("result.userAgent");
+      await frames.send({ method: "initialized", params: {} });
+      return await use(frames, request);
+    } finally {
+      frames.controller.abort(new Error("fixture connection completed"));
+      await expect(running).rejects.toThrow();
+    }
+  };
+  const git = promisify(execFile);
+  origin = path.join(root, "origin");
+  await fs.mkdir(origin);
+  await git("git", ["init", "--initial-branch=fixture/admitted", origin]);
+  await fs.writeFile(path.join(origin, "admitted.txt"), "exact admitted checkout");
+  await git("git", ["-C", origin, "add", "admitted.txt"]);
+  await git("git", [
+    "-C",
+    origin,
+    "-c",
+    "user.name=Fixture",
+    "-c",
+    "user.email=fixture@example.invalid",
+    "commit",
+    "-m",
+    "fixture",
+  ]);
+  await git("git", ["-C", origin, "update-server-info"]);
+  const head = (await git("git", ["-C", origin, "rev-parse", "HEAD"])).stdout.trim();
+  const repository = {
+    workspaceId: "fixture-repository",
+    revision: 1,
+    branch: "fixture/admitted",
+    baseCommit: head,
+  };
+  const setRepository = (status: "pending" | "ready" | "failed") =>
+    workspace.exec({
+      ...owner,
+      argv: [NODE_WORKSPACE_REPOSITORY_COMMAND],
+      repositoryPreparation: { ...repository, status },
+    });
+  await setRepository("pending");
+  const directLease = await context.acquireManagedWorkspaceAsync!({
+    workspaceDir: placement.cwd,
+    environmentId: owner.environmentId,
+    sessionId: owner.sessionId,
+    ownerEpoch: owner.generation,
+    sessionKey: owner.sessionKey,
+  });
+  const directAbort = new AbortController();
+  const carrier = await fixture.createCodexNodeWorkspaceEnvironment({
+    workspace: directLease,
+    signal: directAbort.signal,
+    assertExecAuthorized: () => directLease.processEnvironment!.assertCurrent(),
+  });
+  const socket = new WebSocket(carrier.url);
+  await once(socket, "open");
+  let sequence = 0;
+  const processExited = Promise.withResolvers<unknown>();
+  const pending = new Map<
+    number,
+    ReturnType<typeof Promise.withResolvers<Record<string, unknown>>>
+  >();
+  socket.on("message", (bytes) => {
+    const text = rawDataToString(bytes);
+    raw.push(text);
+    const response = JSON.parse(text) as Record<string, unknown>;
+    if (response.method === "process/exited") processExited.resolve(response.params);
+    if (typeof response.id === "number") {
+      pending.get(response.id)?.resolve(response);
+      pending.delete(response.id);
+    }
+  });
+  const direct = (method: string, params: unknown) => {
+    const id = ++sequence;
+    const result = Promise.withResolvers<Record<string, unknown>>();
+    pending.set(id, result);
+    socket.send(JSON.stringify({ id, method, params }));
+    return result.promise;
   };
   try {
-    await Promise.race([ready, running]);
-    expect(
-      await request(1, "initialize", fixture.buildCodexAppServerInitializeParams()),
-    ).toHaveProperty("result");
-    await receiver?.(Buffer.from(JSON.stringify({ method: "initialized", params: {} })));
-    const started = await request(2, "thread/start", {
-      cwd: placement.cwd,
-      modelProvider: "autodev",
-      model: "codex-test-model",
+    expect(await direct("initialize", { clientName: "repository-fixture" })).toHaveProperty(
+      "result.sessionId",
+    );
+    socket.send(JSON.stringify({ method: "initialized" }));
+    const admittedFile = path.join(placement.cwd, "admitted.txt");
+    const commandFile = path.join(placement.cwd, "command-head.txt");
+    const reading = direct("fs/readFile", { path: pathToFileURL(admittedFile).href });
+    const starting = direct("process/start", {
+      processId: "exact-branch-command",
+      argv: [
+        process.execPath,
+        "-e",
+        `const fs=require('node:fs');const cp=require('node:child_process');if(process.env.IDENTITY_HEADER==='caller-override')process.exit(6);if(!Object.entries(${JSON.stringify(platformTrust)}).every(([key,value])=>process.env[key]===value)){console.error('DIRECT_CA_TRUST_MISMATCH');process.exit(7);}fs.writeFileSync('command-head.txt',cp.execFileSync('git',['symbolic-ref','--short','HEAD'])+cp.execFileSync('git',['rev-parse','HEAD']));`,
+      ],
+      cwd: pathToFileURL(placement.cwd).href,
+      env: { IDENTITY_HEADER: "caller-override", NODE_EXTRA_CA_CERTS: "/untrusted-caller.pem" },
+      tty: false,
+      pipeStdin: false,
+      arg0: null,
     });
-    const threadId = (started.result as { thread: { id: string } }).thread.id;
-    const completed = once(replies, "turn/completed");
+    let directReads = 0;
+    void reading.then(() => {
+      directReads++;
+    });
+    void starting.then(() => {
+      directReads++;
+    });
+    expect(await direct("environment/info", {})).toHaveProperty("result.cwd");
+    const threadId = await connection(async (frames, request) => {
+      const pendingRead = request(20, "fs/readFile", { path: admittedFile });
+      let appRead = false;
+      void pendingRead.then(
+        () => {
+          appRead = true;
+        },
+        () => {},
+      );
+      const started = await request(2, "thread/start", {
+        cwd: placement.cwd,
+        modelProvider: "autodev",
+        model: "codex-test-model",
+      });
+      expect(started).toHaveProperty("result.thread.id");
+      const id = (started.result as { thread: { id: string } }).thread.id;
+      expect(id).toMatch(/^[a-f0-9-]+$/);
+      const turn = async (requestId: number) => {
+        const from = frames.outbound.length;
+        expect(
+          await request(requestId, "turn/start", {
+            threadId: id,
+            input: [{ type: "text", text: "Reply briefly.", text_elements: [] }],
+          }),
+        ).toHaveProperty("result");
+        expect(
+          await frames.waitForMessage(
+            (message) =>
+              frames.outbound.indexOf(message) >= from &&
+              message.method === "turn/completed" &&
+              isRecord(message.params) &&
+              message.params.threadId === id,
+          ),
+        ).toMatchObject({ params: { threadId: id, turn: { status: "completed" } } });
+      };
+      await turn(3);
+      expect(modelRequests).toEqual([{ authenticated: true, model: "codex-test-model" }]);
+      expect(appRead).toBe(false);
+      expect(directReads).toBe(0);
+      expect(directLease.repositoryReadiness!.wait).toHaveBeenCalledTimes(2);
+      expect(leases[1]?.repositoryReadiness?.wait).toHaveBeenCalled();
+      await expect(fs.access(admittedFile)).rejects.toThrow();
+      await expect(fs.access(commandFile)).rejects.toThrow();
+      expect(
+        (
+          await workspace.exec({
+            ...owner,
+            argv: [
+              "git",
+              "clone",
+              "--branch",
+              repository.branch,
+              `http://127.0.0.1:${server.claim.port}/repo.git`,
+              ".",
+            ],
+          })
+        ).code,
+      ).toBe(0);
+      await setRepository("ready");
+      expect(await pendingRead).toMatchObject({
+        result: { dataBase64: Buffer.from("exact admitted checkout").toString("base64") },
+      });
+      expect(await reading).toMatchObject({
+        result: { dataBase64: Buffer.from("exact admitted checkout").toString("base64") },
+      });
+      expect(await starting).toHaveProperty("result");
+      expect(await processExited.promise).toMatchObject({
+        processId: "exact-branch-command",
+        exitCode: 0,
+      });
+      expect(
+        await direct("process/read", {
+          processId: "exact-branch-command",
+          afterSeq: 0,
+          waitMs: 1000,
+        }),
+      ).toMatchObject({ result: { exited: true, exitCode: 0 } });
+      expect(await fs.readFile(commandFile, "utf8")).toBe(`fixture/admitted
+${head}
+`);
+      expect((await git("git", ["-C", placement.cwd, "rev-parse", "HEAD"])).stdout.trim()).toBe(
+        head,
+      );
+      expect(
+        (await git("git", ["-C", placement.cwd, "symbolic-ref", "--short", "HEAD"])).stdout.trim(),
+      ).toBe(repository.branch);
+      await turn(4);
+      expect(modelRequests.slice(1)).toEqual([
+        { authenticated: true, model: "codex-test-model" },
+        { authenticated: true, model: "codex-test-model" },
+      ]);
+      return id;
+    });
+    await connection(async (_frames, request) => {
+      expect(await request(2, "thread/resume", { threadId })).toMatchObject({
+        result: { thread: { id: threadId } },
+      });
+    });
+    await setRepository("failed");
     expect(
-      await request(3, "turn/start", {
-        threadId,
-        input: [{ type: "text", text: "Reply briefly.", text_elements: [] }],
+      await direct("fs/writeFile", {
+        path: pathToFileURL(admittedFile).href,
+        dataBase64: Buffer.from("forbidden").toString("base64"),
       }),
-    ).toHaveProperty("result");
-    const completion = (await completed)[0];
+    ).toMatchObject({ error: { message: expect.stringContaining("operation did not run") } });
+    expect(await fs.readFile(admittedFile, "utf8")).toBe("exact admitted checkout");
     expect(
       JSON.parse(await fs.readFile(path.join(configDir, "auth-attempt.json"), "utf8")),
     ).toEqual({ providerPairPresent: true, platformTrustPresent: true });
-    expect(completion).toMatchObject({ params: { turn: { status: "completed" } } });
     expect(identityRequests.length).toBeGreaterThan(0);
     expect(
       identityRequests.every(
         (observation) => observation.headerMatches && observation.purposeMatches,
       ),
     ).toBe(true);
-    expect(modelRequests).toEqual([true, true]);
-    expect(frames.join("\n")).toContain("CA_TRUST_PASS");
-    expect(frames.join("\n")).not.toContain(header);
-    expect(frames.join("\n")).not.toContain(bearer);
-    const configs = await fs.readdir(path.join(configDir, "sessions"));
-    for (const directory of configs) {
+    expect(raw.join("\n")).toContain("CA_TRUST_PASS");
+    expect(raw.join("\n")).not.toContain(header);
+    expect(raw.join("\n")).not.toContain(bearer);
+    const sessionHomes = await fs.readdir(path.join(configDir, "sessions"));
+    expect(sessionHomes).toHaveLength(1);
+    for (const directory of sessionHomes) {
       const saved = await fs.readFile(
         path.join(configDir, "sessions", directory, "config.toml"),
         "utf8",
@@ -273,9 +487,13 @@ it("carries the managed workspace transport through native Codex auth.command an
       expect(saved).not.toContain("IDENTITY_HEADER");
     }
   } finally {
-    abort.abort(new Error("fixture completed"));
-    await running.catch(() => {});
+    directAbort.abort();
+    socket.terminate();
+    await carrier.close();
+    directLease.release();
     await command.onDisconnect?.();
+    for (const lease of leases) expect(lease.release).toHaveBeenCalledOnce();
+    workspace.repositoryReadiness.close();
     await workspace.processes.close();
     fixture.setManagedCodexPluginRoot(undefined);
     server.listener.closeAllConnections();

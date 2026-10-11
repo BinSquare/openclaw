@@ -4,7 +4,10 @@ import type {
 } from "./device-bootstrap.worker-types.js";
 import type { DevicePairingPendingRequest, PairedDevice } from "./device-pairing.types.js";
 
-export type DevicePairingReadCommand = { publishedRevision?: string } & (
+export type DevicePairingReadCommand = {
+  /** Reuse binding facts only when the caller owns this complete revision. */
+  publishedRevision?: string;
+} & (
   | { type: "devicePairing.list"; nowMs: number }
   | { type: "devicePairing.lookup"; deviceId: string }
   | { type: "devicePairing.pending"; requestId: string; nowMs: number }
@@ -30,6 +33,7 @@ export type DevicePairingReadReply = {
   sourceAdmitted: true;
   revision: string;
   bindings: DevicePairingBindingFact[] | undefined;
+  /** A new revision carries the complete binding index, even for a keyed read. */
   bindingsComplete?: boolean;
 } & (
   | {

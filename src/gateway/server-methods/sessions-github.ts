@@ -21,6 +21,7 @@ import { normalizeAgentId } from "../../routing/session-key.js";
 import { OpenClawStateLeaseAcquisitionError } from "../../state/openclaw-state-lease-error.js";
 import { getSessionRepositoryWorkspaceStore } from "../../state/session-repository-workspaces.js";
 import { prepareControlUiSessionPrRead } from "../control-ui-session-pr-read.js";
+import { factoryGitHubRequestDigest } from "../factory-github-proof.js";
 import {
   factoryPublicationPreflightCredential,
   prepareCurrentGitHubPublicationOptionsIdentity,
@@ -292,7 +293,9 @@ export const sessionsGitHubHandlers: GatewayRequestHandlers = {
         agentId: caller.agentId,
       });
       const admittedWorkspaceId = admitted.entry?.repositoryWorkspaceId;
-      if (!admittedWorkspaceId) {
+      const admittedSessionId = admitted.entry?.sessionId;
+      const admittedLifecycleRevision = admitted.entry?.lifecycleRevision ?? null;
+      if (!admittedWorkspaceId || !admittedSessionId) {
         throw new Error("The repository session is no longer bound to this run.");
       }
       const preparedWorkspace =
@@ -309,6 +312,8 @@ export const sessionsGitHubHandlers: GatewayRequestHandlers = {
           loaded.canonicalKey !== caller.sessionKey ||
           loaded.agentId !== caller.agentId ||
           !loaded.entry?.sessionId ||
+          loaded.entry.sessionId !== admittedSessionId ||
+          (loaded.entry.lifecycleRevision ?? null) !== admittedLifecycleRevision ||
           !workspace ||
           workspace.agentId !== caller.agentId ||
           workspace.sessionKey !== caller.sessionKey
@@ -334,6 +339,22 @@ export const sessionsGitHubHandlers: GatewayRequestHandlers = {
       const identity = await prepareGatewayProjectGitHubIdentity({
         agentId: caller.agentId,
         assertActive: assertRepositoryCurrent,
+        operatorAuthority: caller.operatorAuthority,
+        sessionKey: caller.sessionKey,
+        factoryCredential: {
+          claim: {
+            purpose: "session-item-read",
+            binding: {
+              kind: "session",
+              agentId: caller.agentId,
+              sessionKey: caller.sessionKey,
+              sessionId: admittedSessionId,
+              lifecycleRevision: admittedLifecycleRevision,
+              requestDigest: factoryGitHubRequestDigest(initial.workspace.url),
+            },
+          },
+          assertCurrent: assertRepositoryCurrent,
+        },
         config: options.context.getRuntimeConfig(),
         context: options.context,
       });

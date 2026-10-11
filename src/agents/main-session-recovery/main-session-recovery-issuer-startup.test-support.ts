@@ -13,9 +13,7 @@ import {
 import { projectPublicSessionEntry } from "../../config/sessions/session-entry-projection.js";
 import { SESSION_TOTAL_TOKENS_VERSION } from "../../config/sessions/types.js";
 import { closeGatewayDeviceRevocation } from "../../gateway/device-revocation.js";
-import { createGatewayInstanceRuntime } from "../../gateway/server-instance-runtime.js";
 import { createGatewayRequestContext } from "../../gateway/server-request-context.js";
-import { makeContextParams } from "../../gateway/server-request-context.test-support.js";
 import { SharedGatewaySessionGenerationState } from "../../gateway/server-shared-auth-generation.js";
 import { persistGatewaySessionLifecycleEvent } from "../../gateway/session-lifecycle-state.js";
 import { prepareRepositoryWorkerProjectSource } from "../../gateway/worker-environments/repository-project-admission.js";
@@ -33,12 +31,11 @@ import { getSessionRepositoryWorkspaceStore } from "../../state/session-reposito
 import { setCanonicalUserProfileRole } from "../../state/user-profile-writes.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import {
-  readAdmittedRunOperatorAuthority,
+  type AdmittedRunOperatorAuthority,
   assertOperatorModelAllowed,
 } from "../admitted-run-context.js";
-import * as attemptRuntime from "../command/attempt-execution.runtime.js";
+import type { runAgentAttempt } from "../command/attempt-execution.runtime.js";
 import { refreshPreparedModelRuntimeSnapshots } from "../prepared-model-runtime.js";
-import { createAgentRunRestartAbortError } from "../run-termination.js";
 import { withGatewayToolCallerIdentity } from "../tools/gateway-caller-context.js";
 import { createCreateGoalTool } from "../tools/goal-tools.js";
 import {
@@ -46,8 +43,10 @@ import {
   installFactoryRestartRepositoryFixture,
 } from "./main-session-recovery-factory-read.test-support.js";
 import { applyOriginalIssuerStartupChange } from "./main-session-recovery-issuer-changes.test-support.js";
+import { installRecoveryModelLeaf } from "./main-session-recovery-model.test-support.js";
 import {
   createOriginalIssuerFixture,
+  createOriginalIssuerGateway,
   legacyIssuerChanges,
   acceptedTurnChanges,
   acceptOriginalIssuerTurn,
@@ -56,6 +55,7 @@ import {
   pauseNewGoalDuringOriginalDrain,
   assertRecoveredOriginalInput,
   readIssuerFixtureHistory,
+  startOriginalIssuerEvents,
 } from "./main-session-recovery-original-issuer.test-support.js";
 import {
   retiredOriginalSourceChanges,
@@ -99,6 +99,8 @@ export async function exerciseTrustedGoalStartup(
               : factoryRepository
                 ? factoryRestartChanges
                 : legacyIssuerChanges;
+    let stopActiveModel = () => {};
+    let closeActiveEvents = async () => {};
     let originalTurnRunId = "";
     let commitOriginalInput = async () => {};
     let originalReached = createDeferred();
@@ -137,89 +139,62 @@ export async function exerciseTrustedGoalStartup(
         },
       });
     }
-    const execution = vi
-      .spyOn(attemptRuntime, "runAgentAttempt")
-      .mockImplementation(async (params) => {
-        if (acceptedTurn && params.runId === originalTurnRunId) {
-          commitOriginalInput = () =>
-            commitOriginalAcceptedInput(params.opts.userTurnTranscriptRecorder);
-          originalReached.resolve();
-          await originalStopped.promise;
-          throw createAgentRunRestartAbortError();
-        }
-        const admitted = await params.preparedRunAdmission.admit("embedded");
-        const authority = readAdmittedRunOperatorAuthority(admitted);
-        expect(authority?.profileId).toBe(expectedProfileId);
-        expect(authority?.scopes).toEqual(["operator.read", "operator.write"]);
-        expect(authority?.scopes).not.toContain("operator.admin");
-        if (currentChange === "late role revoke" && !factoryRepository) {
-          await setCanonicalUserProfileRole(expectedProfileId, "revoked");
-          expect(() => authority!.assertCurrent()).toThrow();
-          throw new Error("Synthetic issuer revoked before effect");
-        }
-        authority!.assertCurrent();
-        assertOperatorModelAllowed(authority, { provider: "fixture", model: "allowed" });
-        expect(() =>
-          assertOperatorModelAllowed(authority, { provider: "fixture", model: "forbidden" }),
-        ).toThrow();
-        const fresh = loadSessionEntry(currentTarget)!;
-        expect(fresh.sessionId).toBe(expectedSessionId);
-        if (noGoal) {
-          expect(fresh.goal).toBeUndefined();
-          await assertRecoveredOriginalInput(currentTarget, expectedSessionId, originalTurnRunId);
-        } else {
-          expect(fresh.goal, JSON.stringify(fresh.goal)).toMatchObject({
-            id: expectedGoalId,
-            status: "active",
-            tokensUsed: 120,
-            tokenBudget: 500,
-            tokenStart: 100,
-            continuationTurns: 0,
-          });
-        }
-        if (activeGoalAccepted) {
-          await assertRecoveredOriginalInput(currentTarget, expectedSessionId, originalTurnRunId);
-        }
-        if (factoryRepository) {
-          const readNativeCredential = authority!.createFactoryGitHubDispatchCredentialReader!({
-            ...currentTarget,
-            sessionId: expectedSessionId,
-            repositoryUrl:
-              currentChange === "wrong repository"
-                ? "https://microsoft.ghe.com/other/not-accepted.git"
-                : expectedRepositoryUrl,
-            assertCurrent: () => authority!.assertCurrent(),
-          });
-          const source = await prepareRepositoryWorkerProjectSource({
-            namespace: "restored-factory",
-            repository: { agentId: "main", url: expectedRepositoryUrl, ref: "main" },
-            getConfig: () => nextBrokerContext.getRuntimeConfig(),
-            assertCurrent: () => authority!.assertCurrent(),
-            readNativeCredential,
-          });
-          expect(source.project.source.url).toBe(expectedRepositoryUrl);
-          expect(source.project.source.owner.identity).toMatchObject({
-            source: "system-detected",
-            accountId: expectedActorId,
-          });
-        }
-        effectCount += 1;
-        await params.onAgentEvent({ stream: "lifecycle", data: { phase: "start" } });
-        await params.opts.onExecutionStarted?.();
-        return {
-          payloads: [],
-          meta: {
-            durationMs: 0,
-            agentMeta: {
-              sessionId: params.sessionId,
-              provider: "fixture",
-              model: "allowed",
-              usage: { input: 0, output: 0, total: 0 },
-            },
-            stopReason: "stop",
-          },
-        };
-      });
+    const executeRecovered = async (
+      _params: Parameters<typeof runAgentAttempt>[0],
+      authority: AdmittedRunOperatorAuthority,
+    ) => {
+      expect(authority?.profileId).toBe(expectedProfileId);
+      expect(authority?.scopes).toEqual(["operator.read", "operator.write"]);
+      expect(authority?.scopes).not.toContain("operator.admin");
+      if (currentChange === "late role revoke" && !factoryRepository) {
+        await setCanonicalUserProfileRole(expectedProfileId, "revoked");
+        expect(() => authority!.assertCurrent()).toThrow();
+        throw new Error("Synthetic issuer revoked before effect");
+      }
+      authority!.assertCurrent();
+      assertOperatorModelAllowed(authority, { provider: "fixture", model: "allowed" });
+      expect(() =>
+        assertOperatorModelAllowed(authority, { provider: "fixture", model: "forbidden" }),
+      ).toThrow();
+      const fresh = loadSessionEntry(currentTarget)!;
+      expect(fresh.sessionId).toBe(expectedSessionId);
+      if (noGoal) {
+        expect(fresh.goal).toBeUndefined();
+      } else {
+        expect(fresh.goal, JSON.stringify(fresh.goal)).toMatchObject({
+          id: expectedGoalId,
+          status: "active",
+          tokensUsed: 120,
+          tokenBudget: 500,
+          tokenStart: 100,
+          continuationTurns: 0,
+        });
+      }
+      if (factoryRepository) {
+        const readNativeCredential = authority!.createFactoryGitHubDispatchCredentialReader!({
+          ...currentTarget,
+          sessionId: expectedSessionId,
+          repositoryUrl:
+            currentChange === "wrong repository"
+              ? "https://microsoft.ghe.com/other/not-accepted.git"
+              : expectedRepositoryUrl,
+          assertCurrent: () => authority!.assertCurrent(),
+        });
+        const source = await prepareRepositoryWorkerProjectSource({
+          namespace: "restored-factory",
+          repository: { agentId: "main", url: expectedRepositoryUrl, ref: "main" },
+          getConfig: () => nextBrokerContext.getRuntimeConfig(),
+          assertCurrent: () => authority!.assertCurrent(),
+          readNativeCredential,
+        });
+        expect(source.project.source.url).toBe(expectedRepositoryUrl);
+        expect(source.project.source.owner.identity).toMatchObject({
+          source: "system-detected",
+          accountId: expectedActorId,
+        });
+      }
+      effectCount += 1;
+    };
     let expectedProfileId = "";
     let expectedSessionId = "";
     let expectedGoalId = "";
@@ -242,6 +217,28 @@ export async function exerciseTrustedGoalStartup(
           original,
         } = issuerFixture;
         let cfg = initialConfig;
+        let closeEvents = startOriginalIssuerEvents(context);
+        closeActiveEvents = closeEvents;
+        const stopModel = installRecoveryModelLeaf({
+          cfg,
+          registry: issuerFixture.registry,
+          beforeAttempt: async (params) => {
+            if (acceptedTurn && params.runId === originalTurnRunId) {
+              commitOriginalInput = () =>
+                commitOriginalAcceptedInput(params.userTurnTranscriptRecorder);
+              originalReached.resolve();
+              await originalStopped.promise;
+            }
+          },
+          run: executeRecovered,
+          failed: (error, params) => {
+            if (params.runId === originalTurnRunId) {
+              originalReached.reject(error);
+            }
+          },
+        });
+
+        stopActiveModel = stopModel;
         expectedProfileId = profile.id;
         expectedActorId = 700100 + index;
         expectedRepositoryUrl = `https://microsoft.ghe.com/acme/issuer-${index}.git`;
@@ -464,6 +461,7 @@ export async function exerciseTrustedGoalStartup(
         original!.release();
         deviceSource.release();
         closeGatewayDeviceRevocation(context);
+        await closeEvents();
         runtime.close();
         if (index === 0) {
           await closeOpenClawAgentDatabasesAsync();
@@ -489,23 +487,14 @@ export async function exerciseTrustedGoalStartup(
                 : "original-shared",
           required: null,
         });
-        const nextParams = makeContextParams({
-          connectionWork: { track: (run) => work.track(run) },
-          sharedGatewaySessionGenerationState: newShared,
-        });
-        const nextContext = createGatewayRequestContext(nextParams);
+        const { context: nextContext, runtime: nextRuntime } = createOriginalIssuerGateway(
+          { ...issuerFixture, cfg },
+          newShared,
+          () => cfg,
+        );
         nextBrokerContext = nextContext;
-        nextContext.getRuntimeConfig = () => cfg;
-        nextContext.getCommittedRuntimeConfig = () => cfg;
-        nextContext.resolveGatewayContext = () => nextContext;
-        nextContext.getGatewayMethodRegistry = () => methods;
-        const nextRuntime = createGatewayInstanceRuntime({
-          getContext: () => nextContext,
-          getMethodRegistry: () => methods,
-          isDispatchAvailable: () => true,
-        });
-        nextContext.recoveryRuntime = nextRuntime.recovery;
-        nextContext.createAgentTurnFacade = nextRuntime.createAgentTurnFacade;
+        closeEvents = startOriginalIssuerEvents(nextContext);
+        closeActiveEvents = closeEvents;
         let restorePlanning = () => {};
         const prepareIssuer = nextRuntime.recovery.prepareGoalRecoveryAuthority!;
         const revokeBeforeCommit =
@@ -618,6 +607,13 @@ export async function exerciseTrustedGoalStartup(
             );
           }
           if (resumed) {
+            if (acceptedTurn) {
+              await assertRecoveredOriginalInput(
+                currentTarget,
+                expectedSessionId,
+                originalTurnRunId,
+              );
+            }
             expect(saved.sessionId).toBe(expectedSessionId);
             expect(saved.goal?.id).toBe(noGoal ? undefined : expectedGoalId);
             if (!noGoal) {
@@ -684,13 +680,16 @@ export async function exerciseTrustedGoalStartup(
           observer.mockRestore();
           warnings.mockRestore();
           await clearSessionGoal(currentTarget);
+          await closeEvents();
+          stopModel();
           nextRuntime.close();
           closeGatewayDeviceRevocation(nextContext);
           await work.drain();
         }
       }
     } finally {
-      execution.mockRestore();
+      stopActiveModel();
+      await closeActiveEvents();
       restoreActivePluginRegistrySnapshot(registrySnapshot);
       vi.unstubAllEnvs();
       vi.unstubAllGlobals();

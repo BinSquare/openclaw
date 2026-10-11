@@ -8,6 +8,7 @@ import { clearSessionStoreCacheForTest } from "../config/sessions/store-writer-s
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { areHeartbeatsEnabled, setHeartbeatsEnabled } from "../infra/heartbeat-wake.js";
 import { resolveOpenClawAgentSqlitePath } from "../state/openclaw-agent-db.paths.js";
+import { captureEnv, setTestEnvValue } from "../test-utils/env.js";
 import {
   createGatewayConfigPath,
   removeGatewayTempHome,
@@ -24,14 +25,22 @@ it("answers chat.send after a dashboard daily rollover", async () => {
   resetGatewayTestState();
   const home = await setupGatewayTempHome({ prefix: "openclaw-dashboard-title-rollover-" });
   const heartbeatsEnabled = areHeartbeatsEnabled();
+  const envSnapshot = captureEnv(["NO_PROXY", "no_proxy"]);
+  const providerRequests: string[] = [];
+  const providerErrors: string[] = [];
   const provider = createServer((request, response) => {
+    providerRequests.push(`${request.method} ${request.url}`);
     void readAndComplete(request, response).catch((error: unknown) => {
+      providerErrors.push(error instanceof Error ? error.message : String(error));
       response.destroy(error instanceof Error ? error : undefined);
     });
   });
   let gateway: Awaited<ReturnType<typeof startGatewayWithClient>> | undefined;
   const transcript: string[] = [];
   try {
+    // This provider is local even when the host routes external traffic through a proxy.
+    setTestEnvValue("NO_PROXY", "127.0.0.1,localhost");
+    setTestEnvValue("no_proxy", "127.0.0.1,localhost");
     setHeartbeatsEnabled(false);
     await new Promise<void>((resolve, reject) => {
       provider.once("error", reject);
@@ -114,10 +123,13 @@ it("answers chat.send after a dashboard daily rollover", async () => {
       `sessionStartedAtRefreshed=${(rolled?.sessionStartedAt ?? 0) > staleAt + 24 * 60 * 60 * 1000}`,
       `lifecycleRotated=${rolled?.lifecycleRevision !== "seed-revision"}`,
       `drainTimeout=${drainTimeout}`,
+      `providerRequests=${JSON.stringify(providerRequests)} providerErrors=${JSON.stringify(providerErrors)}`,
     );
     console.info(transcript.join("\n"));
     expect(freshness.state).toBe("stale");
     expect(staleReason).toBe("daily");
+    expect(providerRequests).toContain("POST /v1/responses");
+    expect(providerErrors).toEqual([]);
     expect(result.status, result.error).toBe("ok");
     expect(result.terminalReply?.text).toBe(replyText);
     expect(rolled?.sessionId).toBe(seededSessionId);
@@ -134,6 +146,7 @@ it("answers chat.send after a dashboard daily rollover", async () => {
       provider.close(() => resolve());
     });
     setHeartbeatsEnabled(heartbeatsEnabled);
+    envSnapshot.restore();
     home.envSnapshot.restore();
     await removeGatewayTempHome(home.tempHome);
     resetGatewayTestState();

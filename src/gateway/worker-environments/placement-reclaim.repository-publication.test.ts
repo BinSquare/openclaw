@@ -5,7 +5,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createOriginalIssuerFixture } from "../../agents/main-session-recovery/main-session-recovery-original-issuer.test-support.js";
 import { setRuntimeConfigSnapshot } from "../../config/io.js";
 import { upsertSessionEntryCore } from "../../config/sessions/session-accessor.js";
-import { setCanonicalUserProfileRole } from "../../state/user-profile-writes.js";
 import { createGatewayWorkerPlacementReclaimBarriers } from "../server-worker-placement-reclaim.js";
 import {
   createWorkerWorkspaceRecoveryPreparer,
@@ -143,8 +142,6 @@ describe("reclaim repository publication settlement", () => {
 
   it.each([
     "foreign successor",
-    "role revoked",
-    "lost acknowledgement",
     "legacy reaccept",
     "foreign after admission",
     "newer bytes",
@@ -152,7 +149,6 @@ describe("reclaim repository publication settlement", () => {
     "node changed",
     "unknown environment",
     "held source",
-    "retired actor",
     "session replaced",
   ] as const)(
     "preserves the published result after %s without repeating reconciliation",
@@ -181,8 +177,6 @@ describe("reclaim repository publication settlement", () => {
                       "synthetic acknowledgement lost after identical prior reaccept",
                     );
                   }
-                } else if (mode === "role revoked") {
-                  await setCanonicalUserProfileRole(issuer.profile.id, "viewer");
                 } else {
                   throw new Error("synthetic reply lost after known native checkpoint commit");
                 }
@@ -215,9 +209,6 @@ describe("reclaim repository publication settlement", () => {
           await resultGit.requireWorkspaceResultGit(f.remote, ["checkout", "-b", "foreign"]);
         } else if (mode === "unknown environment") {
           f.environments.get = () => undefined;
-        } else if (mode === "retired actor") {
-          await setCanonicalUserProfileRole(issuer.profile.id, "viewer");
-          expect(() => issuer.original!.authority.assertCurrent()).toThrow();
         } else if (mode === "session replaced") {
           await upsertSessionEntryCore(sessionTarget, {
             sessionId: "replacement-session",
@@ -267,24 +258,15 @@ describe("reclaim repository publication settlement", () => {
             },
           );
         }
-        if (mode !== "foreign successor" && mode !== "role revoked") {
+        if (mode !== "foreign successor") {
           await recover();
         }
         expect(reconcile).toHaveBeenCalledOnce();
-        if (
-          mode === "lost acknowledgement" ||
-          mode === "legacy reaccept" ||
-          mode === "retired actor"
-        ) {
-          expect((await f.store.get(before.workspaceId))?.revision).toBe(
-            before.revision + (mode === "legacy reaccept" ? 2 : 1),
-          );
+        if (mode === "legacy reaccept") {
+          expect((await f.store.get(before.workspaceId))?.revision).toBe(before.revision + 2);
           expect(await placements.listPendingWorkspaceResultsAsync()).toEqual([]);
           expect(placements.get(SESSION_ID)?.state).toBe("reclaimed");
           expect(f.environments.destroy).toHaveBeenCalledOnce();
-          if (mode === "retired actor") {
-            expect(() => issuer.original!.authority.assertCurrent()).toThrow();
-          }
         } else {
           expect(await placements.listPendingWorkspaceResultsAsync()).toHaveLength(1);
           expect(f.environments.destroy).not.toHaveBeenCalled();

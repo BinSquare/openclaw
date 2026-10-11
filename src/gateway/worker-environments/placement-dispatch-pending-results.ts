@@ -435,7 +435,6 @@ export async function recoverPendingWorkspaceResults(
               sessionId: active.sessionId,
               environmentId: active.environmentId,
               ownerEpoch: active.activeOwnerEpoch,
-              authorize: recovery.assertCurrent,
               placementGeneration: pending.placementGeneration,
             };
             const journal = {

@@ -28,7 +28,10 @@ import {
   readGatewayDeviceRecoverySource,
   retainGatewayDeviceRevocation,
 } from "./device-revocation.js";
-import { factoryGitHubDispatchCredentialReader } from "./factory-github-proof.js";
+import {
+  factoryGitHubClientProof,
+  factoryGitHubDispatchCredentialReader,
+} from "./factory-github-proof.js";
 import {
   onOperatorRolePolicyChanged,
   resolveGatewayOperatorRoleActor,
@@ -36,6 +39,7 @@ import {
 } from "./operator-role-policy.js";
 import {
   sourceRolePolicy,
+  prepareRunRolePolicy,
   resolveOperatorRoleSourcePolicyGeneration,
 } from "./operator-role-source-policy.js";
 import type { GatewayClient, GatewayRequestContext } from "./server-methods/shared-types.js";
@@ -103,18 +107,6 @@ function retainOperatorSource(
       }
     },
   };
-}
-
-function prepareRunRolePolicy(
-  role: ReturnType<typeof sourceRolePolicy>,
-): AdmittedRunOperatorAuthority["rolePolicy"] {
-  return role
-    ? {
-        sessionAccessCap: role.sessions.others,
-        sandboxRequired: role.sandbox === "required",
-        agents: role.agents,
-      }
-    : undefined;
 }
 
 /** Bridge a prepared linked principal while retaining its exact channel admission capability. */
@@ -615,6 +607,26 @@ export async function captureGatewayOperatorRunAuthority(input: {
               }
               return reader;
             }
+          : undefined,
+        captureFactoryGitHubReadProof: factoryActorId
+          ? (target) =>
+              factoryGitHubClientProof({
+                client,
+                claim: target.claim,
+                assertCurrent: () => {
+                  assertCurrent();
+                  target.assertCurrent();
+                  connectionSignal?.throwIfAborted();
+                  if (
+                    client.connId !== connectionId ||
+                    client.connectionSignal !== connectionSignal ||
+                    client.authenticatedFactoryGitHubAccountId !== factoryActorId ||
+                    client.authenticatedUserProfile?.profileId !== profileId
+                  ) {
+                    throw new Error("Original Factory GitHub source changed");
+                  }
+                },
+              })
           : undefined,
         captureRestartRecoveryIssuer: () => {
           assertCurrent();

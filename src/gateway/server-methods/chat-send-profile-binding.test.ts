@@ -33,7 +33,6 @@ import {
   useBrowserFollowupFixture,
 } from "./chat-send-pending-inputs.test-support.js";
 import { normalizeChatSendRequest } from "./chat-send-request.js";
-import { registerNativeSteeringAdmissionCases } from "./chat-send-retained-profile.test-support.js";
 import { prepareChatSendSession, qualifyChatSendSession } from "./chat-send-session.js";
 installGatewayTestHooks();
 registerAgentSessionLoopTestLifecycle();
@@ -535,12 +534,6 @@ describe("native profile-bound input admission", () => {
       }
     },
   );
-
-  registerNativeSteeringAdmissionCases({
-    createBrowserFollowupFixture,
-    setClientProfile,
-    setNativeIosClient,
-  });
 
   it.each(["host", "session ACL", "lifecycle"] as const)(
     "retains original %s authority after committed browser custody and profile merge",

@@ -14,17 +14,16 @@ import {
 } from "../config/runtime-snapshot.js";
 import { upsertSessionEntryCore } from "../config/sessions/session-accessor.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
-import * as command from "../process/exec.js";
 import { openOpenClawStateDatabase } from "../state/openclaw-state-db.js";
 import { createSessionRepositoryWorkspaceStore } from "../state/session-repository-workspaces.js";
+import type { SessionRepositoryWorkspaceRecord } from "../state/session-repository-workspaces.types.js";
 import { setCanonicalUserProfileRole } from "../state/user-profile-writes.js";
 import { ensureProfileForEmail } from "../state/user-profiles.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
+import { installFactoryExternalTransport } from "./factory-github-external.test-support.js";
 import { factoryGitHubRequestDigest } from "./factory-github-proof.js";
 import { invalidateOperatorRolePolicy } from "./operator-role-policy.js";
 import { captureGatewayOperatorRunAuthority } from "./operator-run-authority.js";
-import { factoryGitHubProofHandlers } from "./server-methods/factory-github-proof.js";
-import type { GatewayRequestHandlerOptions } from "./server-methods/types.js";
 import {
   createContext,
   createOperatorClient,
@@ -72,6 +71,15 @@ export type ReclaimedFactorySetupVariant =
 
 export async function exerciseReclaimedFactoryCredential(
   variant: ReclaimedFactoryCredentialVariant | ReclaimedFactorySetupVariant,
+  beforeRedispatch?: (flow: {
+    config: OpenClawConfig;
+    context: ReturnType<typeof createContext>;
+    client: ReturnType<typeof createOperatorClient>;
+    profileId: string;
+    repository: SessionRepositoryWorkspaceRecord;
+    assertCurrent: () => void;
+    external: ReturnType<typeof installFactoryExternalTransport>;
+  }) => Promise<void>,
 ) {
   onTestFinished(() => {
     vi.restoreAllMocks();
@@ -92,7 +100,7 @@ export async function exerciseReclaimedFactoryCredential(
     ]) {
       vi.stubEnv(key, undefined);
     }
-    const actorId = 17235;
+    const actorId = 101;
     const setupCase = variant.startsWith("setup ");
     const setupAdministrator = setupCase && variant !== "setup unprivileged";
     const profile = ensureProfileForEmail(`github:microsoft.ghe.com:${actorId}`);
@@ -203,7 +211,7 @@ export async function exerciseReclaimedFactoryCredential(
       runSetupScript: setupCase,
       assertCurrent,
     });
-    if (setupCase) {
+    if (setupCase || beforeRedispatch) {
       await upsertSessionEntryCore(
         { agentId: REQUEST.agentId, sessionKey: REQUEST.sessionKey },
         {
@@ -232,28 +240,6 @@ export async function exerciseReclaimedFactoryCredential(
       requiresNodeEnrollment: true,
       failAt: "create",
     });
-    const active = await harness.placements.seedActive(ready.ownerEpoch);
-    const draining = await placements.startDrain({
-      sessionId: active.sessionId,
-      environmentId: ready.environmentId,
-      ownerEpoch: ready.ownerEpoch,
-      expectedGeneration: active.generation,
-    });
-    const reconciling = await placements.startReconcile({
-      sessionId: active.sessionId,
-      environmentId: ready.environmentId,
-      ownerEpoch: ready.ownerEpoch,
-      expectedGeneration: draining.generation,
-    });
-    const placement = await placements.transition({
-      sessionId: active.sessionId,
-      from: "reconciling",
-      to: "reclaimed",
-      expectedGeneration: reconciling.generation,
-    });
-    if (placement.state !== "reclaimed") {
-      throw new Error("Fixture did not admit the reclaimed source");
-    }
     const provider = createProvider({
       requiresNodeEnrollment: true,
       supportsProjectPreparation: () => true,
@@ -277,83 +263,33 @@ export async function exerciseReclaimedFactoryCredential(
     vi.mocked(harness.environments.revalidatePreparedIntentRepository).mockImplementation(
       intent.revalidatePreparedIntentRepository,
     );
-    const proofs = new Set<string>();
-    const native = vi
-      .spyOn(command, "runCommandBuffered")
-      .mockImplementation(async (argv, options) => {
-        if (argv[2] === "status") {
-          return {
-            stdout: Buffer.from('{"hosts":{}}'),
-            stderr: Buffer.alloc(0),
-            code: 0,
-            signal: null,
-            killed: false,
-            termination: "exit",
-          };
-        }
-        expect(argv.slice(1)).toEqual(["auth", "token", "--hostname", "microsoft.ghe.com"]);
-        const proof = options?.env?.OPENCLAW_FACTORY_GITHUB_PROOF;
-        if (!proof) {
-          return {
-            stdout: Buffer.alloc(0),
-            stderr: Buffer.alloc(0),
-            code: 1,
-            signal: null,
-            killed: false,
-            termination: "exit",
-          };
-        }
-        expect(proofs.has(proof)).toBe(false);
-        proofs.add(proof);
-        const respond = vi.fn();
-        const redeem = expectDefined(
-          factoryGitHubProofHandlers["factory.githubPublication.redeem"],
-          "registered private redemption",
-        );
-        const request: GatewayRequestHandlerOptions = {
-          req: {
-            type: "req" as const,
-            id: "reclaimed-lookup",
-            method: "factory.githubPublication.redeem",
-            params: { proof },
-          },
-          client: {
-            ...createOperatorClient({ profileId: profile.id, scopes: ["operator.admin"] }),
-            internal: {
-              isLocalClient: true,
-              authenticatedOperator: true,
-              operatorRoleActor: { kind: "system" },
-            },
-          },
-          context: { ...context, isConnectionActive: () => true },
-          params: { proof },
-          respond,
-          hasCurrentClientAuthority: () => true,
-          isWebchatConnect: () => false,
-        };
-        await redeem(request);
-        expect(respond).toHaveBeenCalledWith(
-          true,
-          expect.objectContaining({
-            actorId,
-            profileId: profile.id,
-            purpose: "session-dispatch-project",
-            binding: {
-              kind: "session-dispatch",
-              agentId: REQUEST.agentId,
-              sessionKey: REQUEST.sessionKey,
-              sessionId: REQUEST.sessionId,
-              requestDigest: factoryGitHubRequestDigest(repository.url),
-            },
-          }),
-        );
-        const replay = vi.fn();
-        await redeem({ ...request, respond: replay });
-        expect(replay).toHaveBeenCalledWith(
-          false,
-          undefined,
-          expect.objectContaining({ code: "FORBIDDEN" }),
-        );
+    const external = installFactoryExternalTransport({
+      binding: () => ({ actorId, profileId: profile.id, repositoryUrl: repository.url, context }),
+      token: "synthetic-reclaimed-token",
+      executionAccountId: 731,
+      nodeId: "R_reclaimed_fixture",
+      allowAnonymousProbe: true,
+      assertVerdict: (verdict) => {
+        expect(verdict.binding).toMatchObject({
+          agentId: REQUEST.agentId,
+          sessionKey: REQUEST.sessionKey,
+          sessionId: REQUEST.sessionId,
+        });
+        if (!beforeRedispatch || verdict.purpose === "session-dispatch-project")
+          expect(verdict).toEqual(
+            expect.objectContaining({
+              purpose: "session-dispatch-project",
+              binding: {
+                kind: "session-dispatch",
+                agentId: REQUEST.agentId,
+                sessionKey: REQUEST.sessionKey,
+                sessionId: REQUEST.sessionId,
+                requestDigest: factoryGitHubRequestDigest(repository.url),
+              },
+            }),
+          );
+      },
+      afterLookup: async () => {
         await Promise.resolve();
         if (variant === "actor changed during lookup") {
           client.authenticatedFactoryGitHubAccountId = actorId + 1;
@@ -396,52 +332,40 @@ export async function exerciseReclaimedFactoryCredential(
           });
           expect(changed.requestedRef).not.toBe(repository.requestedRef);
         }
-        return {
-          stdout: Buffer.from("synthetic-reclaimed-token"),
-          stderr: Buffer.alloc(0),
-          code: 0,
-          signal: null,
-          killed: false,
-          termination: "exit",
-        };
-      });
-    const commit = "a".repeat(40);
-    const tree = "b".repeat(40);
-    const fetchFixture = vi.fn<typeof fetch>(async (input, init) => {
-      expect(new Headers(init?.headers).get("authorization")).toContain(
-        "synthetic-reclaimed-token",
-      );
-      const path = new URL(input instanceof Request ? input.url : input).pathname;
-      const metadata = {
-        node_id: "R_reclaimed_fixture",
-        clone_url: repository.url,
-        private: true,
-        default_branch: "main",
-      };
-      let body: unknown;
-      if (path.endsWith("/user")) {
-        body = { id: 731, login: "fixture-system-account", type: "User" };
-      } else if (path.endsWith("/graphql")) {
-        body = {
-          data: {
-            node: {
-              ...metadata,
-              __typename: "Repository",
-              object: { __typename: "Commit", sha: commit, tree: { sha: tree } },
-            },
-          },
-        };
-      } else if (path.includes("/commits/")) {
-        body = { sha: commit, commit: { tree: { sha: tree } } };
-      } else if (path.includes("/git/trees/")) {
-        body = { sha: tree, truncated: false, tree: [] };
-      } else {
-        expect(path).toBe("/repos/acme/project");
-        body = metadata;
-      }
-      return Response.json(body);
+      },
     });
-    vi.stubGlobal("fetch", fetchFixture);
+    const { proofs, native, fetchFixture } = external;
+    await beforeRedispatch?.({
+      config,
+      context,
+      client,
+      profileId: profile.id,
+      repository,
+      assertCurrent,
+      external,
+    });
+    const active = await harness.placements.seedActive(ready.ownerEpoch);
+    const draining = await placements.startDrain({
+      sessionId: active.sessionId,
+      environmentId: ready.environmentId,
+      ownerEpoch: ready.ownerEpoch,
+      expectedGeneration: active.generation,
+    });
+    const reconciling = await placements.startReconcile({
+      sessionId: active.sessionId,
+      environmentId: ready.environmentId,
+      ownerEpoch: ready.ownerEpoch,
+      expectedGeneration: draining.generation,
+    });
+    const placement = await placements.transition({
+      sessionId: active.sessionId,
+      from: "reconciling",
+      to: "reclaimed",
+      expectedGeneration: reconciling.generation,
+    });
+    if (placement.state !== "reclaimed") {
+      throw new Error("Fixture did not admit the reclaimed source");
+    }
     const setupEffects: Array<{ profileId: string; sessionId: string }> = [];
     const setupDispatch: typeof harness.service.dispatch = async (
       request,

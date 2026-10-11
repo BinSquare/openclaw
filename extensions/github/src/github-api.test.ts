@@ -42,146 +42,84 @@ function useRequestClock() {
   });
 }
 
-function requestSignal(init: RequestInit | undefined): AbortSignal {
-  if (!init?.signal) {
-    throw new Error("Fixture requires a cancellable transport");
-  }
-  return init.signal;
+// Only external bytes, readiness and scope-observation live here. The request owner
+// performs admission, starts its deadline and releases the scopes itself.
+function scriptedTransport() {
+  const caller = new AbortController();
+  const scopes: ReturnType<typeof vi.fn>[] = [];
+  const hops = Array.from({ length: 2 }, () => ({
+    sent: createDeferred<void>(),
+    headers: createDeferred<Response>(),
+    reading: createDeferred<void>(),
+    body: createDeferred<Uint8Array>(),
+  }));
+  const fetchImpl = vi.fn<typeof fetch>(async (_url, init) => {
+    const hop = hops[fetchImpl.mock.calls.length - 1];
+    if (!hop || !init?.signal) throw new Error("Unexpected or uncancellable transport");
+    const signal = init.signal;
+    signal.throwIfAborted();
+    hop.sent.resolve();
+    return await new Promise<Response>((resolve, reject) => {
+      const abort = () => reject(signal.reason);
+      signal.addEventListener("abort", abort, { once: true });
+      void hop.headers.promise
+        .then(resolve, reject)
+        .finally(() => signal.removeEventListener("abort", abort));
+    });
+  });
+  const upstream = vi.fn(() => {
+    const release = vi.fn();
+    scopes.push(release);
+    return { signal: caller.signal, release };
+  });
+  const stream = (index: number) => {
+    const hop = hops[index];
+    const signal = fetchImpl.mock.calls[index]?.[1]?.signal;
+    if (!signal) throw new Error("Body requires dispatched transport");
+    return new Response(
+      new ReadableStream<Uint8Array>(
+        {
+          start(controller) {
+            signal.addEventListener("abort", () => controller.error(signal.reason), { once: true });
+          },
+          async pull(controller) {
+            hop.reading.resolve();
+            const bytes = await hop.body.promise;
+            controller.enqueue(bytes);
+            controller.close();
+          },
+        },
+        { highWaterMark: 0 },
+      ),
+    );
+  };
+  return { caller, scopes, hops, fetchImpl, upstream, stream };
+}
+
+async function reached(entered: Promise<void>, settled: Promise<unknown>) {
+  expect(await Promise.race([entered.then(() => "entered"), settled.then(() => "settled")])).toBe(
+    "entered",
+  );
+}
+
+function expectPhase(name: string, status: "success" | "error") {
+  const records = phaseLog.mock.calls.map(([, fields]) => fields);
+  const entry = records.find((record) => record.name === name && record.status === "entry");
+  expect(entry).toMatchObject({ traceId: expect.stringMatching(/^[a-f0-9]{32}$/u) });
+  expect(records).toContainEqual(
+    expect.objectContaining({
+      traceId: entry.traceId,
+      requestSpanId: entry.requestSpanId,
+      spanId: entry.spanId,
+      name,
+      status,
+      durationMs: expect.any(Number),
+    }),
+  );
+  return entry;
 }
 
 describe("GitHub API base URL", () => {
-  it.each(["admission", "transport"] as const)(
-    "observes pending %s and its error without exporting private diagnostics",
-    async (failureStage) => {
-      const api = await import("./github-api.js");
-      phaseLog.mockReset();
-      const entered = createDeferred<void>();
-      const admitted = createDeferred<void>();
-      const transported = createDeferred<Response>();
-      const transportEntered = createDeferred<void>();
-      const privateError = new Error("synthetic-private-token-and-request-body");
-      const fetchImpl = vi.fn<typeof fetch>(async () => {
-        transportEntered.resolve();
-        return await transported.promise;
-      });
-      const request = api.fetchGitHubApi(
-        "https://api.github.com/repos/acme/private-repo?private-query=secret",
-        fetchImpl,
-        "synthetic-private-token",
-        undefined,
-        {
-          revalidate: async () => {
-            entered.resolve();
-            await admitted.promise;
-          },
-          assertSelected: vi.fn(),
-        },
-      );
-      const outcome = request.then(
-        () => ({ ok: true as const }),
-        (error: unknown) => ({ ok: false as const, error }),
-      );
-      await entered.promise;
-      try {
-        expect(phaseLog).toHaveBeenCalledWith(
-          "github api phase",
-          expect.objectContaining({
-            traceId: expect.stringMatching(/^[a-f0-9]{32}$/u),
-            name: "credentialRevalidation",
-            status: "entry",
-          }),
-        );
-        expect(fetchImpl).not.toHaveBeenCalled();
-        if (failureStage === "admission") {
-          admitted.reject(privateError);
-        } else {
-          admitted.resolve();
-          await transportEntered.promise;
-          expect(phaseLog).toHaveBeenCalledWith(
-            "github api phase",
-            expect.objectContaining({ name: "credentialRevalidation", status: "success" }),
-          );
-          expect(phaseLog).toHaveBeenCalledWith(
-            "github api phase",
-            expect.objectContaining({ name: "responseHeaders", status: "entry" }),
-          );
-          transported.reject(privateError);
-        }
-      } finally {
-        admitted.reject(privateError);
-        transported.resolve(new Response("{}"));
-        await outcome;
-      }
-      const result = await outcome;
-      expect(result.ok).toBe(false);
-      if (result.ok) {
-        throw new Error("Failed GitHub request unexpectedly succeeded");
-      }
-      expect(result.error).toMatchObject({
-        message: failureStage === "admission" ? privateError.message : "Could not reach GitHub",
-      });
-      const records = phaseLog.mock.calls.map(([, fields]) => fields);
-      const failedName =
-        failureStage === "admission" ? "credentialRevalidation" : "responseHeaders";
-      const entry = records.find(
-        (record) => record.name === failedName && record.status === "entry",
-      );
-      expect(records).toContainEqual(
-        expect.objectContaining({
-          traceId: entry.traceId,
-          requestSpanId: entry.requestSpanId,
-          name: failedName,
-          spanId: entry.spanId,
-          status: "error",
-          durationMs: expect.any(Number),
-        }),
-      );
-      if (failureStage === "transport") {
-        expect(phaseLog).toHaveBeenCalledWith(
-          "github api failed",
-          expect.objectContaining({
-            traceId: entry.traceId,
-            requestSpanId: entry.requestSpanId,
-            diagnosticCode: "transport_error",
-          }),
-        );
-      }
-      expect(JSON.stringify(records)).not.toMatch(/private-repo|private-query|secret|token|body/);
-    },
-  );
-
-  it("honors caller cancellation while current authority is being revalidated", async () => {
-    const api = await import("./github-api.js");
-    phaseLog.mockImplementationOnce(() => {
-      throw new Error("diagnostic sink unavailable");
-    });
-    const entered = createDeferred<void>();
-    const admitted = createDeferred<void>();
-    const controller = new AbortController();
-    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(new Response("{}"));
-    const request = api.fetchGitHubApi(
-      "https://api.github.com/repos/acme/repo",
-      fetchImpl,
-      "synthetic-token",
-      undefined,
-      {
-        revalidate: async () => {
-          entered.resolve();
-          await admitted.promise;
-        },
-        assertSelected: vi.fn(),
-      },
-      undefined,
-      controller.signal,
-    );
-    const cancelled = expect(request).rejects.toMatchObject({ name: "AbortError" });
-    await entered.promise;
-    controller.abort();
-    admitted.resolve();
-    await cancelled;
-    expect(fetchImpl).not.toHaveBeenCalled();
-  });
-
   it("defaults to public GitHub", async () => {
     const { GITHUB_API_BASE_URL, GITHUB_API_ORIGIN } = await import("../api.js");
     expect(GITHUB_API_BASE_URL).toBe("https://api.github.com");
@@ -268,296 +206,279 @@ describe("GitHub API base URL", () => {
   });
 });
 
-describe("GitHub transport deadline", () => {
+describe("GitHub request lifetime", () => {
+  it.each([
+    "admission error",
+    "admission cancel",
+    "credential",
+    "selection",
+    "headers error",
+    "headers cancel",
+    "body cancel",
+  ] as const)("settles %s at its reached boundary without exposing private data", async (fault) => {
+    const api = await import("./github-api.js");
+    useRequestClock();
+    const wire = scriptedTransport();
+    const entered = createDeferred<void>();
+    const admission = createDeferred<void>();
+    const privateError = new Error("synthetic-private-token-and-request-body");
+    let current = true;
+    if (fault === "admission cancel")
+      phaseLog.mockImplementationOnce(() => {
+        throw new Error("sink unavailable");
+      });
+    const pending = api
+      .fetchGitHubApi(
+        "https://api.github.com/repos/acme/private-repo?private-query=secret",
+        wire.fetchImpl,
+        "synthetic-private-token",
+        undefined,
+        {
+          revalidate: async () => {
+            entered.resolve();
+            await admission.promise;
+            if (fault === "credential" && !current) throw privateError;
+          },
+          assertSelected: () => {
+            if (fault === "selection" && !current) throw privateError;
+          },
+        },
+        undefined,
+        fault === "admission cancel" ? wire.caller.signal : wire.upstream,
+      )
+      .then((response) => api.readBoundedResponse(response, 1024));
+    const settled = vi.fn();
+    const outcome = pending.then(
+      (value) => settled({ value }),
+      (error) => settled({ error }),
+    );
+    try {
+      await reached(entered.promise, outcome);
+      expect(wire.fetchImpl).not.toHaveBeenCalled();
+      expect(wire.upstream).not.toHaveBeenCalled();
+      // The sink-failure row tests cancellation, not successful observation delivery.
+      if (fault !== "admission cancel")
+        expect(phaseLog).toHaveBeenCalledWith(
+          "github api phase",
+          expect.objectContaining({
+            traceId: expect.stringMatching(/^[a-f0-9]{32}$/u),
+            name: "credentialRevalidation",
+            status: "entry",
+          }),
+        );
+      if (fault === "admission error") admission.reject(privateError);
+      else {
+        if (fault === "credential" || fault === "selection") current = false;
+        if (fault === "admission cancel") wire.caller.abort();
+        admission.resolve();
+        if (fault.startsWith("headers") || fault === "body cancel") {
+          await reached(wire.hops[0].sent.promise, outcome);
+          expect(phaseLog).toHaveBeenCalledWith(
+            "github api phase",
+            expect.objectContaining({
+              traceId: expect.stringMatching(/^[a-f0-9]{32}$/u),
+              name: "responseHeaders",
+              status: "entry",
+            }),
+          );
+          expectPhase("credentialRevalidation", "success");
+          if (fault === "headers error") wire.hops[0].headers.reject(privateError);
+          else {
+            if (fault === "body cancel") {
+              wire.hops[0].headers.resolve(wire.stream(0));
+              await reached(wire.hops[0].reading.promise, outcome);
+            }
+            await vi.advanceTimersByTimeAsync(1_000);
+            wire.caller.abort(new DOMException("synthetic-private-cancel-reason", "AbortError"));
+          }
+        }
+      }
+      if (["admission error", "admission cancel", "credential", "selection"].includes(fault)) {
+        expect(
+          await Promise.race([
+            outcome.then(() => "settled"),
+            wire.hops[0].sent.promise.then(() => "sent"),
+          ]),
+        ).toBe("settled");
+      }
+      await outcome;
+      const sent = fault.startsWith("headers") || fault === "body cancel";
+      expect(wire.fetchImpl).toHaveBeenCalledTimes(sent ? 1 : 0);
+      expect(wire.scopes).toHaveLength(sent ? 1 : 0);
+      for (const release of wire.scopes) expect(release).toHaveBeenCalledOnce();
+      const error = settled.mock.calls[0]?.[0].error;
+      expect(error).toBeInstanceOf(Error);
+      if (fault === "admission cancel") expect(error).toMatchObject({ name: "AbortError" });
+      if (["admission error", "credential", "selection"].includes(fault))
+        expect(error).toBe(privateError);
+      if (fault === "headers error") {
+        expect(error).toMatchObject({ message: "Could not reach GitHub" });
+        const entry = expectPhase("responseHeaders", "error");
+        expect(phaseLog).toHaveBeenCalledWith(
+          "github api failed",
+          expect.objectContaining({
+            traceId: entry.traceId,
+            requestSpanId: entry.requestSpanId,
+            diagnosticCode: "transport_error",
+          }),
+        );
+      }
+      if (fault === "admission error") expectPhase("credentialRevalidation", "error");
+      if (fault === "headers cancel")
+        expect(phaseLog).toHaveBeenCalledWith(
+          "github api failed",
+          expect.objectContaining({ diagnosticCode: "caller_aborted" }),
+        );
+      expect(JSON.stringify(phaseLog.mock.calls)).not.toMatch(
+        /private-repo|private-query|secret|token|body|cancel-reason/,
+      );
+    } finally {
+      admission.resolve();
+      wire.caller.abort();
+      await outcome;
+    }
+  });
+
   it.each(["rest", "graphql", "lazy upstream"] as const)(
-    "preserves the full HTTP budget after bounded slow admission for %s",
+    "gives %s a full eight-second dispatch budget after slow admission",
     async (kind) => {
       const api = await import("./github-api.js");
       useRequestClock();
-      const admissionEntered = createDeferred<void>();
-      const admitted = createDeferred<void>();
-      const transportEntered = createDeferred<void>();
-      const caller = new AbortController();
-      const released = vi.fn();
-      const upstream = vi.fn(() => ({ signal: caller.signal, release: released }));
-      const fetchImpl = vi.fn<typeof fetch>(async (_url, init) => {
-        transportEntered.resolve();
-        const signal = requestSignal(init);
-        signal.throwIfAborted();
-        return await new Promise<Response>((_resolve, reject) => {
-          signal.addEventListener(
-            "abort",
-            () => reject(new DOMException("Request aborted", "AbortError")),
-            { once: true },
-          );
-        });
-      });
+      const wire = scriptedTransport();
+      const entered = createDeferred<void>();
+      const admission = createDeferred<void>();
       const settled = vi.fn();
-      const pending = api
+      const outcome = api
         .fetchGitHubApi(
           kind === "graphql"
             ? api.GITHUB_GRAPHQL_URL
-            : `${api.GITHUB_API_BASE_URL}/repos/acme/repo`,
-          fetchImpl,
+            : api.GITHUB_API_BASE_URL + "/repos/acme/repo",
+          wire.fetchImpl,
           "synthetic-deadline-token",
           undefined,
           {
             revalidate: async () => {
-              admissionEntered.resolve();
-              await admitted.promise;
+              entered.resolve();
+              await admission.promise;
             },
             assertSelected: () => {},
           },
           undefined,
-          kind === "lazy upstream" ? upstream : caller.signal,
+          kind === "lazy upstream" ? wire.upstream : wire.caller.signal,
           kind === "graphql" ? { query: "query { viewer { login } }", variables: {} } : undefined,
         )
         .then(
-          (response) => settled({ response }),
-          (error: unknown) => settled({ error }),
+          (value) => settled({ value }),
+          (error) => settled({ error }),
         );
       try {
-        await admissionEntered.promise;
+        await reached(entered.promise, outcome);
         await vi.advanceTimersByTimeAsync(9_000);
-        expect(fetchImpl).not.toHaveBeenCalled();
-        expect(upstream).not.toHaveBeenCalled();
-        admitted.resolve();
-        await transportEntered.promise;
-        await vi.advanceTimersByTimeAsync(0);
-        expect(settled).not.toHaveBeenCalled();
+        expect(wire.fetchImpl).not.toHaveBeenCalled();
+        expect(wire.upstream).not.toHaveBeenCalled();
+        admission.resolve();
+        await reached(wire.hops[0].sent.promise, outcome);
         await vi.advanceTimersByTimeAsync(7_999);
         expect(settled).not.toHaveBeenCalled();
         await vi.advanceTimersByTimeAsync(1);
-        await pending;
+        await outcome;
         expect(settled).toHaveBeenCalledExactlyOnceWith({
           error: expect.objectContaining({ statusCode: 502, retryable: true }),
         });
-        // A post-send timeout retains its failure; it neither proves no effects nor retries.
-        expect(fetchImpl).toHaveBeenCalledOnce();
+        // Post-send timeout is a failure, not proof of no effects or permission to retry.
+        expect(wire.fetchImpl).toHaveBeenCalledOnce();
+        expect(wire.scopes).toHaveLength(kind === "lazy upstream" ? 1 : 0);
+        for (const release of wire.scopes) expect(release).toHaveBeenCalledOnce();
         expect(phaseLog).toHaveBeenCalledWith(
           "github api failed",
-          expect.objectContaining({
-            diagnosticCode: "deadline_expired",
-          }),
+          expect.objectContaining({ diagnosticCode: "deadline_expired" }),
         );
-        expect(released).toHaveBeenCalledTimes(kind === "lazy upstream" ? 1 : 0);
       } finally {
-        admitted.resolve();
-        caller.abort();
-        await pending;
+        admission.resolve();
+        wire.caller.abort();
+        await outcome;
       }
     },
   );
 
-  it.each(["headers", "body"] as const)(
-    "preserves caller cancellation and scope release during transport %s",
+  it.each(["headers", "body", "redirect admission", "success"] as const)(
+    "retains the first deadline and response ownership across redirect to %s",
     async (stage) => {
       const api = await import("./github-api.js");
       useRequestClock();
-      const sent = createDeferred<void>();
-      const caller = new AbortController();
-      const release = vi.fn();
-      const fetchImpl = vi.fn<typeof fetch>(async (_url, init) => {
-        const signal = requestSignal(init);
-        signal.throwIfAborted();
-        sent.resolve();
-        if (stage === "body") {
-          return new Response(
-            new ReadableStream({
-              start(controller) {
-                signal.addEventListener("abort", () => controller.error(signal.reason), {
-                  once: true,
-                });
-              },
-            }),
-          );
-        }
-        return await new Promise<Response>((_resolve, reject) => {
-          signal.addEventListener(
-            "abort",
-            () => reject(new DOMException("Request aborted", "AbortError")),
-            { once: true },
-          );
-        });
-      });
-      const pending = api
-        .fetchGitHubApi(
-          `${api.GITHUB_API_BASE_URL}/repos/acme/repo`,
-          fetchImpl,
-          "synthetic-caller-token",
-          undefined,
-          undefined,
-          undefined,
-          () => ({ signal: caller.signal, release }),
-        )
-        .then((response) => api.readBoundedResponse(response, 1024));
-      const cancelled = expect(pending).rejects.toBeInstanceOf(Error);
-      try {
-        await sent.promise;
-        await vi.advanceTimersByTimeAsync(1_000);
-        caller.abort(new DOMException("synthetic-private-cancel-reason", "AbortError"));
-        await cancelled;
-        expect(fetchImpl).toHaveBeenCalledOnce();
-        expect(release).toHaveBeenCalledOnce();
-        if (stage === "headers") {
-          expect(phaseLog).toHaveBeenCalledWith(
-            "github api failed",
-            expect.objectContaining({
-              diagnosticCode: "caller_aborted",
-            }),
-          );
-        }
-        expect(JSON.stringify(phaseLog.mock.calls)).not.toContain(
-          "synthetic-private-cancel-reason",
-        );
-      } finally {
-        caller.abort();
-        await cancelled;
-      }
-    },
-  );
-
-  it.each(["headers", "body", "redirect admission"] as const)(
-    "retains one dispatch deadline across redirects and %s",
-    async (stage) => {
-      const api = await import("./github-api.js");
-      useRequestClock();
-      const firstEntered = createDeferred<void>();
-      const firstHeaders = createDeferred<Response>();
-      const secondEntered = createDeferred<void>();
+      const wire = scriptedTransport();
+      const redirectEntered = createDeferred<void>();
       const redirectAdmission = createDeferred<void>();
-      const caller = new AbortController();
       let admissions = 0;
-      const fetchImpl = vi.fn<typeof fetch>(async (_url, init) => {
-        const signal = requestSignal(init);
-        signal.throwIfAborted();
-        if (fetchImpl.mock.calls.length === 1) {
-          firstEntered.resolve();
-          return await firstHeaders.promise;
-        }
-        secondEntered.resolve();
-        if (stage === "body") {
-          return new Response(
-            new ReadableStream({
-              start(controller) {
-                signal.addEventListener("abort", () => controller.error(signal.reason), {
-                  once: true,
-                });
-              },
-            }),
-          );
-        }
-        return await new Promise<Response>((_resolve, reject) => {
-          signal.addEventListener(
-            "abort",
-            () => reject(new DOMException("Request aborted", "AbortError")),
-            { once: true },
-          );
-        });
-      });
       const settled = vi.fn();
-      const pending = api
+      let response: Response | undefined;
+      const outcome = api
         .fetchGitHubApi(
-          `${api.GITHUB_API_BASE_URL}/repos/acme/repo`,
-          fetchImpl,
+          api.GITHUB_API_BASE_URL + "/repos/acme/repo",
+          wire.fetchImpl,
           "synthetic-redirect-token",
           undefined,
           {
             revalidate: async () => {
-              admissions++;
-              if (stage === "redirect admission" && admissions === 2) {
-                secondEntered.resolve();
+              if (++admissions === 2) {
+                redirectEntered.resolve();
                 await redirectAdmission.promise;
               }
             },
             assertSelected: () => {},
           },
           undefined,
-          caller.signal,
+          wire.upstream,
         )
-        .then((response) => api.readBoundedResponse(response, 1024))
+        .then((value) => {
+          response = value;
+          return api.readBoundedResponse(value, 1024);
+        })
         .then(
-          (body) => settled({ body }),
-          (error: unknown) => settled({ error }),
+          (value) => settled({ value }),
+          (error) => settled({ error }),
         );
       try {
-        await firstEntered.promise;
+        await reached(wire.hops[0].sent.promise, outcome);
         await vi.advanceTimersByTimeAsync(5_000);
-        firstHeaders.resolve(
+        wire.hops[0].headers.resolve(
           new Response(null, {
             status: 302,
-            headers: {
-              location: `${api.GITHUB_API_BASE_URL}/repos/acme/moved`,
-            },
+            headers: { location: api.GITHUB_API_BASE_URL + "/repos/acme/moved" },
           }),
         );
-        await secondEntered.promise;
+        await reached(redirectEntered.promise, outcome);
+        expect(wire.scopes[0]).toHaveBeenCalledOnce();
+        if (stage !== "redirect admission") {
+          redirectAdmission.resolve();
+          await reached(wire.hops[1].sent.promise, outcome);
+          if (stage !== "headers") {
+            wire.hops[1].headers.resolve(wire.stream(1));
+            await reached(wire.hops[1].reading.promise, outcome);
+          }
+        }
         await vi.advanceTimersByTimeAsync(2_999);
         expect(settled).not.toHaveBeenCalled();
-        await vi.advanceTimersByTimeAsync(1);
+        if (stage === "success") wire.hops[1].body.resolve(new TextEncoder().encode("{}"));
+        else await vi.advanceTimersByTimeAsync(1);
         redirectAdmission.resolve();
-        await pending;
-        expect(settled).toHaveBeenCalledExactlyOnceWith({ error: expect.any(Error) });
-        expect(admissions).toBe(2);
-        expect(fetchImpl).toHaveBeenCalledTimes(stage === "redirect admission" ? 1 : 2);
-        if (stage !== "redirect admission") {
-          expect(requestSignal(fetchImpl.mock.calls[1]?.[1]).aborted).toBe(true);
-        }
-      } finally {
-        firstHeaders.resolve(
-          new Response(null, {
-            status: 302,
-            headers: {
-              location: `${api.GITHUB_API_BASE_URL}/repos/acme/moved`,
-            },
-          }),
+        await vi.advanceTimersByTimeAsync(0);
+        if (stage !== "success") expect(settled).toHaveBeenCalledOnce();
+        await outcome;
+        expect(settled).toHaveBeenCalledExactlyOnceWith(
+          stage === "success" ? { value: Buffer.from("{}") } : { error: expect.any(Error) },
         );
+        expect(admissions).toBe(2);
+        expect(wire.fetchImpl).toHaveBeenCalledTimes(stage === "redirect admission" ? 1 : 2);
+        if (stage !== "success" && stage !== "redirect admission")
+          expect(wire.fetchImpl.mock.calls[1]?.[1]?.signal?.aborted).toBe(true);
+        if (response) await api.discardResponse(response);
+        for (const release of wire.scopes) expect(release).toHaveBeenCalledOnce();
+      } finally {
         redirectAdmission.resolve();
-        caller.abort();
-        await pending;
+        wire.caller.abort();
+        await outcome;
       }
-    },
-  );
-
-  it.each(["credential", "selection"] as const)(
-    "does not send HTTP when %s authority changes during admission",
-    async (stage) => {
-      const api = await import("./github-api.js");
-      const entered = createDeferred<void>();
-      const admitted = createDeferred<void>();
-      const refused = new Error("Synthetic authority retired");
-      let current = true;
-      const fetchImpl = vi.fn<typeof fetch>();
-      const upstream = vi.fn(() => ({ signal: new AbortController().signal, release: vi.fn() }));
-      const pending = api.fetchGitHubApi(
-        `${api.GITHUB_API_BASE_URL}/repos/acme/repo`,
-        fetchImpl,
-        "synthetic-guard-token",
-        undefined,
-        {
-          revalidate: async () => {
-            entered.resolve();
-            await admitted.promise;
-            if (stage === "credential" && !current) {
-              throw refused;
-            }
-          },
-          assertSelected: () => {
-            if (!current) {
-              throw refused;
-            }
-          },
-        },
-        undefined,
-        upstream,
-      );
-      const denied = expect(pending).rejects.toBe(refused);
-      await entered.promise;
-      current = false;
-      admitted.resolve();
-      await denied;
-      expect(fetchImpl).not.toHaveBeenCalled();
-      expect(upstream).not.toHaveBeenCalled();
     },
   );
 });

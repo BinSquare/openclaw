@@ -25,18 +25,20 @@ export function executeDevicePairingRead(
     readDevicePairingStoreStateFromDatabase(db),
   );
   let bindings = bindingsBySnapshot.get(state);
-  if (!bindings) {
+  if (!bindings && command.publishedRevision !== revision) {
     bindings = Object.values(state.pairedByDeviceId).map((device) =>
       prepareDevicePairingBinding(device.deviceId, device),
     );
     bindingsBySnapshot.set(state, bindings);
   }
-  const publishComplete = command.publishedRevision !== revision;
+  // A partial newer revision cannot establish what happened to other retained
+  // devices. Publish the worker's complete binding index once per revision.
+  const refreshedBindings = command.publishedRevision === revision ? undefined : bindings;
   const common = {
     ok: true as const,
     sourceAdmitted: true as const,
     revision,
-    bindingsComplete: publishComplete,
+    bindingsComplete: refreshedBindings !== undefined,
   };
   if (command.type === "devicePairing.lookup") {
     const deviceId = command.deviceId.trim();
@@ -47,14 +49,14 @@ export function executeDevicePairingRead(
       ...common,
       type: command.type,
       device,
-      bindings: publishComplete ? bindings : [prepareDevicePairingBinding(deviceId, device)],
+      bindings: refreshedBindings ?? [prepareDevicePairingBinding(deviceId, device)],
     };
   }
   if (command.type === "devicePairing.bootstrapContext") {
     return {
       ...common,
       type: command.type,
-      bindings: publishComplete ? bindings : [],
+      bindings: refreshedBindings ?? [],
       context: getBoundDeviceBootstrapContextFromRecords(
         readDeviceBootstrapTokenRecordsFromDatabase(db),
         command.input,
@@ -67,12 +69,12 @@ export function executeDevicePairingRead(
       record && command.nowMs - (record.refreshedAtMs ?? record.ts) <= 5 * 60 * 1000
         ? (({ refreshedAtMs: _refreshedAtMs, ...request }) => request)(record)
         : null;
-    return { ...common, type: command.type, pending, bindings: publishComplete ? bindings : [] };
+    return { ...common, type: command.type, pending, bindings: refreshedBindings ?? [] };
   }
   return {
     ...common,
     type: command.type,
-    bindings: command.publishedRevision === revision ? undefined : bindings,
+    bindings: refreshedBindings,
     list: {
       pending: Object.values(state.pendingById)
         .filter((record) => command.nowMs - (record.refreshedAtMs ?? record.ts) <= 5 * 60 * 1000)

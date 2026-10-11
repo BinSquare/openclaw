@@ -11,6 +11,13 @@ import {
   getAgentEventLifecycleGeneration,
   rotateAgentEventLifecycleGeneration,
 } from "../../infra/agent-events.js";
+import {
+  claimAgentRunDelegatedAuthority,
+  clearAgentRunContext,
+  registerAgentRunContext,
+  releaseAgentRunDelegatedAuthority,
+  retainQueuedAgentRunContext,
+} from "../../infra/agent-run-registry.js";
 import * as recoveryOwnerRelease from "./main-session-recovery-owner-release.js";
 import {
   claimMainSessionRecoveryOwner,
@@ -111,6 +118,71 @@ describe("main session recovery store", () => {
       ...overrides,
     });
   }
+
+  it.each([
+    "live",
+    "queued",
+    "display only",
+    "released",
+    "old fence",
+    "other session",
+    "other key",
+    "other agent",
+    "recovery attempt",
+    "tombstone",
+  ] as const)("distinguishes a live foreground fence from recovery custody: %s", async (change) => {
+    const runId = "live-primary";
+    const authority =
+      change === "display only" || change === "queued"
+        ? undefined
+        : claimAgentRunDelegatedAuthority({
+            runId,
+            instanceId: "primary-instance",
+          });
+    registerAgentRunContext(runId, {
+      agentId: change === "other agent" ? "other" : "main",
+      sessionId: change === "other session" ? "other-session" : "session-1",
+      sessionKey: change === "other key" ? "agent:main:other" : sessionKey,
+      lifecycleGeneration,
+      projectSessionActive: true,
+    });
+    const releaseQueued =
+      change === "queued" ? retainQueuedAgentRunContext(runId, lifecycleGeneration) : undefined;
+    if (change === "released" && authority) releaseAgentRunDelegatedAuthority(authority);
+    const entry: SessionEntry = {
+      sessionId: "session-1",
+      updatedAt: 100,
+      abortedLastRun: false,
+      delivery: { kind: "none" },
+      restartRecoveryRuns: [
+        { runId, lifecycleGeneration: change === "old fence" ? "previous" : lifecycleGeneration },
+      ],
+      mainRestartRecovery: {
+        cycleId: "live-cycle",
+        revision: 1,
+        queuedInputsPending: true,
+        chargedAttempts: change === "recovery attempt" ? 1 : 0,
+        ...(change === "tombstone" ? { tombstone: { reason: "exhausted" } } : {}),
+      },
+    };
+    try {
+      await write(entry);
+      const result = await claimMainSessionRecoveryOwner({
+        lifecycleGeneration,
+        sessionId: "session-1",
+        runId: "accepted-follower",
+        target: { agentId: "main", sessionKey, storePath },
+      });
+      expect(result.kind).toBe(
+        change === "live" || change === "queued" ? "not_required" : "invalidated",
+      );
+      expect(read()).toEqual(entry);
+    } finally {
+      if (authority) releaseAgentRunDelegatedAuthority(authority);
+      releaseQueued?.("admitted");
+      clearAgentRunContext(runId);
+    }
+  });
 
   async function claimedRecovery() {
     const claim = await claimRecovery();

@@ -14,6 +14,10 @@ import {
   assertAgentRunLifecycleGenerationCurrent,
 } from "../../infra/agent-events.js";
 import {
+  getAgentRunContext,
+  hasAgentRunContextExecutionOwner,
+} from "../../infra/agent-run-registry.js";
+import {
   retryMainSessionRecoveryMutation,
   scheduleMainSessionRecoveryMutation,
 } from "./main-session-recovery-lifecycle.js";
@@ -273,8 +277,30 @@ export async function claimMainSessionRecoveryOwner(params: {
     !hasMainRestartRecoveryEpisode(claim.entry) &&
     (claim.entry.sessionId === params.sessionId ||
       claim.entry.sessionId === params.replacementSessionId);
+  // Capturing crash custody for a live foreground input does not make it a
+  // recovery attempt. Leave those fences intact and let ordinary admission use
+  // its existing FIFO lane; a display marker or an unowned/old fence is not enough.
+  const liveForegroundExpectedSession =
+    claim.transition.kind === "no_change" &&
+    claim.entry?.sessionId === params.sessionId &&
+    claim.sessionKey === params.target.sessionKey &&
+    params.target.agentId !== undefined &&
+    claim.entry.abortedLastRun !== true &&
+    !hasMainRestartRecoveryEpisode({ ...claim.entry, restartRecoveryRuns: undefined }) &&
+    Boolean(claim.entry.restartRecoveryRuns?.length) &&
+    claim.entry.restartRecoveryRuns!.every(({ runId, lifecycleGeneration }) => {
+      const context = getAgentRunContext(runId);
+      return (
+        lifecycleGeneration === params.lifecycleGeneration &&
+        context?.sessionId === params.sessionId &&
+        context.sessionKey === claim.sessionKey &&
+        context.agentId === params.target.agentId &&
+        hasAgentRunContextExecutionOwner(runId)
+      );
+    });
   if (
     healthyExpectedSession ||
+    liveForegroundExpectedSession ||
     (claim.entry?.sessionId === params.sessionId &&
       claim.sessionKey &&
       !isMainRestartRecoveryCandidate(claim.entry, claim.sessionKey))

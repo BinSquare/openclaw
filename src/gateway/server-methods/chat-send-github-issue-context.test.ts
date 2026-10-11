@@ -9,60 +9,55 @@ import {
   replaceSessionEntry,
   loadSessionEntry,
 } from "../../config/sessions/session-accessor.js";
+import { getSessionRepositoryWorkspaceStore } from "../../state/session-repository-workspaces.js";
 import {
   ensureCanonicalFactoryGitHubProfile,
   setCanonicalUserProfileRole,
 } from "../../state/user-profile-writes.js";
+import { attachSessionGitHubIssueContext } from "../chat-github-issue-context.js";
 import { prepareGatewayRecipientProfile } from "../expected-profile.js";
-import {
-  FACTORY_GITHUB_PROOF_ENV,
-  factoryGitHubRequestDigest,
-  redeemFactoryGitHubProof,
-  type FactoryGitHubProofVerdict,
-} from "../factory-github-proof.js";
+import { installFactoryExternalTransport } from "../factory-github-external.test-support.js";
+import { factoryGitHubRequestDigest } from "../factory-github-proof.js";
+import * as sessionFacts from "../session-sharing-preparation.js";
 import { rolePolicyConfig } from "../session-sharing.test-utils.js";
 import { dispatchInboundMessageMock, installGatewayTestHooks } from "../test-helpers.js";
 import { useBrowserFollowupFixture } from "./chat-send-pending-inputs.test-support.js";
-
-const boundary = vi.hoisted(() => ({ native: vi.fn(), verify: vi.fn(), workspace: vi.fn() }));
-vi.mock("../../agents/github-read-identity.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../agents/github-read-identity.js")>()),
-  readNativeGitHubToken: boundary.native,
-}));
-vi.mock("../../agents/github-oauth-client.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../agents/github-oauth-client.js")>()),
-  verifyGitHubCredential: boundary.verify,
-}));
-vi.mock("../../state/session-repository-workspaces.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../state/session-repository-workspaces.js")>()),
-  getSessionRepositoryWorkspaceStore: () => ({
-    get: boundary.workspace,
-  }),
-}));
 
 installGatewayTestHooks();
 registerAgentSessionLoopTestLifecycle();
 const createFixture = useBrowserFollowupFixture();
 afterEach(() => {
   clearRuntimeConfigSnapshot();
+  vi.restoreAllMocks();
   vi.unstubAllEnvs();
   vi.unstubAllGlobals();
-  boundary.native.mockReset();
-  boundary.verify.mockReset();
-  boundary.workspace.mockReset();
 });
 
+const issueUrl = "https://microsoft.ghe.com/example/project/issues/101";
+const scenarios = [
+  ["actor-a", issueUrl + ".", true],
+  ["actor-b", issueUrl.replace("101", "00101") + ".", true],
+  ["foreign-host", issueUrl.replace("microsoft.ghe.com", "github.com"), false],
+  ["foreign-repository", issueUrl.replace("/project/", "/other/"), false],
+  ["pull-url", issueUrl.replace("/issues/", "/pull/"), false],
+  ["query-url", issueUrl + "?token=private-query", false],
+  ["actor-switched", issueUrl, true],
+  ["revoked", issueUrl, true],
+  ["session-replaced", issueUrl, true],
+  ["disabled", issueUrl, false],
+] as const;
+
 describe("registered Factory issue-context admission", () => {
-  it.each(["actor-a", "actor-b", "actor-switched", "revoked", "session-replaced"] as const)(
-    "keeps the admitted caller and session through issue reads: %s",
-    async (scenario) => {
+  it.each(scenarios)(
+    "keeps real parser, bounded content and original actor: %s",
+    async (scenario, url, accepted) => {
       vi.stubEnv("FACTORY_AUTH_MODE", "github");
       vi.stubEnv("OPENCLAW_DISABLE_BUNDLED_PLUGINS", "0");
       const fixture = await createFixture({ active: false });
       const actorId = scenario === "actor-b" ? 202 : 101;
       const profile = await ensureCanonicalFactoryGitHubProfile(
-        `github:microsoft.ghe.com:${actorId}`,
-        `Issue context actor ${actorId}`,
+        "github:microsoft.ghe.com:" + actorId,
+        "Issue context actor " + actorId,
       );
       await setCanonicalUserProfileRole(profile.id, "write");
       fixture.client.authenticatedUserId = profile.id;
@@ -73,116 +68,162 @@ describe("registered Factory issue-context admission", () => {
         updatedAt: profile.updatedAt,
       };
       fixture.client.authenticatedFactoryGitHubAccountId = actorId;
+      fixture.client.connect.scopes = ["operator.read", "operator.write"];
       prepareGatewayRecipientProfile(fixture.client);
       const policyConfig = rolePolicyConfig();
       const config = {
         ...policyConfig,
         gateway: {
           ...policyConfig.gateway,
-          projects: { nativeGitHubSearch: true },
+          projects: { nativeGitHubSearch: scenario !== "disabled" },
           github: { host: "microsoft.ghe.com", apiBaseUrl: "https://api.microsoft.ghe.com" },
         },
         session: { store: fixture.scope.storePath },
       };
       setRuntimeConfigSnapshot(config);
       fixture.context.getRuntimeConfig = () => config;
-      const issueUrl = "https://microsoft.ghe.com/example/project/issues/101";
-      fixture.params.message = `Read ${issueUrl}`;
+      fixture.params.message = "Read " + url;
+      const repositoryUrl = "https://microsoft.ghe.com/example/project.git";
+      const repository = await getSessionRepositoryWorkspaceStore().create({
+        agentId: fixture.scope.agentId,
+        sessionKey: fixture.scope.sessionKey,
+        url: repositoryUrl,
+        assertCurrent: () => {},
+      });
       await patchSessionEntryCore(fixture.scope, (entry) => ({
         ...entry,
-        repositoryWorkspaceId: "issue-workspace",
+        repositoryWorkspaceId: repository.workspaceId,
       }));
-      expect(loadSessionEntry(fixture.scope)?.repositoryWorkspaceId).toBe("issue-workspace");
-      boundary.workspace.mockResolvedValue({
-        agentId: "main",
-        url: "https://microsoft.ghe.com/example/project.git",
+      const original = loadSessionEntry(fixture.scope)!;
+      const external = installFactoryExternalTransport({
+        token: "synthetic-issue-token-" + scenario,
+        binding: () => ({
+          actorId,
+          profileId: profile.id,
+          repositoryUrl,
+          context: fixture.context,
+        }),
+        assertVerdict: (claim) =>
+          expect(claim).toMatchObject({
+            purpose: "session-issue-read",
+            actorId,
+            profileId: profile.id,
+            binding: {
+              kind: "session",
+              agentId: fixture.scope.agentId,
+              sessionKey: fixture.scope.sessionKey,
+              sessionId: fixture.scope.sessionId,
+              lifecycleRevision: original.lifecycleRevision ?? null,
+              requestDigest: factoryGitHubRequestDigest(issueUrl),
+            },
+          }),
       });
-      const claims: FactoryGitHubProofVerdict[] = [];
-      boundary.native.mockImplementation(async (env: NodeJS.ProcessEnv) => {
-        const proof = env[FACTORY_GITHUB_PROOF_ENV];
-        if (!proof) {
-          throw new Error("Expected owner-issued Factory proof");
-        }
-        const claim = redeemFactoryGitHubProof(proof);
-        claims.push(claim);
-        return `synthetic-issue-token-${claim.actorId}`;
+      external.responses.set("/repos/example/project/issues/101", {
+        title: "Synthetic issue",
+        body: "b".repeat(30_000),
+        state: "open",
+        user: { login: "owner" },
+        comments: 9,
+        created_at: "2026-09-24T00:00:00Z",
+        updated_at: "2026-09-24T01:00:00Z",
       });
+      external.responses.set(
+        "/repos/example/project/issues/101/comments",
+        Array.from({ length: 9 }, (_, index) => ({
+          user: { login: "author-" + index },
+          body: "c".repeat(3_000),
+          created_at: "2026-09-24T02:00:00Z",
+        })),
+      );
+      const fetchBytes = external.fetchFixture.getMockImplementation()!;
       let verified = false;
-      boundary.verify.mockImplementation(async () => {
-        if (!verified) {
+      external.fetchFixture.mockImplementation(async (...args) => {
+        const response = await fetchBytes(...args);
+        if (new URL(String(args[0])).pathname === "/user" && !verified) {
           verified = true;
-          if (scenario === "actor-switched") {
+          if (scenario === "actor-switched")
             fixture.client.authenticatedFactoryGitHubAccountId = 202;
-          }
-          if (scenario === "revoked") {
-            fixture.client.invalidated = true;
-          }
-          if (scenario === "session-replaced") {
+          if (scenario === "revoked") fixture.client.invalidated = true;
+          if (scenario === "session-replaced")
             await replaceSessionEntry(fixture.scope, {
-              ...loadSessionEntry(fixture.scope)!,
+              ...original,
               sessionId: "replacement-session",
               lifecycleRevision: "replacement-generation",
             });
-          }
         }
-        return {
-          status: "available",
-          account: { accountId: actorId, login: `actor-${actorId}`, avatarUrl: null },
-        };
+        return response;
       });
-      const fetchIssue = vi.fn(
-        async () =>
-          new Response(
-            JSON.stringify({
-              title: "Issue context from the selected repository",
-              body: "Synthetic issue",
-              comments: 0,
-              user: { login: "author" },
-            }),
-            { status: 200, headers: { "content-type": "application/json" } },
-          ),
-      );
-      vi.stubGlobal("fetch", fetchIssue);
       try {
-        const respond = await fixture.send(vi.fn(), {
-          expectedProfileId: profile.id,
-        });
-        expect(respond.mock.calls[0]?.[0]).toBe(true);
+        if (scenario === "disabled") {
+          const prepareFacts = vi.spyOn(sessionFacts, "prepareSessionMutationFacts");
+          const templateContext = {};
+          await attachSessionGitHubIssueContext({
+            ...fixture.scope,
+            client: fixture.client,
+            config,
+            context: fixture.context,
+            assertActive: () => {},
+            message: fixture.params.message,
+            repositoryWorkspaceId: repository.workspaceId,
+            templateContext,
+          });
+          expect(prepareFacts).not.toHaveBeenCalled();
+          expect(templateContext).toEqual({});
+          prepareFacts.mockRestore();
+        }
+        const respond = await fixture.send(vi.fn(), { expectedProfileId: profile.id });
+        expect(respond.mock.calls[0]?.[0], JSON.stringify(respond.mock.calls)).toBe(true);
         await fixture.finishDispatch();
-        expect(boundary.workspace).toHaveBeenCalledWith("issue-workspace");
-        if (scenario === "actor-a" || scenario === "actor-b") {
-          expect(fetchIssue).toHaveBeenCalledOnce();
+        const invalidated = ["actor-switched", "revoked", "session-replaced"].includes(scenario);
+        const issueCalls = external.fetchFixture.mock.calls
+          .map(([input]) => String(input))
+          .filter((input) => input.includes("/issues/"));
+        if (accepted && !invalidated) {
+          expect(issueCalls).toEqual([
+            "https://api.microsoft.ghe.com/repos/example/project/issues/101",
+            "https://api.microsoft.ghe.com/repos/example/project/issues/101/comments?per_page=8",
+          ]);
           expect(dispatchInboundMessageMock).toHaveBeenCalledOnce();
           const delivered = dispatchInboundMessageMock.mock.calls[0]![0];
-          expect(delivered).toMatchObject({
-            ctx: {
-              ChannelStructuredContext: expect.arrayContaining([
-                expect.objectContaining({
-                  type: "github_issue",
-                  payload: expect.objectContaining({ number: 101 }),
-                }),
-              ]),
-            },
+          const context = delivered.ctx.ChannelStructuredContext?.find(
+            (entry) => entry.type === "github_issue",
+          );
+          expect(context?.label).toBe("GitHub issue context (untrusted external content)");
+          expect(context?.payload).toMatchObject({
+            url: issueUrl,
+            repository: "example/project",
+            number: 101,
+            title: "Synthetic issue",
+            author: "owner",
+            state: "open",
+            body: "b".repeat(24 * 1024),
+            body_truncated: true,
+            comments_total: 9,
+            comments_truncated: true,
+            created_at: "2026-09-24T00:00:00Z",
+            updated_at: "2026-09-24T01:00:00Z",
+            comments: Array.from({ length: 8 }, (_, index) => ({
+              author: "author-" + index,
+              body: "c".repeat(2 * 1024),
+              body_truncated: true,
+              created_at: "2026-09-24T02:00:00Z",
+            })),
           });
-          expect(JSON.stringify(delivered)).not.toContain(`synthetic-issue-token-${actorId}`);
-          expect(claims.length).toBeGreaterThan(0);
-          for (const claim of claims) {
-            expect(claim).toMatchObject({
-              purpose: "session-issue-read",
-              actorId,
-              profileId: profile.id,
-              binding: {
-                agentId: fixture.scope.agentId,
-                sessionKey: fixture.scope.sessionKey,
-                sessionId: fixture.scope.sessionId,
-                requestDigest: factoryGitHubRequestDigest(issueUrl),
-              },
-            });
-          }
+          expect(external.verdicts.length).toBeGreaterThan(0);
+          expect(JSON.stringify(delivered)).not.toContain("synthetic-issue-token-");
         } else {
-          expect(fetchIssue).not.toHaveBeenCalled();
-          expect(dispatchInboundMessageMock).not.toHaveBeenCalled();
-          expect(claims[0]?.actorId).toBe(actorId);
+          expect(issueCalls).toEqual([]);
+          if (invalidated) {
+            expect(dispatchInboundMessageMock).not.toHaveBeenCalled();
+            expect(verified).toBe(true);
+          } else {
+            expect(external.native.mock.calls.length).toBe(0);
+            expect(external.fetchFixture).not.toHaveBeenCalled();
+            expect(dispatchInboundMessageMock).toHaveBeenCalledOnce();
+            expect(
+              dispatchInboundMessageMock.mock.calls[0]![0].ctx.ChannelStructuredContext,
+            ).toBeUndefined();
+          }
         }
       } finally {
         await fixture.cleanup();

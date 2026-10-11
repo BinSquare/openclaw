@@ -25,7 +25,6 @@ import {
   seedAttachedPlacementEnvironment,
   writePlacementEnvironmentFixture,
 } from "../worker-environments/placement-test-fixtures.js";
-import { prepareRepositoryWorkerProjectSource } from "../worker-environments/repository-project-admission.js";
 import { createNodeCarrier } from "../worker-environments/skill-resource-transfer.test-support.js";
 import type { WorkerTunnelHandle } from "../worker-environments/tunnel-contract.js";
 import { createWorkerPlacementRedispatch } from "../worker-environments/worker-placement-redispatch.js";
@@ -65,7 +64,6 @@ export async function prepareGoalRecoveryNativeFixture(
   target: { agentId: string; sessionKey: string },
   sessionId: string,
   workspaceDir: string,
-  canonicalDispatch = false,
   failedSource = false,
   suppliedRepositoryProof?: ReturnType<typeof installFactoryRestartRepositoryFixture>,
   preparedScenario?: RecoveryPreparedScenario,
@@ -182,9 +180,7 @@ export async function prepareGoalRecoveryNativeFixture(
   if (!delayedOriginalResult && !pendingReclaim && !failedBeforeActivation) {
     await reclaimOriginal();
   }
-  if (canonicalDispatch) {
-    writePlacementEnvironmentFixture(database, environment);
-  }
+  writePlacementEnvironmentFixture(database, environment);
   fixture.context.workerSessionPlacementService = placements;
   fixture.registry.plugins.push(createPluginRecord({ id: "codex" }));
   const { createCodexHarnessForTest } = await loadBundledPluginFacade<{
@@ -259,7 +255,7 @@ export async function prepareGoalRecoveryNativeFixture(
       ...(failedSource
         ? {
             allowPublicationPreflight: true as const,
-            repositorySnapshot: () => canonical?.failedRecovery?.repositorySnapshot,
+            repositorySnapshot: () => canonical.failedRecovery?.repositorySnapshot,
           }
         : {}),
     });
@@ -305,51 +301,47 @@ export async function prepareGoalRecoveryNativeFixture(
     environmentId: environment.environmentId,
     ownerEpoch: environment.ownerEpoch,
   });
-  const canonical = canonicalDispatch
-    ? await createRecoveryDispatchFixture({
-        database,
-        placements,
-        cfg: fixture.cfg,
-        repository,
-        tunnel,
-        remoteWorkspaceDir: carrier.workspace,
-        build: environment.bootstrapReceipt!,
-        ...(exactWorkerWorkspace ? { exactWorkerWorkspace: carrier } : {}),
-        preparedScenario,
-        pendingReclaim,
-        ...(delayedOriginalResult
-          ? {
-              lateResult: {
-                originalEnvironmentId: environment.environmentId,
-                sessionId,
-                carrier: oldCarrier,
-                afterCurrentRead,
-              },
-            }
-          : {}),
-        ...(failedSource
-          ? {
-              failedSource: {
-                sessionId,
-                environmentId: environment.environmentId,
-                leaseId: expectDefined(environment.leaseId, "original owned lease"),
-                oldWorkspaceDir: oldCarrier.workspace,
-              },
-            }
-          : {}),
-      })
-    : undefined;
-  if (canonical) {
-    if (failedBeforeSelection) {
-      fixture.cfg.cloudWorkers!.projectProfiles = {
-        [expectDefined(normalizeCloudRepo(repository.url), "repository project key")]:
-          "development",
-      };
-    }
-    Object.assign(environments, canonical.service);
-    vi.spyOn(environments, "startTunnel");
-    bindDeviceWorkerAvailability(environments, canonical.resolveAvailability);
+  const canonical = await createRecoveryDispatchFixture({
+    database,
+    placements,
+    cfg: fixture.cfg,
+    repository,
+    tunnel,
+    remoteWorkspaceDir: carrier.workspace,
+    build: environment.bootstrapReceipt!,
+    ...(exactWorkerWorkspace ? { exactWorkerWorkspace: carrier } : {}),
+    preparedScenario,
+    pendingReclaim,
+    ...(delayedOriginalResult
+      ? {
+          lateResult: {
+            originalEnvironmentId: environment.environmentId,
+            sessionId,
+            carrier: oldCarrier,
+            afterCurrentRead,
+          },
+        }
+      : {}),
+    ...(failedSource
+      ? {
+          failedSource: {
+            sessionId,
+            environmentId: environment.environmentId,
+            leaseId: expectDefined(environment.leaseId, "original owned lease"),
+            oldWorkspaceDir: oldCarrier.workspace,
+          },
+        }
+      : {}),
+  });
+  if (failedBeforeSelection) {
+    fixture.cfg.cloudWorkers!.projectProfiles = {
+      [expectDefined(normalizeCloudRepo(repository.url), "repository project key")]: "development",
+    };
   }
+  Object.assign(environments, canonical.service);
+  vi.spyOn(environments, "startTunnel");
+  bindDeviceWorkerAvailability(environments, canonical.resolveAvailability);
+
   let redispatches = 0;
   const redispatch = createWorkerPlacementRedispatch({
     placements,
@@ -365,30 +357,9 @@ export async function prepareGoalRecoveryNativeFixture(
     dispatch: async (request, onTransition, assertCurrent) => {
       assertCurrent?.();
       expect(request).toMatchObject({ ...identity, executionMode: "remote-exec" });
-      if (canonical) {
-        const next = await canonical.dispatch(request, onTransition, assertCurrent);
-        environment = expectDefined(canonical.service.get(next.environmentId), "fresh environment");
-        expect(environment.environmentId).not.toBe(originalEnvironmentId);
-        redispatches += 1;
-        return next;
-      }
-      const readNativeCredential = expectDefined(
-        request.readNativeCredential,
-        "original issuer dispatch reader",
-      );
-      const source = await prepareRepositoryWorkerProjectSource({
-        namespace: "informed-native-recovery",
-        repository: { agentId: target.agentId, url: repositoryUrl, ref: "main" },
-        getConfig: fixture.context.getRuntimeConfig,
-        assertCurrent: () => assertCurrent?.(),
-        readNativeCredential,
-      });
-      expect(source.project.source.url).toBe(repositoryUrl);
-      const next = await activate();
-      onTransition?.(next);
-      if (next.state !== "active") {
-        throw new Error("Synthetic provider failed to activate");
-      }
+      const next = await canonical.dispatch(request, onTransition, assertCurrent);
+      environment = expectDefined(canonical.service.get(next.environmentId), "fresh environment");
+      expect(environment.environmentId).not.toBe(originalEnvironmentId);
       redispatches += 1;
       return next;
     },
@@ -400,7 +371,7 @@ export async function prepareGoalRecoveryNativeFixture(
     resolveWorkspace: async () => ({ kind: "local", path: workspaceDir }),
     waitForAdmissionNode: async () => {},
     reconcileActivePlacement: async (environmentId) => {
-      if (!pendingReclaim || !canonical || environmentId !== originalEnvironmentId) {
+      if (!pendingReclaim || environmentId !== originalEnvironmentId) {
         throw new Error("Unexpected provider failure cleanup");
       }
       pendingRecoveries += 1;
@@ -409,7 +380,7 @@ export async function prepareGoalRecoveryNativeFixture(
     },
     workspaceOperations: createWorkerWorkspaceOperationCoordinator(),
     redispatchPlacement: redispatch,
-    ...((failedSource || failedBeforeActivation) && canonical
+    ...(failedSource || failedBeforeActivation
       ? { recoverFailedPlacement: canonical.recoverFailedPlacement }
       : {}),
   });
@@ -427,7 +398,7 @@ export async function prepareGoalRecoveryNativeFixture(
     async close() {
       uninstall();
       try {
-        await canonical?.close();
+        await canonical.close();
       } finally {
         registryLoader.mockRestore();
         registryAcquirer.mockRestore();
@@ -438,18 +409,18 @@ export async function prepareGoalRecoveryNativeFixture(
     },
     acquireManagedWorkspaceAsync: carrier.acquireManagedWorkspaceAsync,
     oldWorkspaceDir: oldCarrier.workspace,
-    failedRecovery: canonical?.failedRecovery,
-    reconcileFailedPlacement: canonical?.reconcileFailedPlacement,
-    lateResult: canonical?.lateResult,
+    failedRecovery: canonical.failedRecovery,
+    reconcileFailedPlacement: canonical.reconcileFailedPlacement,
+    lateResult: canonical.lateResult,
     transportCounts: () => ({ started: commandsStarted, completed: commandsCompleted }),
     harnessAttempts,
-    coldAllocations: () => canonical?.coldAllocations(),
-    warmEnvironment: () => canonical?.warmEnvironment(),
-    warmReceipt: () => canonical?.warmReceipt(),
-    readWarmClaim: () => canonical?.readWarmClaim(),
-    credentialErrors: () => canonical?.credentialErrors,
+    coldAllocations: () => canonical.coldAllocations(),
+    warmEnvironment: () => canonical.warmEnvironment(),
+    warmReceipt: () => canonical.warmReceipt(),
+    readWarmClaim: () => canonical.readWarmClaim(),
+    credentialErrors: () => canonical.credentialErrors,
     settlePrevious: async () => {
-      if (canonical && failedBeforeActivation) {
+      if (failedBeforeActivation) {
         const source = placements.get(sessionId);
         expect(source).toMatchObject({
           state: "failed",
@@ -470,7 +441,7 @@ export async function prepareGoalRecoveryNativeFixture(
         await canonical.prepareWarm();
         return;
       }
-      if (canonical && failedBeforeSelection) {
+      if (failedBeforeSelection) {
         const source = placements.get(sessionId);
         if (source?.state !== "failed") {
           throw new Error("Expected original owned failure before preparing unallocated retry");
@@ -498,7 +469,7 @@ export async function prepareGoalRecoveryNativeFixture(
         await canonical.prepareWarm();
         return;
       }
-      if (canonical && pendingReclaim) {
+      if (pendingReclaim) {
         const claim = await placements.claimTurn({
           ...identity,
           claimId: "reclaim-interrupted-original",
@@ -519,7 +490,7 @@ export async function prepareGoalRecoveryNativeFixture(
         ]);
         return;
       }
-      if (canonical && !failedSource) {
+      if (!failedSource) {
         if (delayedOriginalResult) {
           await reclaimOriginal();
         }

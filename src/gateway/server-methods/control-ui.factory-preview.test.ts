@@ -2,9 +2,11 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core/expect";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import * as oauth from "../../agents/github-oauth-client.js";
 import * as nativeIdentity from "../../agents/github-read-identity.js";
 import { resolveManagedGitHubProfileDir } from "../../agents/github-tool-identity.js";
+import * as configRuntime from "../../config/config.js";
 import { setRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
 import {
   createPluginRegistryFixture,
@@ -15,24 +17,47 @@ import { getSessionRepositoryWorkspaceStore } from "../../state/session-reposito
 import { linkCanonicalUserProfileEmail } from "../../state/user-profile-writes.js";
 import { loadBundledPluginFacade } from "../../test-utils/bundled-plugin-public-surface.js";
 import {
+  createGatewaySchedulerClock,
+  createTestGatewayScheduler,
+} from "../../test-utils/gateway-scheduler-clock.js";
+import {
   createOpenClawTestState,
   type OpenClawTestState,
 } from "../../test-utils/openclaw-test-state.js";
 import { createFixture, sessionKey } from "../control-ui-session-pr-access.test-support.js";
 import {
+  prepareControlUiSessionPrRead,
+  prepareControlUiSessionGitHubIdentity,
+} from "../control-ui-session-pr-read.js";
+import { createControlUiSessionPullRequestSubscriptions } from "../control-ui-session-pr-subscriptions.js";
+import {
   FACTORY_GITHUB_PROOF_ENV,
   factoryGitHubRequestDigest,
   redeemFactoryGitHubProof,
-  type FactoryGitHubProofVerdict,
 } from "../factory-github-proof.js";
 import * as oauthLifecycle from "../github-oauth-lifecycle.js";
 import { gitHubPublicApi } from "../github-public-api.js";
+import {
+  factoryPublicationPreflightCredential,
+  prepareCurrentGitHubPublicationIdentity,
+  prepareCurrentGitHubPublicationOptionsIdentity,
+} from "../github-publication-availability.js";
 import { createGatewayMethodRegistry } from "../methods/registry.js";
+import { exerciseReclaimedFactoryCredential } from "../operator-run-authority.factory.test-support.js";
 import { handleGatewayRequest } from "../server-methods.js";
-import { createDispatchTestHarness } from "../server/ws-connection/authenticated-request-dispatch.test-support.js";
+import {
+  createDispatchTestHarness,
+  createOperatorWsClient,
+} from "../server/ws-connection/authenticated-request-dispatch.test-support.js";
 import { prepareGatewayOperatorIngressMetadata } from "../server/ws-connection/connect-device-metadata.js";
+import { getSessionRowProjection } from "../session-row-projection-access.js";
 import { resetTestPluginRegistry, setTestPluginRegistry } from "../test-helpers.plugin-registry.js";
+import { REQUEST } from "../worker-environments/placement-dispatch-test-fixtures.js";
 import { createControlUiHandlers } from "./control-ui.js";
+import {
+  initializeSessionReadContext,
+  disposeSessionReadContexts,
+} from "./sessions-read-cache.test-support.js";
 
 const host = "microsoft.ghe.com";
 let sharedState: OpenClawTestState | undefined;
@@ -71,319 +96,6 @@ afterEach(() => {
 });
 
 describe("registered Factory session GitHub preview", () => {
-  it.each([
-    { kind: "issue", bot: false },
-    { kind: "pull", bot: false },
-    { kind: "pull", bot: true },
-  ] as const)(
-    "reads a literal Enterprise $kind using the selected credential (bot=$bot)",
-    async ({ kind, bot }) => {
-      vi.stubEnv("FACTORY_AUTH_MODE", "github");
-      await withFixture("operator.read", async (f) => {
-        // The admitted WebSocket fixture retains the actual registered client and current access grant.
-        f.client.internal = {
-          ...f.client.internal,
-          ...prepareGatewayOperatorIngressMetadata({
-            role: "operator",
-            authMethod: "token",
-            clientId: f.client.connect.client.id,
-            scopes: f.client.connect.scopes ?? [],
-          }),
-        };
-        f.client.authenticatedFactoryGitHubAccountId = 101;
-        const repository = await getSessionRepositoryWorkspaceStore().create({
-          agentId: "main",
-          sessionKey,
-          url: `https://${host}/bic/lobster.git`,
-          branch: "preview-fixture",
-          assertCurrent: () => {},
-        });
-        await f.seed(sessionKey, f.profile.id, {
-          repositoryWorkspaceId: repository.workspaceId,
-          lifecycleRevision: "preview-lifecycle",
-        });
-        if (bot) {
-          const profileId = "ghp_11111111111111111111111111111111";
-          f.cfg.tools = { ...f.cfg.tools, github: { profileId } };
-          setRuntimeConfigSnapshot(f.cfg);
-          const directory = resolveManagedGitHubProfileDir({
-            agentId: "main",
-            scope: "system",
-            profileId,
-          });
-          await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-          await fs.writeFile(
-            path.join(directory, "hosts.yml"),
-            `${host}:\n  oauth_token: synthetic-bot-reader\n`,
-            { mode: 0o600 },
-          );
-          vi.spyOn(oauthLifecycle, "requestCurrentGitHubOAuthRefresh").mockResolvedValue();
-        }
-        const number = kind === "pull" ? 17420 : 17436;
-        const url = `https://${host}/bic/lobster/${kind === "pull" ? "pull" : "issues"}/${number}`;
-        const claims: FactoryGitHubProofVerdict[] = [];
-        vi.spyOn(nativeIdentity, "readNativeGitHubToken").mockImplementation(async (env) => {
-          expect(bot).toBe(false);
-          expect(env?.GH_TOKEN).toBeUndefined();
-          const claim = redeemFactoryGitHubProof(env?.[FACTORY_GITHUB_PROOF_ENV] ?? "");
-          claims.push(claim);
-          expect(claim).toMatchObject({
-            actorId: 101,
-            profileId: f.profile.id,
-            purpose: "session-item-read",
-            binding: {
-              kind: "session",
-              agentId: "main",
-              sessionKey,
-              sessionId: f.sessionId,
-              lifecycleRevision: "preview-lifecycle",
-              requestDigest: factoryGitHubRequestDigest(url),
-            },
-          });
-          return "synthetic-reader-token";
-        });
-        vi.spyOn(oauth, "verifyGitHubCredential").mockResolvedValue({
-          status: "available",
-          scopes: [],
-          account: { accountId: 101, login: "reader", avatarUrl: null },
-        });
-        const fetchImpl = vi.fn<typeof fetch>(async (input, init) => {
-          const target = new URL(input instanceof Request ? input.url : String(input));
-          expect(target.origin).toBe(`https://api.${host}`);
-          expect(new Headers(init?.headers).get("authorization")).toBe(
-            bot ? "Bearer synthetic-bot-reader" : "Bearer synthetic-reader-token",
-          );
-          const payload = target.pathname.endsWith("/commits")
-            ? []
-            : target.pathname === "/repos/bic/lobster"
-              ? { full_name: "bic/lobster", private: true }
-              : {
-                  number,
-                  title: "Synthetic private item",
-                  body: "Synthetic fixture",
-                  state: "closed",
-                  html_url: url,
-                  repository_url: `https://api.${host}/repos/bic/lobster`,
-                  created_at: "2026-10-03T00:00:00Z",
-                  updated_at: "2026-10-03T00:00:00Z",
-                  user: { login: "reader" },
-                  comments: 0,
-                  base: {
-                    repo: {
-                      full_name: "bic/lobster",
-                      url: `https://api.${host}/repos/bic/lobster`,
-                    },
-                  },
-                };
-          return new Response(JSON.stringify(payload), {
-            headers: { "content-type": "application/json" },
-          });
-        });
-        const handlers = createControlUiHandlers((target, identity) =>
-          gitHubPublicApi.loadControlUiGitHubPreview(target, identity, fetchImpl),
-        );
-        const { default: github } = await loadBundledPluginFacade<{
-          default: OpenClawPluginDefinition;
-        }>({ pluginId: "github", artifactBasename: "index.ts" });
-        const { registry, config } = createPluginRegistryFixture();
-        registerVirtualTestPlugin({
-          registry,
-          config,
-          id: "github",
-          name: "GitHub",
-          contracts: { gatewayMethodDispatch: ["authenticated-request"] },
-          register: expectDefined(github.register, "GitHub registration"),
-        });
-        setTestPluginRegistry(registry.registry);
-        const methods = createGatewayMethodRegistry(
-          [
-            ...registry.registry.gatewayMethodDescriptors,
-            {
-              name: "controlUi.githubPreview",
-              owner: { kind: "core", area: "control-ui" },
-              scope: "operator.read",
-              profileAccess: "independent",
-              handler: expectDefined(handlers["controlUi.githubPreview"], "preview handler"),
-            },
-          ],
-          registry.registry,
-        );
-        f.context.getGatewayMethodRegistry = () => methods;
-        const harness = createDispatchTestHarness({ buildRequestContext: () => f.context });
-        harness.clients.add(f.client);
-        await harness.dispatcher.dispatch(
-          {
-            type: "req",
-            id: "factory-preview",
-            method: "github.preview",
-            params: { sessionKey, agentId: "main", url },
-          },
-          f.client,
-        );
-        const response = await harness.awaitResponseFrame("factory-preview");
-        expect(response.error).toBeUndefined();
-        expect(response).toMatchObject({
-          ok: true,
-          payload: { title: "Synthetic private item", url },
-        });
-        if (bot) {
-          expect(claims).toHaveLength(0);
-        } else {
-          expect(claims.length).toBeGreaterThan(0);
-        }
-        expect(fetchImpl).toHaveBeenCalled();
-      });
-    },
-  );
-
-  it.each(["catalog", "checks", "foreign-checks"] as const)(
-    "uses the same current reader for registered repository metadata: %s",
-    async (method) => {
-      vi.stubEnv("FACTORY_AUTH_MODE", "github");
-      await withFixture(
-        "operator.read",
-        async (f) => {
-          f.client.internal = {
-            ...f.client.internal,
-            ...prepareGatewayOperatorIngressMetadata({
-              role: "operator",
-              authMethod: "token",
-              clientId: f.client.connect.client.id,
-              scopes: f.client.connect.scopes ?? [],
-            }),
-          };
-          f.client.authenticatedFactoryGitHubAccountId = 101;
-          const repository = await getSessionRepositoryWorkspaceStore().create({
-            agentId: "main",
-            sessionKey,
-            url: `https://${host}/bic/lobster.git`,
-            branch: "preview-fixture",
-            assertCurrent: () => {},
-          });
-          await f.seed(sessionKey, f.profile.id, {
-            repositoryWorkspaceId: repository.workspaceId,
-            lifecycleRevision: "metadata-lifecycle",
-          });
-          const claims: FactoryGitHubProofVerdict[] = [];
-          const lookup = vi
-            .spyOn(nativeIdentity, "readNativeGitHubToken")
-            .mockImplementation(async (env) => {
-              const claim = redeemFactoryGitHubProof(env?.[FACTORY_GITHUB_PROOF_ENV] ?? "");
-              claims.push(claim);
-              expect(claim).toMatchObject({
-                purpose: "session-item-read",
-                actorId: 101,
-                profileId: f.profile.id,
-                binding: {
-                  kind: "session",
-                  agentId: "main",
-                  sessionKey,
-                  sessionId: f.sessionId,
-                  lifecycleRevision: "metadata-lifecycle",
-                  requestDigest: factoryGitHubRequestDigest(`https://${host}/bic/lobster`),
-                },
-              });
-              return "synthetic-reader-token";
-            });
-          vi.spyOn(oauth, "verifyGitHubCredential").mockResolvedValue({
-            status: "available",
-            scopes: [],
-            account: { accountId: 101, login: "reader", avatarUrl: null },
-          });
-          const item = {
-            number: 17420,
-            title: "Synthetic PR",
-            html_url: `https://${host}/bic/lobster/pull/17420`,
-            state: "open",
-            draft: false,
-            merged_at: null,
-            head: { sha: "a".repeat(40) },
-            base: {
-              ref: "main",
-              repo: { name: "lobster", owner: { login: "bic" }, full_name: "bic/lobster" },
-            },
-          };
-          const fetchImpl = vi.fn<typeof fetch>(async (input, init) => {
-            const url = new URL(input instanceof Request ? input.url : String(input));
-            expect(url.origin).toBe(`https://api.${host}`);
-            expect(url.pathname.startsWith("/repos/bic/lobster")).toBe(true);
-            expect(new Headers(init?.headers).get("authorization")).toBe(
-              "Bearer synthetic-reader-token",
-            );
-            const value = url.pathname.endsWith("/pulls")
-              ? [item]
-              : url.pathname.endsWith("/check-runs")
-                ? { total_count: 0, check_runs: [] }
-                : url.pathname.endsWith("/pulls/17420")
-                  ? { ...item, additions: 0, deletions: 0, changed_files: 0 }
-                  : { full_name: "bic/lobster", private: true };
-            return new Response(JSON.stringify(value), {
-              headers: { "content-type": "application/json" },
-            });
-          });
-          vi.stubGlobal("fetch", fetchImpl);
-          if (method === "catalog") {
-            await f.subscribe();
-            await f.subscriptions.pollNow();
-            expect(f.load).not.toHaveBeenCalled();
-            const payloads = f.socket.send.mock.calls.map(([bytes]) => JSON.parse(bytes));
-            expect(payloads).toContainEqual(
-              expect.objectContaining({
-                event: "controlUi.sessionPullRequests.changed",
-                payload: {
-                  sessions: {
-                    [sessionKey]: expect.objectContaining({
-                      repository: { owner: "bic", repo: "lobster", host },
-                      status: "ready",
-                    }),
-                  },
-                },
-              }),
-            );
-          } else {
-            const respond = vi.fn();
-            await handleGatewayRequest({
-              req: {
-                type: "req",
-                id: "factory-checks",
-                method: "controlUi.sessionPullRequests.checks",
-                params: {
-                  sessionKey,
-                  owner: "bic",
-                  repo: method === "foreign-checks" ? "other" : "lobster",
-                  number: 17420,
-                  headSha: "a".repeat(40),
-                },
-              },
-              client: f.client,
-              context: f.context,
-              extraHandlers: createControlUiHandlers(),
-              isWebchatConnect: () => false,
-              respond,
-            });
-            if (method === "foreign-checks") {
-              expect(respond.mock.calls[0]?.[0]).toBe(false);
-              expect(lookup).not.toHaveBeenCalled();
-              expect(fetchImpl).not.toHaveBeenCalled();
-              return;
-            }
-            expect(respond.mock.calls[0]?.[0]).toBe(true);
-            expect(respond.mock.calls[0]?.[1]).toMatchObject({
-              owner: "bic",
-              repo: "lobster",
-              number: 17420,
-              status: "ready",
-              checks: [],
-            });
-          }
-          expect(claims.length).toBeGreaterThan(0);
-          expect(fetchImpl).toHaveBeenCalled();
-        },
-        true,
-      );
-    },
-  );
-
   it.each([
     "foreign-repository",
     "foreign-host",
@@ -506,3 +218,402 @@ describe("registered Factory session GitHub preview", () => {
     });
   });
 });
+
+it("keeps one admitted Factory issuer through preflight, registered reads, reclaim and retirement", async () => {
+  await exerciseReclaimedFactoryCredential("current", async (flow) => {
+    const { context, config, profileId, external, assertCurrent } = flow;
+    config.gateway = { ...config.gateway, projects: { nativeGitHubSearch: true } };
+    const reader = createOperatorWsClient({
+      connId: "factory-workflow-reader",
+      scopes: ["operator.read"],
+    });
+    reader.authenticatedUserProfile = {
+      ...expectDefined(flow.client.authenticatedUserProfile, "original profile"),
+      avatarRevision: "fixture",
+    };
+    reader.authenticatedUserId = flow.client.authenticatedUserId;
+    reader.authenticatedFactoryGitHubAccountId = 101;
+    const access = new AbortController();
+    reader.internal = {
+      ...prepareGatewayOperatorIngressMetadata({
+        role: "operator",
+        authMethod: "token",
+        clientId: reader.connect.client.id,
+        scopes: ["operator.read"],
+      }),
+      operatorAccessAuthority: {
+        signal: access.signal,
+        assertCurrent: () => access.signal.throwIfAborted(),
+      },
+    };
+    context.getClientConnIds = (filter) =>
+      new Set(
+        [flow.client, reader]
+          .filter((client) => !filter || filter(client))
+          .flatMap((client) => (client.connId ? [client.connId] : [])),
+      );
+    context.isConnectionActive = () => !reader.invalidated;
+    await initializeSessionReadContext(context);
+    const root = "/repos/acme/project";
+    const base = "https://api.microsoft.ghe.com" + root;
+    const item = {
+      number: 17420,
+      title: "Synthetic private item",
+      state: "closed",
+      html_url: "https://microsoft.ghe.com/acme/project/pull/17420",
+      repository_url: base,
+      created_at: "2026-10-03T00:00:00Z",
+      updated_at: "2026-10-03T00:00:00Z",
+      user: { login: "reader" },
+      comments: 0,
+      head: { sha: "a".repeat(40) },
+      base: {
+        ref: "main",
+        repo: { name: "project", owner: { login: "acme" }, full_name: "acme/project", url: base },
+      },
+    };
+    external.responses.set(root, {
+      full_name: "acme/project",
+      private: true,
+      node_id: "R_reclaimed_fixture",
+      clone_url: flow.repository.url,
+      default_branch: "main",
+    });
+    external.responses.set(root + "/pulls", [
+      { ...item, state: "open", draft: false, merged_at: null },
+    ]);
+    external.responses.set(root + "/pulls/17420", {
+      ...item,
+      additions: 0,
+      deletions: 0,
+      changed_files: 0,
+    });
+    external.responses.set(root + "/pulls/17420/commits", []);
+    external.responses.set(root + "/issues/17436", { ...item, number: 17436 });
+    external.responses.set(root + "/commits/" + "a".repeat(40) + "/check-runs", {
+      total_count: 0,
+      check_runs: [],
+    });
+    const credential = factoryPublicationPreflightCredential({
+      ...REQUEST,
+      lifecycleRevision: "setup-issuer-lifecycle",
+      assertCurrent,
+    });
+    for (let index = 0; index < 2; index++) {
+      const prepared = await prepareCurrentGitHubPublicationIdentity(
+        "main",
+        { profileId, sessionKey: REQUEST.sessionKey, assertCurrent },
+        credential,
+      );
+      expect(prepared.account.accountId).toBe(731);
+      expect(prepared.env.OPENCLAW_FACTORY_GITHUB_PROOF).toBeUndefined();
+      expect(external.verdicts[index]).toMatchObject({
+        purpose: "publication-preflight",
+        actorId: 101,
+        binding: credential.claim.binding,
+      });
+    }
+    expect(external.proofs.size).toBe(2);
+    const handlers = createControlUiHandlers((target, identity) =>
+      gitHubPublicApi.loadControlUiGitHubPreview(target, identity, external.fetchFixture),
+    );
+    const { default: github } = await loadBundledPluginFacade<{
+      default: OpenClawPluginDefinition;
+    }>({ pluginId: "github", artifactBasename: "index.ts" });
+    const registered = createPluginRegistryFixture();
+    registerVirtualTestPlugin({
+      ...registered,
+      id: "github",
+      name: "GitHub",
+      contracts: { gatewayMethodDispatch: ["authenticated-request"] },
+      register: expectDefined(github.register, "GitHub registration"),
+    });
+    setTestPluginRegistry(registered.registry.registry);
+    const methods = createGatewayMethodRegistry(
+      [
+        ...registered.registry.registry.gatewayMethodDescriptors,
+        ...Object.entries(handlers).map(([name, handler]) => ({
+          name,
+          owner: { kind: "core" as const, area: "control-ui" },
+          scope: "operator.read" as const,
+          profileAccess: "independent" as const,
+          handler,
+        })),
+      ],
+      registered.registry.registry,
+    );
+    context.getGatewayMethodRegistry = () => methods;
+    const harness = createDispatchTestHarness({ buildRequestContext: () => context });
+    harness.clients.add(reader);
+    let sequence = 0;
+    const request = async (method: string, params: Record<string, unknown>) => {
+      const id = "factory-workflow-" + ++sequence;
+      await harness.dispatcher.dispatch({ type: "req", id, method, params }, reader);
+      return await harness.awaitResponseFrame(id);
+    };
+    const clock = createGatewaySchedulerClock(Date.now());
+    const scheduler = createTestGatewayScheduler(clock.clock);
+    const broadcast = vi.fn();
+    const prepareRead = () =>
+      prepareControlUiSessionPrRead({
+        client: reader,
+        ...REQUEST,
+        getRuntimeConfig: () => config,
+        getSessionRowProjection: () => getSessionRowProjection(context),
+        isCurrentClient: () => !reader.invalidated,
+      });
+    const subscriptions = createControlUiSessionPullRequestSubscriptions({
+      scheduler,
+      broadcastToConnIds: broadcast,
+      getSessionRowProjection: () => getSessionRowProjection(context),
+      prepareRead,
+      isConnectionActive: () => !reader.invalidated,
+    });
+    context.controlUiSessionPullRequests = subscriptions;
+    try {
+      for (const [kind, number] of [
+        ["issue", 17436],
+        ["pull", 17420],
+      ] as const) {
+        const url =
+          "https://microsoft.ghe.com/acme/project/" +
+          (kind === "pull" ? "pull/" : "issues/") +
+          number;
+        const response = await request("github.preview", {
+          sessionKey: REQUEST.sessionKey,
+          agentId: "main",
+          url,
+        });
+        expect(response).toMatchObject({ ok: true, payload: { title: item.title, url } });
+        expect(external.verdicts.at(-1)).toMatchObject({
+          purpose: "session-item-read",
+          actorId: 101,
+          profileId,
+          binding: {
+            sessionId: REQUEST.sessionId,
+            lifecycleRevision: "setup-issuer-lifecycle",
+            requestDigest: factoryGitHubRequestDigest(url),
+          },
+        });
+      }
+      const previousTools = config.tools;
+      const botProfileId = "ghp_" + "1".repeat(32);
+      config.tools = { ...config.tools, github: { profileId: botProfileId } };
+      setRuntimeConfigSnapshot(config);
+      const botDirectory = resolveManagedGitHubProfileDir({
+        agentId: "main",
+        scope: "system",
+        profileId: botProfileId,
+      });
+      await fs.mkdir(botDirectory, { recursive: true, mode: 0o700 });
+      await fs.writeFile(
+        path.join(botDirectory, "hosts.yml"),
+        `${host}:\n  oauth_token: synthetic-reclaimed-token\n`,
+        { mode: 0o600 },
+      );
+      vi.spyOn(oauthLifecycle, "requestCurrentGitHubOAuthRefresh").mockResolvedValue();
+      const botNativeCalls = external.native.mock.calls.length;
+      const botUrl = "https://microsoft.ghe.com/acme/project/pull/17421";
+      external.responses.set(root + "/pulls/17421", { ...item, number: 17421, html_url: botUrl });
+      external.responses.set(root + "/pulls/17421/commits", []);
+      try {
+        expect(
+          await request("github.preview", {
+            sessionKey: REQUEST.sessionKey,
+            agentId: "main",
+            url: botUrl,
+          }),
+        ).toMatchObject({ ok: true, payload: { title: item.title, url: botUrl } });
+        expect(external.native).toHaveBeenCalledTimes(botNativeCalls);
+      } finally {
+        config.tools = previousTools;
+        setRuntimeConfigSnapshot(config);
+      }
+      external.responses.set(root + "/pulls/17420", {
+        ...item,
+        state: "open",
+        draft: false,
+        merged_at: null,
+        additions: 0,
+        deletions: 0,
+        changed_files: 0,
+      });
+      external.responses.set(root + "/commits/" + "a".repeat(40) + "/status", {
+        sha: "a".repeat(40),
+        total_count: 0,
+        statuses: [],
+      });
+      const assertMetadataProofs = (start: number, operation: string) => {
+        const proofs = external.verdicts.slice(start);
+        expect(proofs.length, operation + " must acquire a fresh proof").toBeGreaterThan(0);
+        for (const proof of proofs)
+          expect(proof, operation + " proof").toEqual(
+            expect.objectContaining({
+              purpose: "session-item-read",
+              actorId: 101,
+              profileId,
+              binding: {
+                kind: "session",
+                agentId: REQUEST.agentId,
+                sessionKey: REQUEST.sessionKey,
+                sessionId: REQUEST.sessionId,
+                lifecycleRevision: "setup-issuer-lifecycle",
+                requestDigest: factoryGitHubRequestDigest("https://microsoft.ghe.com/acme/project"),
+              },
+            }),
+          );
+      };
+      const catalogProofStart = external.verdicts.length;
+      expect(
+        await request("controlUi.sessionPullRequests.subscribe", {
+          sessionKeys: [REQUEST.sessionKey],
+        }),
+      ).toMatchObject({ ok: true });
+      await subscriptions.pollNow();
+      expect(broadcast).toHaveBeenCalledWith(
+        "controlUi.sessionPullRequests.changed",
+        expect.objectContaining({
+          sessions: {
+            [REQUEST.sessionKey]: expect.objectContaining({
+              status: "ready",
+              repository: { owner: "acme", repo: "project", host },
+            }),
+          },
+        }),
+        new Set([reader.connId]),
+        expect.objectContaining({ agentId: "main", sessionKeys: [REQUEST.sessionKey] }),
+      );
+      assertMetadataProofs(catalogProofStart, "catalog");
+      const checkParams = {
+        sessionKey: REQUEST.sessionKey,
+        owner: "acme",
+        repo: "project",
+        number: 17420,
+        headSha: "a".repeat(40),
+      };
+      const checksProofStart = external.verdicts.length;
+      expect(await request("controlUi.sessionPullRequests.checks", checkParams)).toMatchObject({
+        ok: true,
+        payload: { owner: "acme", repo: "project", number: 17420, status: "ready", checks: [] },
+      });
+      assertMetadataProofs(checksProofStart, "checks");
+      expect(JSON.stringify(broadcast.mock.calls)).not.toContain("synthetic-reclaimed-token");
+      const calls = external.native.mock.calls.length;
+      const fetchCalls = external.fetchFixture.mock.calls.length;
+      expect(
+        await request("controlUi.sessionPullRequests.checks", { ...checkParams, repo: "foreign" }),
+      ).toMatchObject({ ok: false });
+      expect(external.native).toHaveBeenCalledTimes(calls);
+      expect(external.fetchFixture).toHaveBeenCalledTimes(fetchCalls);
+      const read = expectDefined(await prepareRead(), "retained current reader");
+      const target = expectDefined(await read(), "retained session target");
+      const identity = expectDefined(
+        await prepareControlUiSessionGitHubIdentity({
+          target,
+          assertCurrent: target.assertCurrent!,
+        }),
+        "real read identity",
+      );
+      const cacheTarget = { kind: "pull" as const, owner: "acme", repo: "project", number: 17420 };
+      await gitHubPublicApi.loadControlUiGitHubPreview(
+        cacheTarget,
+        identity,
+        external.fetchFixture,
+      );
+      const beforeCache = external.fetchFixture.mock.calls.length;
+      await gitHubPublicApi.loadControlUiGitHubPreview(
+        cacheTarget,
+        identity,
+        external.fetchFixture,
+      );
+      expect(external.fetchFixture).toHaveBeenCalledTimes(beforeCache);
+      access.abort(new Error("reader retired"));
+      const beforeRetirement = external.native.mock.calls.length;
+      await expect(
+        gitHubPublicApi.loadControlUiGitHubPreview(cacheTarget, identity, external.fetchFixture),
+      ).rejects.toThrow();
+      expect(external.native).toHaveBeenCalledTimes(beforeRetirement);
+      assertCurrent();
+    } finally {
+      await subscriptions.stop();
+      await scheduler.stop();
+      harness.clients.clear();
+      await disposeSessionReadContexts();
+    }
+  });
+});
+
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+it.each(["publication", "options"] as const)(
+  "uses the selected bot for Factory %s while retaining human authority",
+  async (usage) => {
+    vi.stubEnv("FACTORY_AUTH_MODE", "github");
+    vi.stubEnv("OPENCLAW_STATE_DIR", tempDirs.make("selected-bot-publication-"));
+    const profileId = "ghp_11111111111111111111111111111111";
+    let config = { tools: { github: { profileId } } };
+    vi.spyOn(configRuntime, "getRuntimeConfig").mockImplementation(() => config);
+    vi.spyOn(oauthLifecycle, "requestCurrentGitHubOAuthRefresh").mockResolvedValue();
+    const directory = resolveManagedGitHubProfileDir({
+      agentId: "main",
+      scope: "system",
+      profileId,
+    });
+    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+    await fs.writeFile(
+      path.join(directory, "hosts.yml"),
+      "github.com:\n  oauth_token: synthetic-bot-token\n",
+      { mode: 0o600 },
+    );
+    const native = vi
+      .spyOn(nativeIdentity, "readNativeGitHubToken")
+      .mockRejectedValue(new Error("must not borrow native credentials"));
+    let current = true;
+    const assertCurrent = () => {
+      if (!current) throw new Error("human authority revoked");
+    };
+    const actor = { profileId: "human-profile", sessionKey: "agent:main:own", assertCurrent };
+    const credential = factoryPublicationPreflightCredential({
+      agentId: "main",
+      sessionKey: actor.sessionKey,
+      sessionId: "same-session",
+      lifecycleRevision: "same-life",
+      assertCurrent,
+    });
+    const verify = vi.spyOn(oauth, "verifyGitHubCredential").mockImplementation(async (token) => {
+      expect(token).toBe("synthetic-bot-token");
+      return {
+        status: "available",
+        scopes: [],
+        account: { accountId: 202, login: "system-bot", avatarUrl: null },
+      };
+    });
+    const prepare = () =>
+      usage === "publication"
+        ? prepareCurrentGitHubPublicationIdentity("main", actor, credential)
+        : prepareCurrentGitHubPublicationOptionsIdentity("main", actor, credential);
+    expect(await prepare()).toMatchObject({
+      source: "system-configured",
+      account: { accountId: 202, login: "system-bot" },
+    });
+    verify.mockImplementation(async () => {
+      current = false;
+      return {
+        status: "available",
+        scopes: [],
+        account: { accountId: 202, login: "system-bot", avatarUrl: null },
+      };
+    });
+    await expect(prepare()).rejects.toThrow("human authority revoked");
+    current = true;
+    verify.mockImplementation(async () => {
+      config = { tools: { github: { profileId: "ghp_22222222222222222222222222222222" } } };
+      return {
+        status: "available",
+        scopes: [],
+        account: { accountId: 202, login: "system-bot", avatarUrl: null },
+      };
+    });
+    await expect(prepare()).rejects.toThrow("GitHub publication identity changed");
+    expect(native).not.toHaveBeenCalled();
+  },
+);

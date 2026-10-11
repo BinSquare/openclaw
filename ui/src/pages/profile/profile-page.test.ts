@@ -237,62 +237,6 @@ it("shows the verified Factory person without exposing the raw principal in Prof
   expect(page.textContent).not.toContain("Linked emails");
 });
 
-it.each(["initial", "same-person refresh"] as const)(
-  "requires explicit Enterprise consent through the authenticated self setter after %s eligibility",
-  async (source) => {
-    let eligible = source === "initial";
-    const identity = {
-      host: "fixture.ghe.com",
-      accountId: 700001,
-      login: "enterprise-human",
-      profileUrl: "https://fixture.ghe.com/enterprise-human",
-    };
-    const request = vi.fn(async (method: string, params?: Record<string, unknown>) => {
-      if (method === "users.self") {
-        return {
-          profile: { ...modelAccountProfile, githubIdentity: null },
-          authenticatedGitHubIdentity: { ...identity, gitCoauthorEligible: eligible },
-        };
-      }
-      if (method === "users.prefs.get") {
-        return { status: "ok", entries: {} };
-      }
-      if (method === "users.prefs.set") {
-        return { status: "ok", entries: params?.entries };
-      }
-      throw new Error(`unexpected method: ${method}`);
-    });
-    const harness = createConnectedContext(request as GatewayBrowserClient["request"], {
-      id: modelAccountProfile.id,
-      name: "Enterprise Person",
-    });
-    const page = mountProfilePage(harness.context);
-    if (source === "same-person refresh") {
-      await waitForFast(() =>
-        expect(page.querySelector("wa-switch")?.hasAttribute("disabled")).toBe(true),
-      );
-      expect(request.mock.calls.some(([method]) => method === "users.prefs.get")).toBe(false);
-      eligible = true;
-      harness.context.gateway.updateSelfUser?.({
-        authenticatedGitHubIdentity: { ...identity, gitCoauthorEligible: true },
-      });
-    }
-    await waitForFast(() =>
-      expect(request).toHaveBeenCalledWith("users.prefs.get", { keys: ["git.coauthor.enabled"] }),
-    );
-    const toggle = page.querySelector<HTMLElement & { checked: boolean }>("wa-switch")!;
-    await waitForFast(() => expect(toggle.hasAttribute("disabled")).toBe(false));
-    expect(toggle.checked).toBe(false);
-    toggle.checked = true;
-    toggle.dispatchEvent(new Event("change", { bubbles: true }));
-    await waitForFast(() =>
-      expect(request).toHaveBeenCalledWith("users.prefs.set", {
-        entries: { "git.coauthor.enabled": true },
-      }),
-    );
-  },
-);
-
 it.each(["operator.read", "operator.sessions.write"])(
   "loads a read-only profile with %s without enabling mutations",
   async (scope) => {

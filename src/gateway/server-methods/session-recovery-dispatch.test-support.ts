@@ -189,7 +189,14 @@ export async function createRecoveryDispatchFixture(params: {
     supportedExecutionModes: ["remote-exec"],
     requiresNodeEnrollment: true,
     provision,
-    resolveAllocation: async () => ({ leaseId: "fresh-recovery-lease", sharedHost: false }),
+    resolveAllocation: async (_profile, operationId) => ({
+      leaseId:
+        params.failedSource &&
+        store.get(params.failedSource.environmentId)?.provisionOperationId === operationId
+          ? params.failedSource.leaseId
+          : "fresh-recovery-lease",
+      sharedHost: false,
+    }),
     inspect: async () => ({ status: "active", sharedHost: false }),
     destroy,
     ...(params.preparedScenario

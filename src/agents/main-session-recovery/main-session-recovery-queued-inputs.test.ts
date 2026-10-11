@@ -20,12 +20,28 @@ import {
   queuedRecoveryChanges,
 } from "./main-session-recovery-queued-native.test-support.js";
 
-const nativeAttempt = vi.hoisted(() => vi.fn<AgentHarnessV2["runAttempt"]>());
+const nativeAttempt = vi.hoisted(() =>
+  vi.fn<(params: Parameters<AgentHarnessV2["runAttempt"]>[0]) => Promise<void>>(),
+);
 afterEach(() => closeSkillsWatchers(true));
-// mock-isolation: Replace only model execution; importing the real attempt installs the process-global Codex client disposer.
-vi.mock("../../../extensions/codex/src/app-server/run-attempt.js", () => ({
-  runCodexAppServerAttempt: nativeAttempt,
-}));
+// The external app-server is scripted; the actual attempt owns registration and settlement.
+vi.mock("../../../extensions/codex/src/app-server/run-attempt.js", async (importOriginal) => {
+  const original =
+    await importOriginal<
+      typeof import("../../../extensions/codex/src/app-server/run-attempt.js")
+    >();
+  return {
+    ...original,
+    runCodexAppServerAttempt: async (
+      ...args: Parameters<typeof original.runCodexAppServerAttempt>
+    ) => {
+      const { loadCodexRecoveryQueueTestFixture } =
+        await import("../../../extensions/codex/test-api.js");
+      const { runRecoveryQueueAttempt } = await loadCodexRecoveryQueueTestFixture();
+      return runRecoveryQueueAttempt(original.runCodexAppServerAttempt, ...args, nativeAttempt);
+    },
+  };
+});
 
 it.each(queuedRecoveryChanges)(
   "preserves accepted queued issuer FIFO, once and currentness after reopen: %s",

@@ -156,9 +156,12 @@ export function executeDevicePairingMutation<Key extends keyof DevicePairingWork
       captured.type === "devicePairing.redeemJoinCode"
         ? undefined
         : captureDevicePairingPublication(context.admission);
-    // Runtime facts preserve pairing identity; publishing them must not interrupt live node work.
+    // Bootstrap operations only change prospective bootstrap/completion records,
+    // never existing paired authority. Detached bootstrap cleanup and node runtime
+    // facts must not revoke an admitted operator or node while they settle.
     const mutation = publication?.beginMutation(
-      captured.type !== "node.updateSessionHost" &&
+      !captured.type.startsWith("bootstrap.") &&
+        captured.type !== "node.updateSessionHost" &&
         captured.type !== "node.recordHostStats" &&
         captured.type !== "node.updateBins",
     );

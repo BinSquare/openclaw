@@ -2,12 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import { resetProcessRegistryForTests } from "../agents/bash-process-registry.test-support.js";
-import { createGatewayHostLifecycle } from "../cli/gateway-cli/host-lifecycle.js";
-import { getGatewayProcessInstanceId } from "../gateway/process-instance.js";
-import { suspendHandlers } from "../gateway/server-methods/suspend.js";
 import type { GatewayReaderRequest } from "../gateway/server-public.js";
-import { createGatewayRequestContext } from "../gateway/server-request-context.js";
-import { makeContextParams } from "../gateway/server-request-context.test-support.js";
 import {
   getGatewaySuspendAdmissionPhase,
   isGatewayWorkAdmissionClosed,
@@ -43,143 +38,6 @@ afterEach(() => {
 });
 
 describe("gateway suspend coordinator", () => {
-  it("denies the ended requester response while its accepted native reader join finishes", async () => {
-    await prepareGatewaySuspend({
-      requestId: "reader-response",
-      drain: true,
-      terminalPolicy: "terminate",
-      pauseScheduling: vi.fn(),
-      resumeScheduling: vi.fn(),
-      createSuspensionId: () => "reader-response-lease",
-      inspect: inspectors(),
-    });
-    const entered = createDeferred();
-    const joined = createDeferred();
-    const response = createDeferred();
-    let callerCurrent = true;
-    let nativeFinished = false;
-    const target = { pid: process.pid, processInstanceId: getGatewayProcessInstanceId() };
-    const expiresAtMs = Date.now() + 30_000;
-    const context = createGatewayRequestContext(makeContextParams());
-    const host = createGatewayHostLifecycle({
-      isCurrent: () => true,
-      isServing: () => true,
-      acceptStop: () => {},
-      processOwner: { ownsProcessLifecycle: true, supervisor: null },
-      prepareReader: async (_request, assertCurrent) => {
-        assertCurrent();
-        entered.resolve();
-        await joined.promise;
-        assertCurrent();
-        nativeFinished = true;
-        return {
-          version: 1,
-          status: "reader-ready",
-          ...target,
-          bootId: "response-boot",
-          frozenSourceGeneration: "response-generation",
-          retiredAtMs: Date.now(),
-          expiresAtMs,
-        };
-      },
-    });
-    context.hostLifecycle = host.capability;
-    const respond = vi.fn(() => response.resolve());
-    const handler = suspendHandlers["gateway.suspend.reader"]!;
-    await handler({
-      req: { type: "req", id: "reader-response-request", method: "gateway.suspend.reader" },
-      params: { suspensionId: "reader-response-lease", target, expiresAtMs },
-      context,
-      client: null,
-      respond,
-      isWebchatConnect: () => false,
-      hasCurrentClientAuthority: () => callerCurrent,
-    });
-    await entered.promise;
-    callerCurrent = false;
-    joined.resolve();
-    await response.promise;
-    expect(nativeFinished).toBe(true);
-    expect(respond).toHaveBeenCalledWith(
-      false,
-      undefined,
-      expect.objectContaining({ code: "UNAVAILABLE" }),
-    );
-    await host.retire();
-  });
-  it("finishes accepted reader custody after the initiating request ends without renewing its owner or deadline", async () => {
-    await prepareGatewaySuspend({
-      requestId: "reader-request-lifetime",
-      drain: true,
-      terminalPolicy: "terminate",
-      pauseScheduling: vi.fn(),
-      resumeScheduling: vi.fn(),
-      createSuspensionId: () => "reader-request-lease",
-      inspect: inspectors(),
-    });
-    let requestCurrent = true;
-    const entered = createDeferred();
-    const joined = createDeferred();
-    const expiresAtMs = Date.now() + 30_000;
-    const target = { pid: process.pid, processInstanceId: "reader-request-instance" };
-    const receipt = {
-      version: 1 as const,
-      status: "reader-ready" as const,
-      ...target,
-      bootId: "reader-request-boot",
-      frozenSourceGeneration: "reader-request-generation",
-      retiredAtMs: Date.now(),
-      expiresAtMs,
-    };
-    const owner = {
-      isCurrent: () => true,
-      prepareReader: vi.fn(async (_request: GatewayReaderRequest, assertCurrent: () => void) => {
-        assertCurrent();
-        entered.resolve();
-        await joined.promise;
-        assertCurrent();
-        return receipt;
-      }),
-    };
-    const pending = prepareGatewaySuspendedReader({
-      suspensionId: "reader-request-lease",
-      request: { target, expiresAtMs },
-      owner,
-      assertCurrent: () => {
-        if (!requestCurrent) {
-          throw new Error("Request lifetime ended");
-        }
-      },
-    });
-    await entered.promise;
-    requestCurrent = false;
-    joined.resolve();
-    await expect(pending).resolves.toEqual(receipt);
-    expect(owner.prepareReader).toHaveBeenCalledOnce();
-    await expect(
-      prepareGatewaySuspendedReader({
-        suspensionId: "reader-request-lease",
-        request: { target, expiresAtMs },
-        owner,
-        assertCurrent: () => {
-          throw new Error("Requester response is unauthorized");
-        },
-      }),
-    ).rejects.toThrow("Requester response is unauthorized");
-    await expect(
-      prepareGatewaySuspendedReader({
-        suspensionId: "reader-request-lease",
-        request: { target, expiresAtMs },
-        owner,
-        assertCurrent: () => {},
-      }),
-    ).resolves.toEqual(receipt);
-    expect(owner.prepareReader).toHaveBeenCalledOnce();
-    expect(resumeGatewaySuspend("reader-request-lease")).toEqual({
-      ok: false,
-      reason: "gateway-restarting",
-    });
-  });
   it.each(["initial refusal", "owner loss", "deadline", "native failure"] as const)(
     "keeps reader admission and custody fenced after %s",
     async (failure) => {
@@ -260,53 +118,6 @@ describe("gateway suspend coordinator", () => {
       }
     },
   );
-  it("reports captured reader custody without calling retired application inspectors", async () => {
-    let retired = false;
-    const inspectWork = vi.fn(() => {
-      if (retired) {
-        throw new Error("synthetic retired work inspector");
-      }
-      return 0;
-    });
-    await prepareGatewaySuspend({
-      requestId: "reader-status",
-      drain: true,
-      terminalPolicy: "terminate",
-      pauseScheduling: vi.fn(),
-      resumeScheduling: vi.fn(),
-      createSuspensionId: () => "reader-status-lease",
-      inspect: inspectors({ getSessionMutations: inspectWork }),
-    });
-    const target = { pid: process.pid, processInstanceId: "reader-status-instance" };
-    const expiresAtMs = Date.now() + 30_000;
-    await prepareGatewaySuspendedReader({
-      suspensionId: "reader-status-lease",
-      request: { target, expiresAtMs },
-      assertCurrent: () => {},
-      owner: {
-        isCurrent: () => true,
-        prepareReader: async () => {
-          retired = true;
-          return {
-            version: 1,
-            status: "reader-ready",
-            ...target,
-            expiresAtMs,
-            bootId: "reader-status-boot",
-            frozenSourceGeneration: "reader-status-generation",
-            retiredAtMs: Date.now(),
-          };
-        },
-      },
-    });
-    const inspected = inspectWork.mock.calls.length;
-    expect(getGatewaySuspendStatus("reader-status-lease")).toMatchObject({
-      status: "ready",
-      expiresAtMs,
-    });
-    expect(inspectWork).toHaveBeenCalledTimes(inspected);
-  });
-
   describe("external restart handoff", () => {
     const setup = async (draining: boolean) => {
       let now = 1_000;

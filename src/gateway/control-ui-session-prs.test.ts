@@ -1,7 +1,10 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../test/helpers/promise.js";
 import { getRuntimeConfig } from "../config/io.js";
 import { setRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
 import { runGitWorkerOperation } from "../infra/git-worker.js";
+import * as prRead from "./control-ui-session-pr-read.js";
 import {
   createSessionPullRequestsFixture,
   githubJson,
@@ -149,6 +152,7 @@ describe("loadControlUiSessionPullRequests", () => {
 
     expect(result).toEqual({
       repository: { owner: "openclaw", repo: "openclaw" },
+      issues: [],
       pullRequests: [
         {
           number: 103469,
@@ -262,6 +266,7 @@ describe("loadControlUiSessionPullRequests", () => {
       ).resolves.toEqual({
         pullRequests: [],
         repository: { owner: "openclaw", repo: "openclaw" },
+        issues: [],
         rateLimited: false,
         status: "unavailable",
       });
@@ -611,6 +616,7 @@ describe("loadControlUiSessionPullRequests", () => {
     await expect(load()).resolves.toEqual({
       pullRequests: [],
       repository: { owner: "openclaw", repo: "openclaw" },
+      issues: [],
       rateLimited: false,
       status: "unavailable",
     });
@@ -747,50 +753,94 @@ describe("loadControlUiSessionPullRequests", () => {
     expect((await load(true)).branch?.branch).toBe("feature-c");
   });
 
-  it("refreshes a cached empty result after the assistant creates a PR", async () => {
-    let pulls: Record<string, unknown>[] = [];
-    const fetchImpl = routedFetch([
-      { match: "/pulls?head=", response: () => githubJson(pulls) },
-      { match: "/repos/openclaw/openclaw", response: () => githubJson({ fork: false }) },
-    ]);
+  it.each([false, true])(
+    "refreshes a cached empty result after the assistant creates a PR (held issue read: %s)",
+    async (holdIssueRead) => {
+      const duplicateScope = new AsyncLocalStorage<boolean>();
+      const entered = createDeferred();
+      const release = createDeferred();
+      let pulls: Record<string, unknown>[] = [];
+      const fetchImpl = routedFetch([
+        { match: "/pulls?head=", response: () => githubJson(pulls) },
+        { match: "/repos/openclaw/openclaw", response: () => githubJson({ fork: false }) },
+      ]);
 
-    const initial = await loadControlUiSessionPullRequests(
-      { sessionKey: "agent:main:main" },
-      { fetchImpl, resolveGitContext },
-    );
-    expect(initial.pullRequests).toEqual([]);
+      const initial = await loadControlUiSessionPullRequests(
+        { sessionKey: "agent:main:main" },
+        { fetchImpl, resolveGitContext },
+      );
+      expect(initial.pullRequests).toEqual([]);
 
-    pulls = [pullListItem({ merged_at: "2026-07-09T10:00:00Z" })];
-    const cached = await loadControlUiSessionPullRequests(
-      { sessionKey: "agent:main:main" },
-      { fetchImpl, resolveGitContext },
-    );
-    expect(cached.pullRequests).toEqual([]);
+      pulls = [pullListItem({ merged_at: "2026-07-09T10:00:00Z" })];
+      const cached = await loadControlUiSessionPullRequests(
+        { sessionKey: "agent:main:main" },
+        { fetchImpl, resolveGitContext },
+      );
+      expect(cached.pullRequests).toEqual([]);
 
-    const forcedRefresh = loadControlUiSessionPullRequests(
-      { sessionKey: "agent:main:main", refresh: true },
-      { fetchImpl, resolveGitContext },
-    );
-    const ordinaryFollower = loadControlUiSessionPullRequests(
-      { sessionKey: "agent:main:main" },
-      { fetchImpl, resolveGitContext },
-    );
-    const duplicateForcedRefresh = loadControlUiSessionPullRequests(
-      { sessionKey: "agent:main:main", refresh: true },
-      { fetchImpl, resolveGitContext },
-    );
-    const refreshed = await Promise.all([forcedRefresh, ordinaryFollower, duplicateForcedRefresh]);
-    expect(refreshed.map((result) => result.pullRequests.map((item) => item.number))).toEqual([
-      [103469],
-      [103469],
-      [103469],
-    ]);
-    expect(
-      fetchImpl.mock.calls.filter((call) =>
-        requestUrl(call[0] as RequestInfo | URL).includes("/pulls?head="),
-      ),
-    ).toHaveLength(2);
-  });
+      const readIssues = prRead.readControlUiSessionIssueReferences;
+      const issueRead = holdIssueRead
+        ? vi
+            .spyOn(prRead, "readControlUiSessionIssueReferences")
+            .mockImplementation(async (...args) => {
+              const issues = await readIssues(...args);
+              if (duplicateScope.getStore()) {
+                entered.resolve();
+                await release.promise;
+              }
+              return issues;
+            })
+        : undefined;
+
+      const forcedRefresh = loadControlUiSessionPullRequests(
+        { sessionKey: "agent:main:main", refresh: true },
+        { fetchImpl, resolveGitContext },
+      );
+      const ordinaryFollower = loadControlUiSessionPullRequests(
+        { sessionKey: "agent:main:main" },
+        { fetchImpl, resolveGitContext },
+      );
+      const duplicateForcedRefresh = duplicateScope.run(true, () =>
+        loadControlUiSessionPullRequests(
+          { sessionKey: "agent:main:main", refresh: true },
+          { fetchImpl, resolveGitContext },
+        ),
+      );
+      const operations = [forcedRefresh, ordinaryFollower, duplicateForcedRefresh];
+      try {
+        if (holdIssueRead) {
+          await Promise.race([
+            entered.promise,
+            duplicateForcedRefresh.then(() => {
+              throw new Error("Duplicate completed before its issue-read gate");
+            }),
+          ]);
+          await Promise.all([forcedRefresh, ordinaryFollower]);
+          expect(
+            fetchImpl.mock.calls.filter((call) =>
+              requestUrl(call[0] as RequestInfo | URL).includes("/pulls?head="),
+            ).length,
+          ).toBe(2);
+        }
+        release.resolve();
+        const refreshed = await Promise.all(operations);
+        expect(refreshed.map((result) => result.pullRequests.map((item) => item.number))).toEqual([
+          [103469],
+          [103469],
+          [103469],
+        ]);
+        expect(
+          fetchImpl.mock.calls.filter((call) =>
+            requestUrl(call[0] as RequestInfo | URL).includes("/pulls?head="),
+          ),
+        ).toHaveLength(2);
+      } finally {
+        release.resolve();
+        await Promise.allSettled(operations);
+        issueRead?.mockRestore();
+      }
+    },
+  );
 
   it("queues one forced refresh behind an ordinary in-flight lookup", async () => {
     let resolveInitialPulls!: (response: Response) => void;
@@ -868,6 +918,7 @@ describe("loadControlUiSessionPullRequests", () => {
     expect(result).toEqual({
       pullRequests: [],
       repository: { owner: "openclaw", repo: "openclaw" },
+      issues: [],
       branch: {
         owner: "openclaw",
         repo: "openclaw",

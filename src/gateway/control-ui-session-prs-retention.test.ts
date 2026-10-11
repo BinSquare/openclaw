@@ -362,6 +362,7 @@ describe("watched session PR retention", () => {
       await expect(load()).resolves.toEqual({
         pullRequests: [],
         repository: { owner: "openclaw", repo: "openclaw" },
+        issues: [],
         rateLimited: false,
         status: "unavailable",
       });

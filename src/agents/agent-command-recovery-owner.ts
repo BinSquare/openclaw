@@ -8,6 +8,7 @@ import { hasRestartRecoveryTerminalRun } from "../config/sessions/restart-recove
 import { withSessionEntryReadOnlyInWorker } from "../config/sessions/session-entry-read-runtime.js";
 import { racePromiseWithAbortSignal } from "../infra/abort-signal.js";
 import { assertAgentRunLifecycleGenerationCurrent } from "../infra/agent-events.js";
+import { claimAgentRunContext, releaseAgentRunContext } from "../infra/agent-run-registry.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { getSessionWorkAdmissionOwnerRelease } from "../sessions/session-lifecycle-admission.js";
@@ -28,6 +29,7 @@ import {
 const log = createSubsystemLogger("agents/agent-command");
 
 type PreparedRecoveryOwnerTarget = {
+  runId?: string;
   sessionAgentId: string;
   isNewSession: boolean;
   previousSessionId?: string;
@@ -92,7 +94,7 @@ async function claimAgentCommandRecoveryOwner(params: {
       // session resolution so rollover or rerouting cannot execute under another row's lease.
       throw new Error("main-session recovery owner changed during ingress preparation; retry");
     }
-    const snapshot = await refreshMainSessionRecoveryOwner(transferredLease, params.opts.runId);
+    const snapshot = await refreshMainSessionRecoveryOwner(transferredLease, params.prepared.runId);
     if (!snapshot) {
       throw new Error("main-session recovery owner changed during ingress preparation; retry");
     }
@@ -141,7 +143,7 @@ async function claimAgentCommandRecoveryOwner(params: {
     lifecycleGeneration: params.lifecycleGeneration,
     sessionId: params.prepared.previousSessionId ?? params.prepared.sessionId,
     replacementSessionId: params.prepared.isNewSession ? params.prepared.sessionId : undefined,
-    runId: params.opts.runId,
+    runId: params.prepared.runId,
     target,
   });
   if (claim.kind === "invalidated") {
@@ -149,11 +151,11 @@ async function claimAgentCommandRecoveryOwner(params: {
   }
   if (claim.kind === "not_required") {
     if (
-      params.opts.runId &&
+      params.prepared.runId &&
       ["subagent_settle", "subagent_announce"].includes(
         params.opts.inputProvenance?.sourceTool ?? "",
       ) &&
-      hasRestartRecoveryTerminalRun(claim.entry, params.opts.runId)
+      hasRestartRecoveryTerminalRun(claim.entry, params.prepared.runId)
     ) {
       throw createSessionWorkStartChangedError(sessionKey);
     }
@@ -265,7 +267,27 @@ export async function runWithAgentCommandRecoveryOwner<
     // Preparation uses a detached working copy. Carry the owner transaction's
     // exact row forward so successful settlement can consume the same recovery cycle.
     refreshPreparedRecoveryOwnerTarget(prepared, acquired);
-    return await params.run(prepared);
+    // The command writes its crash fence before the embedded runner acquires a
+    // lane. Retain that real preparation/settlement lifetime in the same registry
+    // so accepted followers cannot mistake it for an orphaned recovery fence.
+    const runId = prepared.runId;
+    const commandClaim = runId
+      ? claimAgentRunContext(
+          runId,
+          {
+            agentId: prepared.sessionAgentId,
+            sessionId: prepared.sessionId,
+            sessionKey: prepared.sessionKey,
+            lifecycleGeneration: params.lifecycleGeneration,
+          },
+          { trackOwner: true },
+        )
+      : undefined;
+    try {
+      return await params.run(prepared);
+    } finally {
+      if (runId) releaseAgentRunContext(runId, commandClaim);
+    }
   } finally {
     try {
       const releasedRecovery = await releaseMainSessionRecoveryOwner(lease);

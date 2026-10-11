@@ -9,10 +9,6 @@ import {
 } from "../../config/sessions/session-accessor.pending-inputs.js";
 import { createChatAbortOps } from "../../gateway/chat-abort-ops.js";
 import { abortChatRunById } from "../../gateway/chat-abort.js";
-import { createGatewayInstanceRuntime } from "../../gateway/server-instance-runtime.js";
-import { createGatewayRequestContext } from "../../gateway/server-request-context.js";
-import { makeContextParams } from "../../gateway/server-request-context.test-support.js";
-import { SharedGatewaySessionGenerationState } from "../../gateway/server-shared-auth-generation.js";
 import { loadSessionEntry as loadGatewaySessionEntry } from "../../gateway/session-utils.js";
 import {
   getAgentEventLifecycleGeneration,
@@ -21,12 +17,13 @@ import {
 import { beginSessionWorkAdmission } from "../../sessions/session-lifecycle-admission.js";
 import { closeOpenClawAgentDatabasesAsync } from "../../state/openclaw-agent-db.js";
 import type { OpenClawTestState } from "../../test-utils/openclaw-test-state.js";
-import { readAdmittedRunOperatorAuthority } from "../admitted-run-context.js";
+import type { AdmittedRunOperatorAuthority } from "../admitted-run-context.js";
 import type { runAgentAttempt } from "../command/attempt-execution.runtime.js";
 import { refreshPreparedModelRuntimeSnapshots } from "../prepared-model-runtime.js";
-import { createAgentRunRestartAbortError } from "../run-termination.js";
 import {
   createOriginalIssuerFixture,
+  createOriginalIssuerGateway,
+  startOriginalIssuerEvents,
   readIssuerFixtureHistory,
 } from "./main-session-recovery-original-issuer.test-support.js";
 import {
@@ -38,31 +35,7 @@ import { recoverRestartAbortedMainSessions } from "./main-session-restart-recove
 type IssuerFixture = Awaited<ReturnType<typeof createOriginalIssuerFixture>>;
 type Target = { agentId: string; sessionKey: string; sessionId: string };
 
-export function createQueuedRecoveryGateway(first: IssuerFixture) {
-  const context = createGatewayRequestContext(
-    makeContextParams({
-      connectionWork: { track: (run) => first.work.track(run) },
-      sharedGatewaySessionGenerationState: new SharedGatewaySessionGenerationState({
-        current: "original-shared",
-        required: null,
-      }),
-    }),
-  );
-  context.getRuntimeConfig = () => first.cfg;
-  context.getCommittedRuntimeConfig = () => first.cfg;
-  context.resolveGatewayContext = () => context;
-  context.getGatewayMethodRegistry = () => first.methods;
-  const runtime = createGatewayInstanceRuntime({
-    getContext: () => context,
-    getMethodRegistry: () => first.methods,
-    isDispatchAvailable: () => true,
-  });
-  context.recoveryRuntime = runtime.recovery;
-  context.createAgentTurnFacade = runtime.createAgentTurnFacade;
-  return { context, runtime };
-}
-
-/** Exercise acceptance and original-issuer restore; the command attempt is a fixture leaf. */
+/** Keep an unissued predecessor while fresh accepted work survives a real restart. */
 export async function createLegacyHeadRecoveryFixture(first: IssuerFixture, target: Target) {
   const legacy = expectDefined(
     await stageSessionPendingInput(target, {
@@ -89,52 +62,28 @@ export async function createLegacyHeadRecoveryFixture(first: IssuerFixture, targ
   const runId = "new-after-held";
   const text = "New authenticated accepted work";
   return {
-    async attempt(params: Parameters<typeof runAgentAttempt>[0]) {
-      if (params.runId !== runId && !recovering) {
-        return undefined;
+    async beforeAttempt(params: Parameters<typeof runAgentAttempt>[0]) {
+      if (!recovering && params.runId === runId) {
+        entered.resolve();
+        await release.promise;
       }
-      const admitted = await params.preparedRunAdmission.admit("embedded");
-      const authority = expectDefined(
-        readAdmittedRunOperatorAuthority(admitted),
-        "actual current accepted issuer",
-      );
+    },
+    run(params: Parameters<typeof runAgentAttempt>[0], authority: AdmittedRunOperatorAuthority) {
+      if (!recovering) {
+        return false;
+      }
       authority.assertCurrent();
       expect(params.sessionId).toBe(target.sessionId);
       expect(authority.captureRestartRecoveryIssuer?.()?.grant).toBeNull();
-      await params.onAgentEvent({ stream: "lifecycle", data: { phase: "start" } });
-      await params.opts.onExecutionStarted?.();
-      if (!recovering) {
-        restoredProfileId = authority.profileId;
-        entered.resolve();
-        await release.promise;
-        throw createAgentRunRestartAbortError();
-      }
       expect(authority.profileId).toBe(restoredProfileId);
-      const history = await readIssuerFixtureHistory(target, target.sessionId);
-      expect(
-        history.filter(
-          (message) => isRecord(message) && message.idempotencyKey === `${runId}:user`,
-        ),
-      ).toEqual([expect.objectContaining({ role: "user", content: text })]);
       runs.push(params.runId);
       completed.resolve();
-      return {
-        payloads: [{ text: "Accepted current work completed" }],
-        meta: {
-          durationMs: 0,
-          agentMeta: {
-            sessionId: target.sessionId,
-            provider: "fixture",
-            model: "allowed",
-            usage: { input: 0, output: 0, total: 0 },
-          },
-          stopReason: "stop",
-        },
-      };
+      return true;
     },
     async exercise(
       state: OpenClawTestState,
-      gateway: ReturnType<typeof createQueuedRecoveryGateway>,
+      gateway: ReturnType<typeof createOriginalIssuerGateway>,
+      closePreviousEvents: () => Promise<void>,
     ) {
       const held = expectDefined(loadSessionEntry(target), "held historical head");
       expect(held.mainRestartRecovery?.turnIntent).toBeUndefined();
@@ -164,8 +113,10 @@ export async function createLegacyHeadRecoveryFixture(first: IssuerFixture, targ
           fresh.original!.authority.assertCurrent();
         },
       });
-      let restarted: ReturnType<typeof createQueuedRecoveryGateway> | undefined;
+      let restarted: ReturnType<typeof createOriginalIssuerGateway> | undefined;
+      let closeRestartEvents: (() => Promise<void>) | undefined;
       try {
+        restoredProfileId = fresh.profile.id;
         fresh.client.internal!.operatorRunAuthority = fresh.original!.authority;
         const facade = await gateway.runtime.createAgentTurnFacade({ client: fresh.client });
         await expect(
@@ -204,6 +155,7 @@ export async function createLegacyHeadRecoveryFixture(first: IssuerFixture, targ
         await first.work.runWhenIdle(() => {});
         fresh.original!.release();
         fresh.deviceSource.release();
+        await closePreviousEvents();
         gateway.runtime.close();
         rotateAgentEventLifecycleGeneration();
         await closeOpenClawAgentDatabasesAsync();
@@ -212,8 +164,9 @@ export async function createLegacyHeadRecoveryFixture(first: IssuerFixture, targ
           "captured interruption snapshot",
         );
         expect(interrupted.restartRecoveryForceSafeTools).toBe(true);
-        restarted = createQueuedRecoveryGateway(first);
+        restarted = createOriginalIssuerGateway(first);
         first.context = restarted.context;
+        closeRestartEvents = startOriginalIssuerEvents(restarted.context);
         recovering = true;
         await refreshPreparedModelRuntimeSnapshots(first.cfg, {
           gatewayLifecycle: true,
@@ -243,6 +196,12 @@ export async function createLegacyHeadRecoveryFixture(first: IssuerFixture, targ
         await completed.promise;
         await first.work.runWhenIdle(() => {});
         expect(runs).toHaveLength(1);
+        const history = await readIssuerFixtureHistory(target, target.sessionId);
+        expect(
+          history.filter(
+            (message) => isRecord(message) && message.idempotencyKey === runId + ":user",
+          ),
+        ).toEqual([expect.objectContaining({ role: "user", content: text })]);
         expect(loadSessionEntry(target)?.sessionId).toBe(target.sessionId);
         expect(loadSessionEntry(target)?.mainRestartRecovery?.turnIntent).toBeUndefined();
         await markStartupOrphanedMainSessionsForRecovery({
@@ -266,6 +225,7 @@ export async function createLegacyHeadRecoveryFixture(first: IssuerFixture, targ
         await first.work.runWhenIdle(() => {});
         fresh.original!.release();
         fresh.deviceSource.release();
+        await closeRestartEvents?.();
         restarted?.runtime.close();
       }
     },

@@ -1,3 +1,4 @@
+import fs from "node:fs/promises";
 import { DatabaseSync } from "node:sqlite";
 import { afterAll, beforeAll, beforeEach, expect, test, vi } from "vitest";
 import { awaitGateBeforeSettlement } from "../../test/helpers/promise.js";
@@ -9,7 +10,7 @@ import { withOpenClawStateDatabaseReadSnapshot } from "../state/openclaw-state-d
 import { openOpenClawStateDatabase } from "../state/openclaw-state-db.js";
 import * as stateWorker from "../state/openclaw-state-worker-store.js";
 import { withEnvAsync } from "../test-utils/env.js";
-import { issueDeviceBootstrapToken } from "./device-bootstrap.js";
+import { issueDeviceBootstrapToken, revokeDeviceBootstrapToken } from "./device-bootstrap.js";
 import { withDevicePairingLock } from "./device-pairing-lock.js";
 import { updatePairedNodeBins, updatePairedNodeSessionHost } from "./device-pairing-node-facts.js";
 import {
@@ -21,12 +22,16 @@ import {
   getPublishedOperatorPairingIdentity,
   getPublishedPairedDeviceBinding,
 } from "./device-pairing-publication.js";
-import { readDevicePairingNodeSnapshot } from "./device-pairing-store-readonly.js";
+import {
+  loadBoundDeviceBootstrapContextReadOnly,
+  readDevicePairingNodeSnapshot,
+} from "./device-pairing-store-readonly.js";
 import { persistDevicePairingStoreState } from "./device-pairing-store.js";
-import { revokeDeviceToken } from "./device-pairing-tokens.js";
+import { rotateDeviceToken, revokeDeviceToken } from "./device-pairing-tokens.js";
 import { withCurrentDevicePairingSnapshot } from "./device-pairing-worker.js";
 import {
   getPairedDevice,
+  getPendingDevicePairing,
   listDevicePairing,
   listDevicePairingReadOnly,
   removePairedDevice,
@@ -146,6 +151,8 @@ test("keeps committed node bindings across bootstrap writes and caller-owned row
 });
 
 test.each([
+  "bootstrap issue",
+  "bootstrap cleanup",
   "session-host consent",
   "host stats",
   "skill bins",
@@ -161,6 +168,8 @@ test.each([
     throw new Error("expected paired node generation");
   }
   const binding = getPublishedPairedDeviceBinding("node", baseDir);
+  const bootstrap =
+    change === "bootstrap cleanup" ? await issueDeviceBootstrapToken({ baseDir }) : undefined;
   if (change === "metadata after a failed read") {
     const read = vi
       .spyOn(stateReads, "executeExistingOpenClawStateRead")
@@ -183,6 +192,10 @@ test.each([
     });
   const mutate = () => {
     switch (change) {
+      case "bootstrap issue":
+        return issueDeviceBootstrapToken({ baseDir });
+      case "bootstrap cleanup":
+        return revokeDeviceBootstrapToken({ baseDir, token: bootstrap!.token });
       case "rename":
         return renamePairedNode("node", "Renamed node", baseDir);
       case "host stats":
@@ -230,7 +243,16 @@ test.each([
       expect(getPublishedPairedDeviceBinding("node", baseDir)).toEqual(binding);
     }
     releaseMutation.resolve();
-    expect(await mutation).toEqual(
+    const settled = await mutation;
+    if (change === "bootstrap issue" || change === "bootstrap cleanup") {
+      expect(settled).toMatchObject(
+        change === "bootstrap issue" ? { expiresAtMs: expect.any(Number) } : { removed: true },
+      );
+      expect(getPublishedPairedDeviceBinding("node", baseDir)).toEqual(binding);
+      expect(await readDevicePairingNodeSnapshot(baseDir)).toBe(snapshot);
+      return;
+    }
+    expect(settled).toEqual(
       change === "token revocation"
         ? expect.objectContaining({ ok: true })
         : change === "rename"
@@ -371,7 +393,7 @@ test("retains pairing admission through final publication preparation and synchr
   expect(getPublishedPairedDeviceBinding("node", baseDir)).toBeNull();
 });
 
-test.each(["worker commit", "external commit"] as const)(
+test.each(["worker commit", "external commit", "database replacement"] as const)(
   "does not restore revoked node authority from a read delayed past a newer %s",
   async (commit) => {
     await listDevicePairing(baseDir);
@@ -421,6 +443,14 @@ test.each(["worker commit", "external commit"] as const)(
           if (mutation) {
             releaseMutation.resolve();
             await mutation;
+          } else if (commit === "database replacement") {
+            const retiredPath = database.path + ".retired";
+            await closeOpenClawStateDatabaseByPathAsync(database.path);
+            await fs.rename(database.path, retiredPath);
+            database = openOpenClawStateDatabase({
+              env: { ...process.env, OPENCLAW_STATE_DIR: baseDir },
+            });
+            expect(await getPairedDevice("node", baseDir)).toBeNull();
           } else {
             const other = new DatabaseSync(database.path);
             try {
@@ -470,3 +500,92 @@ test("retires prepared nodes after a foreign commit and database close", async (
   expect(reopened.paired).toEqual([]);
   expect(reopened.bindings.size).toBe(0);
 });
+
+test.each(["lookup", "pending", "bootstrap"] as const)(
+  "refreshes retained operator authority from the same current snapshot as an unrelated %s read",
+  async (kind) => {
+    const node = (await getPairedDevice("node", baseDir))!;
+    const operator = {
+      deviceId: "operator",
+      publicKey: "synthetic-operator-key",
+      roles: ["operator"],
+      approvedScopes: ["operator.read", "operator.write"],
+      tokens: {
+        operator: {
+          token: "synthetic-operator-token",
+          role: "operator",
+          scopes: ["operator.read", "operator.write"],
+          createdAtMs: 1,
+        },
+      },
+      createdAtMs: 1,
+      approvedAtMs: 1,
+    };
+    const persist = () =>
+      persistDevicePairingStoreState(
+        { pendingById: {}, pairedByDeviceId: { node, operator } },
+        baseDir,
+        "paired",
+      );
+    persist();
+    await getPairedDevice("operator", baseDir);
+    const identity = getPublishedOperatorPairingIdentity("operator", baseDir);
+    expect(identity).toEqual(expect.any(String));
+    const readUnrelated = () =>
+      kind === "lookup"
+        ? getPairedDevice("node", baseDir)
+        : kind === "pending"
+          ? getPendingDevicePairing("missing-request", baseDir)
+          : loadBoundDeviceBootstrapContextReadOnly(
+              {
+                token: "synthetic-unrelated-token",
+                deviceId: "node",
+                publicKey: "synthetic-node-key",
+                nowMs: Date.now(),
+              },
+              baseDir,
+            );
+    node.approvedAtMs++;
+    persist();
+    await readUnrelated();
+    expect(getPublishedOperatorPairingIdentity("operator", baseDir)).toBe(identity);
+    operator.tokens.operator.token = "synthetic-replaced-operator-token";
+    persist();
+    await readUnrelated();
+    expect(getPublishedOperatorPairingIdentity("operator", baseDir)).not.toBe(identity);
+    const replacedIdentity = getPublishedOperatorPairingIdentity("operator", baseDir);
+    expect(
+      await rotateDeviceToken({
+        deviceId: "operator",
+        role: "operator",
+        callerScopes: ["operator.admin"],
+        baseDir,
+      }),
+    ).toMatchObject({ ok: true });
+    expect(getPublishedOperatorPairingIdentity("operator", baseDir)).not.toBe(replacedIdentity);
+    expect(
+      await revokeDeviceToken({
+        deviceId: "operator",
+        role: "operator",
+        callerScopes: ["operator.admin"],
+        baseDir,
+      }),
+    ).toMatchObject({ ok: true });
+    expect(getPublishedOperatorPairingIdentity("operator", baseDir)).toBeNull();
+    operator.publicKey = "synthetic-replaced-operator-key";
+    persist();
+    await readUnrelated();
+    expect(getPublishedOperatorPairingIdentity("operator", baseDir)).not.toBe(replacedIdentity);
+    operator.roles = [];
+    persist();
+    await readUnrelated();
+    expect(getPublishedOperatorPairingIdentity("operator", baseDir)).toBeNull();
+    persistDevicePairingStoreState(
+      { pendingById: {}, pairedByDeviceId: { node } },
+      baseDir,
+      "paired",
+    );
+    await readUnrelated();
+    expect(getPublishedOperatorPairingIdentity("operator", baseDir)).toBeNull();
+  },
+);

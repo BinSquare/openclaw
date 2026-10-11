@@ -492,10 +492,21 @@ export async function loadControlUiSessionPullRequests(
       branchCache.release(deps.cacheSignal);
       return { pullRequests: [], rateLimited: false };
     }
-    const issues =
+    // Transcript enrichment must not delay admission to the shared PR refresh.
+    // Join both reads before releasing this caller's source and delivery authority.
+    const [issues, result] = await Promise.all([
       projection === "publication"
         ? undefined
-        : await readControlUiSessionIssueReferences(deps.read, context).catch(() => undefined);
+        : readControlUiSessionIssueReferences(deps.read, context).catch(() => undefined),
+      context.branch && context.branch !== context.defaultBranch
+        ? cachedBranchPullRequests(
+            context,
+            deps,
+            request.refresh === true,
+            JSON.stringify([target.identity, deps.read.sourceIdentity]),
+          ).catch(() => null)
+        : null,
+    ]);
     assertCurrent();
     const issueProjection = issues === undefined ? {} : { issues };
     const host = context.host ?? "github.com";
@@ -522,13 +533,6 @@ export async function loadControlUiSessionPullRequests(
         rateLimited: false,
       };
     }
-    const result = await cachedBranchPullRequests(
-      context,
-      deps,
-      request.refresh === true,
-      JSON.stringify([target.identity, deps.read.sourceIdentity]),
-    ).catch(() => null);
-    assertCurrent();
     if (!result) {
       // Local repository identity survives a cold PR lookup failure, but an
       // unknown PR list must not enable a Create PR row.

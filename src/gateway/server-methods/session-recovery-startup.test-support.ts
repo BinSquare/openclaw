@@ -105,7 +105,6 @@ export async function exerciseNativeStartup(
       target,
       sessionId,
       workerRoot,
-      true,
       source !== "reclaimed",
       undefined,
       preparedScenario,
@@ -185,9 +184,7 @@ export async function exerciseNativeStartup(
         const result = await runAttempt(params);
         return result;
       } catch (error) {
-        if (delayedOriginalResult) {
-          completed.resolve();
-        }
+        completed.resolve();
         attemptError = error instanceof Error ? error.message : String(error);
         throw error;
       }

@@ -596,7 +596,9 @@ export async function finalizeEmbeddedAgentCommand(params: {
               ? clearPendingFinalDelivery(entry, now)
               : { ...entry, updatedAt: now }),
             ...(clearUnclaimedRecoveryContext ? { restartRecoveryDeliveryContext: undefined } : {}),
-            ...(recoveryClaimEntry
+            // The recovered issuer is bound to this intent until its terminal write commits.
+            // Final cleanup clears the delivery claim after joining that write.
+            ...(recoveryClaimEntry && params.opts.mainRestartRecoveryAdmitted !== true
               ? buildMainSessionRecoverySettlementPatch({
                   entry: {
                     ...recoveryClaimEntry,

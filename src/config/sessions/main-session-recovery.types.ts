@@ -135,7 +135,12 @@ export function isCapturedMainRestartTurnCurrent(entry: InternalSessionEntry): b
     turn.lifecycleRevision === entry.lifecycleRevision &&
     entry.archivedAt === undefined &&
     !hasRestartRecoveryTerminalRun(entry, turn.runId) &&
-    !(entry.lastRunId === turn.runId && entry.status !== undefined),
+    // A restart records the interrupted run, but does not settle its accepted input.
+    !(
+      entry.lastRunId === turn.runId &&
+      entry.status !== undefined &&
+      entry.status !== "interrupted"
+    ),
   );
 }
 

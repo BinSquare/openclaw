@@ -69,6 +69,7 @@ function mainSessionRecoveryCycleChanged(before: SessionEntry, after: SessionEnt
     beforeState?.cycleId !== afterState?.cycleId ||
     beforeState?.chargedAttempts !== afterState?.chargedAttempts ||
     beforeState?.startedAttempt !== afterState?.startedAttempt ||
+    beforeState?.queuedInputsPending !== afterState?.queuedInputsPending ||
     !isDeepStrictEqual(beforeState?.reservation, afterState?.reservation) ||
     !isDeepStrictEqual(beforeState?.pause, afterState?.pause) ||
     !isDeepStrictEqual(beforeState?.acknowledgedPause, afterState?.acknowledgedPause) ||

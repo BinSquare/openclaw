@@ -1,5 +1,7 @@
 import { expectDefined } from "@openclaw/normalization-core/expect";
 import { expect } from "vitest";
+import { isCapturedMainRestartTurnCurrent } from "../../config/sessions/main-session-recovery.types.js";
+import { hasRestartRecoveryTerminalRun } from "../../config/sessions/restart-recovery-state.js";
 import { loadSessionEntry, replaceSessionEntry } from "../../config/sessions/session-accessor.js";
 import { persistGatewaySessionLifecycleEvent } from "../../gateway/session-lifecycle-state.js";
 import { getAgentEventLifecycleGeneration } from "../../infra/agent-events.js";
@@ -44,6 +46,18 @@ export async function retireOriginalAcceptedSourceFence(
   expect(retained.lifecycleRunId).toBeUndefined();
   expect(retained.restartRecoveryDeliverySourceRunId).toBeUndefined();
   expect(retained.restartRecoveryDeliveryRunId).toBeUndefined();
+  expect(
+    isCapturedMainRestartTurnCurrent(retained),
+    JSON.stringify({
+      sessionMatches: retained.mainRestartRecovery?.turnIntent?.sessionId === retained.sessionId,
+      lifecycleMatches:
+        retained.mainRestartRecovery?.turnIntent?.lifecycleRevision === retained.lifecycleRevision,
+      archived: retained.archivedAt !== undefined,
+      terminalMarked: hasRestartRecoveryTerminalRun(retained, runId),
+      lastIsOriginal: retained.lastRunId === runId,
+      status: retained.status,
+    }),
+  ).toBe(true);
   if (source === "conflicting") {
     // A conflicting claim is an independent refusal, even with valid original custody.
     await replaceSessionEntry(target, {

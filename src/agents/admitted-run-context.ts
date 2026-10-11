@@ -13,6 +13,7 @@ import type { GoalRecoveryIssuerBasis } from "../config/sessions/main-session-re
 import { composeSessionSourceAssertion } from "../config/sessions/session-source-authority.js";
 import type { GatewayOperatorRoleDefinition } from "../config/types.gateway.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import type { FactoryGitHubProofClaim } from "../gateway/factory-github-proof.js";
 import {
   captureAgentRunDelegatedSourceAssertion,
   claimAgentRunDelegatedAuthority,
@@ -58,6 +59,16 @@ export type AdmittedRunOperatorAuthority = Readonly<{
   createFactoryGitHubDispatchCredentialReader?: (
     target: FactoryGitHubDispatchTarget,
   ) => import("./github-credential-reader.js").GitHubCredentialReader | undefined;
+  /** Read proofs retain the original ingress actor, never a synthetic tool client. */
+  captureFactoryGitHubReadProof?: (target: {
+    claim: Extract<FactoryGitHubProofClaim, { purpose: "session-item-read" }>;
+    assertCurrent: () => void;
+  }) => {
+    actorId: number;
+    profileId: string;
+    claim: FactoryGitHubProofClaim;
+    assertCurrent: () => void;
+  };
   /** Original access dependency; null is proven independent, undefined is unclassified. */
   gatewayAccessGrant?: GatewayAccessGrantRef | null;
   assertCurrent: () => void;
@@ -147,6 +158,30 @@ export function createAdmittedRunOperatorAuthority(
               return token;
             })
           );
+        }
+      : undefined,
+    captureFactoryGitHubReadProof: source.captureFactoryGitHubReadProof
+      ? (
+          target: Parameters<
+            NonNullable<AdmittedRunOperatorAuthority["captureFactoryGitHubReadProof"]>
+          >[0],
+        ) => {
+          const assertReadCurrent = () => {
+            assertCurrent();
+            target.assertCurrent();
+            if (
+              !scopes.some((scope) =>
+                ["operator.read", "operator.write", "operator.admin"].includes(scope),
+              )
+            ) {
+              throw new Error("Factory GitHub reads require operator read authority");
+            }
+          };
+          assertReadCurrent();
+          return source.captureFactoryGitHubReadProof!({
+            ...target,
+            assertCurrent: assertReadCurrent,
+          });
         }
       : undefined,
     gatewayAccessGrant: source.gatewayAccessGrant

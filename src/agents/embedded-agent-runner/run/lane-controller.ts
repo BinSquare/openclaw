@@ -10,6 +10,7 @@ import { registerAgentRunCapacityWait } from "../../../infra/agent-run-capacity-
 import {
   claimAgentRunContext,
   getAgentRunContext,
+  getAgentRunContextOwnerStatus,
   retainQueuedAgentRunContext,
 } from "../../../infra/agent-run-registry.js";
 import { isBackgroundWorkLane } from "../../../process/background-work.js";
@@ -134,6 +135,9 @@ export function createEmbeddedRunLaneController<TParams extends LaneParams>(opti
     activeAttemptOwner = owner;
     const lifecycleGeneration = options.getLifecycleGeneration();
     const authority = getAdmittedRunDelegatedAuthority(input.admittedRunContext);
+    const runtimeOwner = authority
+      ? getAgentRunContext(authority.operationalRunInstance.runId)
+      : undefined;
     const signal = input.abortSignal
       ? AbortSignal.any([abortSignal, input.abortSignal])
       : abortSignal;
@@ -148,7 +152,23 @@ export function createEmbeddedRunLaneController<TParams extends LaneParams>(opti
       authority !== undefined &&
       getAdmittedRunDelegatedAuthority(input.admittedRunContext) === authority;
     const onAttemptDeadlineChanged = (deadline: CommandQueueTaskDeadline) => {
-      if (isCurrent()) {
+      // Receipt-time bookkeeping can run while this same turn's storage publication
+      // is pending. Check the captured execution owner, not source permission facts;
+      // execution, timeout and abort controls still use the full assertion above.
+      if (
+        state === "active" &&
+        activeAttemptOwner === owner &&
+        !signal.aborted &&
+        isAgentEventLifecycleGenerationCurrent(lifecycleGeneration) &&
+        authority !== undefined &&
+        runtimeOwner?.delegatedAuthority === authority &&
+        getAgentRunContext(authority.operationalRunInstance.runId) === runtimeOwner &&
+        getAgentRunContextOwnerStatus(
+          authority.operationalRunInstance.runId,
+          authority.claimId,
+          authority.lifecycleGeneration,
+        ) !== undefined
+      ) {
         deadlineOwned = true;
         setLaneTaskDeadline(deadline);
       }

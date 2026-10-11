@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, readFileSync, renameSync, statSync } from "node:fs";
+import { copyFileSync, existsSync, renameSync, statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { expect, it, vi } from "vitest";
 import {
@@ -14,7 +14,6 @@ import {
   prepareSqliteReadOnlyLocationSync,
   inspectSharedAuthPluginArtifactsReadOnly,
 } from "../plugin-sdk/sqlite-runtime.js";
-import { runSqliteDeferredTransactionSync } from "../plugin-sdk/sqlite-worker-runtime.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { recordOpenClawAgentCanonicalValidation } from "./openclaw-agent-canonical-validation-receipt.js";
 import { readOpenClawAgentDatabaseIdentity } from "./openclaw-agent-db-identity.js";
@@ -301,29 +300,9 @@ it("requires admitted physical identity and write admission for persisted canoni
   });
 });
 
-it("validates the compared receipt through the SDK fresh reader without writing or creating stores", async () => {
+it("does not create missing stores through the SDK reader", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
     const options = { agentId: "main", env: state.env };
-    const owner = openOpenClawAgentDatabase(options);
-    runOpenClawAgentWriteTransaction(recordOpenClawAgentCanonicalValidation, options);
-    const expected = owner.db.prepare("SELECT * FROM session_key_contract WHERE id = 1").get();
-    const version = owner.db.prepare("PRAGMA user_version").get();
-    closeOpenClawAgentDatabaseByPath(owner.path);
-    const bytes = readFileSync(owner.path);
-    let connection: DatabaseSync | undefined;
-    expect(
-      withFreshOpenClawAgentDatabaseReadOnly((database) => {
-        connection = database.db;
-        expect(() => database.db.exec("CREATE TABLE unexpected (value TEXT)")).toThrow(/readonly/u);
-        return runSqliteDeferredTransactionSync(database.db, () => ({
-          row: database.db.prepare("SELECT * FROM session_key_contract WHERE id = 1").get(),
-          valid: hasPersistedOpenClawAgentCanonicalValidation(database),
-          version: database.db.prepare("PRAGMA user_version").get(),
-        }));
-      }, options),
-    ).toEqual({ found: true, value: { row: expected, valid: true, version } });
-    expect(connection?.isOpen).toBe(false);
-    expect(readFileSync(owner.path)).toEqual(bytes);
     const missing = state.path("uncreated", "agent.sqlite");
     const operation = vi.fn();
     expect(

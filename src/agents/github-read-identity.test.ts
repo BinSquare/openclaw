@@ -7,9 +7,23 @@ import { resolveExecutablePath } from "../infra/executable-path.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { getOrCreatePromise } from "../shared/lazy-promise.js";
 import { withMockedPlatform } from "../test-utils/vitest-spies.js";
+import {
+  createGitHubCommandResult as commandResult,
+  githubTestLookupId as lookupId,
+  createGitHubLookupFrame as frame,
+} from "./github-identity-command.test-support.js";
 import { clearGitHubCredentialVerificationCache } from "./github-oauth-client.js";
 
-const mocks = vi.hoisted(() => ({ runCommandBuffered: vi.fn() }));
+const mocks = vi.hoisted(() => ({ runCommandBuffered: vi.fn(), info: vi.fn() }));
+vi.mock("../logging/subsystem.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../logging/subsystem.js")>();
+  return {
+    ...actual,
+    createSubsystemLogger: (name: string) =>
+      name === "agents/github-identity" ? { info: mocks.info } : actual.createSubsystemLogger(name),
+  };
+});
+beforeEach(() => mocks.info.mockReset());
 vi.mock("../process/exec.js", () => ({ runCommandBuffered: mocks.runCommandBuffered }));
 
 import {
@@ -18,6 +32,8 @@ import {
 } from "../config/runtime-snapshot.js";
 import {
   createGitHubReadIdentity,
+  GitHubCredentialLookupError,
+  GitHubIdentityError,
   readCachedNativeGitHubToken,
   readNativeGitHubToken,
   readGitAuthor,
@@ -30,15 +46,12 @@ import {
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
-function commandResult(stdout = "", code = 0, stderr = "") {
-  return {
-    stdout: Buffer.from(stdout),
-    stderr: Buffer.from(stderr),
-    code,
-    signal: null,
-    killed: false,
-    termination: "exit" as const,
-  };
+function expectLookup(diagnosticCode: string, client = {}, stage = "command") {
+  expect(mocks.info).toHaveBeenCalledWith("github identity lookup", {
+    stage,
+    diagnosticCode,
+    ...client,
+  });
 }
 
 describe("native GitHub identity absence", () => {
@@ -267,6 +280,7 @@ describe("native GitHub identity absence", () => {
       }),
     ).rejects.toMatchObject({ reason: "unverified" });
     expect(mocks.runCommandBuffered).not.toHaveBeenCalled();
+    expectLookup("invalid_executable");
   });
 
   it("preserves explicit undefined scrubs over inherited native environment tokens", async () => {
@@ -337,41 +351,124 @@ describe("native GitHub identity absence", () => {
   });
 
   it.each([
-    { label: "failed status", stdout: '{"hosts":{}}', code: 1 },
-    { label: "malformed status", stdout: "not JSON", code: 0 },
-    { label: "missing host map", stdout: "{}", code: 0 },
+    {
+      label: "failed status",
+      stdout: '{"hosts":{}}',
+      code: 1,
+      diagnostic: "nonzero_exit",
+      reason: "unverified",
+    },
+    {
+      label: "malformed status",
+      stdout: "not JSON",
+      code: 0,
+      diagnostic: "invalid_json",
+      reason: "unverified",
+    },
+    {
+      label: "missing host map",
+      stdout: "{}",
+      code: 0,
+      diagnostic: "invalid_hosts_schema",
+      reason: "unverified",
+    },
     {
       label: "unreadable account",
+      diagnostic: "configured_account_present",
+      reason: "unavailable",
       stdout: '{"hosts":{"github.com":[{"state":"error"}]}}',
       code: 0,
     },
-  ])("does not treat $label as anonymous native identity", async ({ stdout, code }) => {
-    const outputs: ReturnType<typeof commandResult>[] = [];
-    mocks.runCommandBuffered.mockImplementation(async (argv: string[]) => {
-      const result =
-        argv[2] === "status"
-          ? commandResult(stdout, code, "synthetic-native-diagnostic")
-          : commandResult("", 1, "synthetic-token-diagnostic");
-      outputs.push(result);
-      return result;
-    });
-    await expect(readNativeGitHubToken({}, true)).rejects.toThrow(
-      /could not be verified|credential is unavailable/u,
+  ])(
+    "does not treat $label as anonymous native identity",
+    async ({ stdout, code, diagnostic, reason }) => {
+      const outputs: ReturnType<typeof commandResult>[] = [];
+      mocks.runCommandBuffered.mockImplementation(async (argv: string[]) => {
+        const result =
+          argv[2] === "status"
+            ? commandResult(stdout, code, "synthetic-native-diagnostic")
+            : commandResult("", 1, "synthetic-token-diagnostic");
+        outputs.push(result);
+        return result;
+      });
+      const lookup = readNativeGitHubToken({}, true);
+      await expect(lookup).rejects.toBeInstanceOf(GitHubIdentityError);
+      await expect(lookup).rejects.toMatchObject({ reason });
+      expect(mocks.runCommandBuffered.mock.calls.map(([argv]) => argv)).toEqual([
+        ["gh", "auth", "token", "--hostname", "github.com"],
+        ["gh", "auth", "status", "--active", "--hostname", "github.com", "--json", "hosts"],
+      ]);
+      expect(
+        outputs.every(
+          ({ stdout: out, stderr }) =>
+            out.every((byte) => byte === 0) && stderr.every((byte) => byte === 0),
+        ),
+      ).toBe(true);
+      expectLookup("nonzero_exit");
+      expectLookup(diagnostic, {}, "auth_status");
+      expect(JSON.stringify(mocks.info.mock.calls)).not.toMatch(/synthetic.*diagnostic|not JSON/);
+      const statusOptions = mocks.runCommandBuffered.mock.calls[1]?.[1];
+      expect(statusOptions.timeoutMs).toBeGreaterThan(0);
+      expect(statusOptions.timeoutMs).toBeLessThanOrEqual(15_000);
+      expect(statusOptions.maxOutputBytes).toBe(32 * 1024);
+    },
+  );
+  it.each([
+    ["payload", "accepted", 200, 0],
+    ["transport", "broker_unavailable", undefined, 1],
+    ["transport", "deadline_exceeded", undefined, 1],
+    ["broker", "http_rejected", 403, 1],
+    ["parse", "response_unreadable", 200, 1],
+    ["payload", "invalid_credential_response", 200, 1],
+  ] as const)(
+    "preserves wrapper %s/%s diagnostics and scrubs child buffers",
+    async (clientStage, clientCode, httpStatus, code) => {
+      const result = commandResult(
+        "synthetic-private-token",
+        code,
+        frame(clientStage, clientCode, httpStatus),
+      );
+      const diagnostic = {
+        lookupId,
+        clientStage,
+        clientCode,
+        ...(httpStatus === undefined ? {} : { httpStatus }),
+      };
+      mocks.runCommandBuffered.mockResolvedValue(result);
+      if (code === 0) {
+        await expect(readNativeGitHubToken({})).resolves.toBe("synthetic-private-token");
+      } else {
+        const failed = readNativeGitHubToken({});
+        await expect(failed).rejects.toBeInstanceOf(GitHubCredentialLookupError);
+        await expect(failed).rejects.toMatchObject({ diagnostic });
+      }
+      expectLookup(code === 0 ? "token_accepted" : "nonzero_exit", diagnostic);
+      expect(result.stdout.every((byte) => byte === 0)).toBe(true);
+      expect(result.stderr.every((byte) => byte === 0)).toBe(true);
+      expect(JSON.stringify(mocks.info.mock.calls)).not.toContain("synthetic-private-token");
+    },
+  );
+
+  it.each([
+    ["extra content", 1, "", frame("broker", "http_rejected", 403) + "private customer content"],
+    ["forged stage", 1, "", frame("__proto__", "http_rejected", 403)],
+    ["accepted failure", 1, "", frame("payload", "accepted", 200)],
+    ["rejected success", 0, "synthetic-private-token", frame("broker", "http_rejected", 403)],
+  ] as const)("does not link %s to a wrapper lookup", async (_name, code, stdout, stderr) => {
+    mocks.runCommandBuffered.mockResolvedValue(commandResult(stdout, code, stderr));
+    await expect(readNativeGitHubToken({})).resolves.toBe(code === 0 ? stdout : undefined);
+    expectLookup(code === 0 ? "token_accepted" : "nonzero_exit");
+    expect(JSON.stringify(mocks.info.mock.calls)).not.toMatch(
+      /bbbbbbbb|private customer|synthetic-private-token|__proto__/,
     );
-    expect(mocks.runCommandBuffered.mock.calls.map(([argv]) => argv)).toEqual([
-      ["gh", "auth", "token", "--hostname", "github.com"],
-      ["gh", "auth", "status", "--active", "--hostname", "github.com", "--json", "hosts"],
-    ]);
-    expect(
-      outputs.every(
-        ({ stdout: out, stderr }) =>
-          out.every((byte) => byte === 0) && stderr.every((byte) => byte === 0),
-      ),
-    ).toBe(true);
-    const statusOptions = mocks.runCommandBuffered.mock.calls[1]?.[1];
-    expect(statusOptions.timeoutMs).toBeGreaterThan(0);
-    expect(statusOptions.timeoutMs).toBeLessThanOrEqual(15_000);
-    expect(statusOptions.maxOutputBytes).toBe(32 * 1024);
+  });
+
+  it("propagates unexpected native failures without logging private messages", async () => {
+    const failure = new Error("private process content");
+    mocks.runCommandBuffered.mockRejectedValue(failure);
+    await expect(readNativeGitHubToken({})).rejects.toBe(failure);
+    expectLookup("unknown");
+    expect(JSON.stringify(mocks.info.mock.calls)).not.toContain(failure.message);
   });
 });
 
@@ -752,42 +849,87 @@ describe("prepared GitHub read authority", () => {
     expect(publish).toHaveBeenCalledOnce();
   });
 
-  it("refreshes before read credential verification and fences native rotation without changing publication snapshots", async () => {
-    const config = { gateway: { controlUi: { github: { token: "resolved-preview-token" } } } };
-    const sourceConfig = {
-      gateway: {
-        controlUi: {
-          github: { token: { source: "env" as const, provider: "default", id: "GH_TOKEN" } },
+  it.each([false, true])(
+    "refreshes and fences native rotation, selection and publication snapshots (sink fails=%s)",
+    async (sinkFails) => {
+      let config: OpenClawConfig = {
+        gateway: { controlUi: { github: { token: "resolved-preview-token" } } },
+      };
+      const sourceConfig = {
+        gateway: {
+          controlUi: {
+            github: { token: { source: "env" as const, provider: "default", id: "GH_TOKEN" } },
+          },
         },
-      },
-    };
-    const env = { GH_TOKEN: "preview-only", GITHUB_TOKEN: "native-before" };
-    const refresh = vi.fn(async () => {
-      env.GITHUB_TOKEN = "native-refreshed";
-    });
-    const identity = await prepareGitHubReadIdentity({
-      ...readOptions(env, config),
-      sourceConfig,
-      refresh,
-    });
-    expect(refresh).toHaveBeenCalledOnce();
-    expect(identity.token).toBe("native-refreshed");
-    expect(identity.selection).toEqual({ source: "system-detected", accountId: 101 });
-    expect(identity).not.toHaveProperty("env");
-    expect(identity.cacheScope).not.toContain("native-refreshed");
-    await expect(identity.revalidate()).resolves.toBeUndefined();
-    const publication = await prepareGitHubPublicationIdentity({
-      config,
-      sourceConfig,
-      agentId: "main",
-      env,
-    });
-    env.GITHUB_TOKEN = "native-rotated";
-    await expect(identity.revalidate()).rejects.toThrow("identity changed");
-    expect(publication.env.GH_TOKEN).toBe("native-refreshed");
-    expect(publication.env.GH_ENTERPRISE_TOKEN).toBe("native-refreshed");
-    expect(JSON.stringify(mocks.runCommandBuffered.mock.calls)).not.toContain("preview-only");
-  });
+      };
+      const env = { GH_TOKEN: "preview-only", GITHUB_TOKEN: "native-before" };
+      const refresh = vi.fn(async () => {
+        env.GITHUB_TOKEN = "native-refreshed";
+      });
+      const identity = await prepareGitHubReadIdentity({
+        ...readOptions(env, config),
+        sourceConfig,
+        getCurrentConfig: () => config,
+        refresh,
+      });
+      expect(refresh).toHaveBeenCalledOnce();
+      expect(identity.token).toBe("native-refreshed");
+      expect(identity.selection).toEqual({ source: "system-detected", accountId: 101 });
+      expect(identity).not.toHaveProperty("env");
+      expect(identity.cacheScope).not.toContain("native-refreshed");
+      mocks.info.mockClear();
+      const dispatch = vi.fn(() => "read result");
+      await expect(identity.start(dispatch)).resolves.toBe("read result");
+      expect(dispatch).toHaveBeenCalledOnce();
+      expect(mocks.info).not.toHaveBeenCalled();
+      const publication = await prepareGitHubPublicationIdentity({
+        config,
+        sourceConfig,
+        agentId: "main",
+        env,
+      });
+      mocks.info.mockClear();
+      dispatch.mockClear();
+      env.GITHUB_TOKEN = "native-rotated";
+      if (sinkFails)
+        mocks.info.mockImplementationOnce(() => {
+          throw new Error("private sink error");
+        });
+      await expect(identity.start(dispatch)).rejects.toMatchObject({ reason: "changed" });
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(mocks.info).toHaveBeenCalledExactlyOnceWith("github identity rejected", {
+        diagnosticCode: "credential_changed",
+        source: "system-detected",
+        profileId: undefined,
+        expectedAccountId: 101,
+        credentialChanged: true,
+        expectedCredentialPresent: true,
+        currentCredentialPresent: true,
+      });
+      expect(JSON.stringify(mocks.info.mock.calls)).not.toMatch(
+        /native-refreshed|native-rotated|preview-only|private sink/,
+      );
+      mocks.info.mockClear();
+      config = { ...config, tools: { github: { profileId: `ghp_${"7".repeat(32)}` } } };
+      await expect(identity.start(dispatch)).rejects.toMatchObject({ reason: "changed" });
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(mocks.info).toHaveBeenCalledExactlyOnceWith("github identity rejected", {
+        diagnosticCode: "selection_changed",
+        expectedSource: "system-detected",
+        currentSource: "system-configured",
+        expectedProfileId: undefined,
+        currentProfileId: `ghp_${"7".repeat(32)}`,
+        expectedKind: undefined,
+        currentKind: undefined,
+      });
+      expect(JSON.stringify(mocks.info.mock.calls)).not.toMatch(
+        /native-refreshed|native-rotated|preview-only|private sink/,
+      );
+      expect(publication.env.GH_TOKEN).toBe("native-refreshed");
+      expect(publication.env.GH_ENTERPRISE_TOKEN).toBe("native-refreshed");
+      expect(JSON.stringify(mocks.runCommandBuffered.mock.calls)).not.toContain("preview-only");
+    },
+  );
 
   it("does not verify credentials after read authority closes during refresh", async () => {
     let active = true;

@@ -20,38 +20,28 @@ import { captureGatewayTurnIssuerAdmission } from "../../gateway/operator-run-au
 import { createGatewayInstanceRuntime } from "../../gateway/server-instance-runtime.js";
 import { handleGatewayRequest } from "../../gateway/server-methods.js";
 import { initializeSessionReadContext } from "../../gateway/server-methods/sessions-read-cache.test-support.js";
-import { createSessionLifecyclePersistenceOwner } from "../../gateway/session-lifecycle-persistence-owner.js";
 import { prepareRepositoryWorkerProjectSource } from "../../gateway/worker-environments/repository-project-admission.js";
 import {
   getAgentEventLifecycleGeneration,
-  onAgentRuntimeEvent,
   rotateAgentEventLifecycleGeneration,
 } from "../../infra/agent-events.js";
-import { captureAgentRunTerminalWriteContext } from "../../infra/agent-run-terminal-writes.js";
 import { removePairedDevice } from "../../infra/device-pairing.js";
 import { closeOpenClawAgentDatabasesAsync } from "../../state/openclaw-agent-db.js";
 import { resolveOpenClawAgentSqlitePath } from "../../state/openclaw-agent-db.paths.js";
 import { getSessionRepositoryWorkspaceStore } from "../../state/session-repository-workspaces.js";
 import { setCanonicalUserProfileRole } from "../../state/user-profile-writes.js";
-import { createTestGatewayScheduler } from "../../test-utils/gateway-scheduler-clock.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
-import {
-  readAdmittedRunOperatorAuthority,
-  assertOperatorModelAllowed,
-} from "../admitted-run-context.js";
-import { isDefinitiveRunLifecycle } from "../agent-run-terminal-outcome.js";
+import { assertOperatorModelAllowed } from "../admitted-run-context.js";
 import * as attemptRuntime from "../command/attempt-execution.runtime.js";
-import type { AgentHarnessV2 } from "../harness/types.js";
 import { refreshPreparedModelRuntimeSnapshots } from "../prepared-model-runtime.js";
-import { createAgentRunRestartAbortError } from "../run-termination.js";
-import {
-  createLegacyHeadRecoveryFixture,
-  createQueuedRecoveryGateway,
-} from "./main-session-recovery-legacy-head.test-support.js";
+import { createLegacyHeadRecoveryFixture } from "./main-session-recovery-legacy-head.test-support.js";
+import { installRecoveryModelLeaf } from "./main-session-recovery-model.test-support.js";
 import {
   createOriginalIssuerFixture,
+  createOriginalIssuerGateway,
   readIssuerFixtureHistory,
   pauseNewGoalDuringOriginalDrain,
+  startOriginalIssuerEvents,
 } from "./main-session-recovery-original-issuer.test-support.js";
 import {
   prepareQueuedNativeRecoveryFixture,
@@ -59,6 +49,7 @@ import {
   freshNativeRecoveryChanges,
   prepareQueuedNativeFixtureOwner,
   exerciseFreshQueuedNativeFixture,
+  type QueuedNativeModel,
 } from "./main-session-recovery-queued-native.test-support.js";
 import {
   markRestartAbortedMainSessions,
@@ -73,7 +64,7 @@ import * as recoveryStore from "./main-session-restart-recovery-store.js";
 
 export async function exerciseQueuedInputRecovery(
   change: (typeof queuedRecoveryChanges)[number] | (typeof freshNativeRecoveryChanges)[number],
-  nativeAttempt?: Mock<AgentHarnessV2["runAttempt"]>,
+  nativeAttempt?: Mock<QueuedNativeModel>,
 ) {
   await withOpenClawTestState({ label: "queued-original-issuers" }, async (state) => {
     vi.stubEnv("FACTORY_AUTH_MODE", "github");
@@ -98,31 +89,10 @@ export async function exerciseQueuedInputRecovery(
     const issuers = [first, second, third];
     const target = { agentId: "main", sessionKey: "agent:main:queued-issuers" };
     const sessionId = "queued-issuer-session";
-    const lifecycleScheduler = createTestGatewayScheduler();
-    const lifecyclePersistence = createSessionLifecyclePersistenceOwner(lifecycleScheduler);
-    let unsubscribeLifecycle = () => {};
+    let closeEvents = startOriginalIssuerEvents(first.context);
     let native: Awaited<ReturnType<typeof prepareQueuedNativeRecoveryFixture>> | undefined;
     let nextRuntime: ReturnType<typeof createGatewayInstanceRuntime> | undefined;
     try {
-      unsubscribeLifecycle = onAgentRuntimeEvent((event) => {
-        if (event.stream !== "lifecycle" || event.sessionKey !== target.sessionKey) {
-          return;
-        }
-        // Use the Gateway's real terminal owner and operational write join while
-        // the fixture replaces only external transport and the model attempt.
-        if (isDefinitiveRunLifecycle({ phase: event.data.phase, data: event.data })) {
-          const writeContext = captureAgentRunTerminalWriteContext(event.runId);
-          const persistence = lifecyclePersistence.observe({
-            ...target,
-            event,
-            ...(writeContext ? { writeContext } : {}),
-          });
-          writeContext?.track(persistence);
-          void first.work.track(() => persistence);
-        } else if (event.data.phase === "start") {
-          void first.work.track(() => lifecyclePersistence.persist({ ...target, event }));
-        }
-      });
       const repositoryUrl = nativeCase
         ? "https://microsoft.ghe.com/acme/accepted.git"
         : "https://microsoft.ghe.com/acme/queued-accepted.git";
@@ -235,98 +205,98 @@ export async function exerciseQueuedInputRecovery(
       const attemptedRuns: string[] = [];
       const attemptErrors: unknown[] = [];
 
-      const runAgentAttempt = attemptRuntime.runAgentAttempt;
-      vi.spyOn(attemptRuntime, "runAgentAttempt").mockImplementation(async (params) => {
-        const legacyResult = await legacy?.attempt(params);
-        if (legacyResult) {
-          return legacyResult;
+      const onFailure = (error: unknown) => {
+        if (phase === "recovery") {
+          attemptErrors.push(error);
+          completed.resolve();
+        } else {
+          reached.reject(error);
         }
-        if (phase === "original") {
-          reached.resolve();
-          await stopped.promise;
-          throw createAgentRunRestartAbortError();
-        }
-        if (nativeCase) {
-          attemptedRuns.push(params.runId);
+      };
+      if (!nativeCase) {
+        installRecoveryModelLeaf({
+          cfg: first.cfg,
+          registry: first.registry,
+          beforeAttempt: async (params) => {
+            if (phase === "original") {
+              reached.resolve();
+              await stopped.promise;
+            } else {
+              await legacy?.beforeAttempt(params);
+            }
+          },
+          failed: onFailure,
+          run: async (params, authority) => {
+            if (legacy?.run(params, authority)) {
+              return;
+            }
+            const expected = issuers[executionIndexes[effects.length]!]!;
+            const accepted = requests[executionIndexes[effects.length]!]!;
+            attemptedRuns.push(params.runId);
+            expect(authority.profileId).toBe(expected.profile.id);
+            expect(authority.scopes).toEqual(["operator.read", "operator.write"]);
+            assertOperatorModelAllowed(authority, { provider: "fixture", model: "allowed" });
+            authority.assertCurrent();
+            expect(params.sessionId).toBe(sessionId);
+            expect(params.sessionKey).toBe(target.sessionKey);
+            if (effects.length > 0) {
+              expect(params.runId).toBe(accepted.runId);
+              expect(params.body).toBe(accepted.text);
+            }
+            const reader = authority.createFactoryGitHubDispatchCredentialReader!({
+              ...target,
+              sessionId,
+              repositoryUrl,
+              assertCurrent: authority.assertCurrent,
+            });
+            const source = await prepareRepositoryWorkerProjectSource({
+              namespace: "queued-original",
+              repository: { agentId: "main", url: repositoryUrl, ref: "main" },
+              getConfig: brokerContext.getRuntimeConfig,
+              assertCurrent: authority.assertCurrent,
+              readNativeCredential: reader,
+            }).catch((error: unknown) => {
+              if (change === "late revoke" && effects.length === 1) {
+                lateDenied.resolve();
+              }
+              throw error;
+            });
+            expect(source.project.source.url).toBe(repositoryUrl);
+            effects.push({
+              runId: params.runId,
+              profileId: authority.profileId,
+              body: params.body,
+            });
+            if (blockedAll) {
+              completed.resolve();
+            }
+            if ((completesQueue || cancelled) && effects.length === expectedIndexes.length) {
+              completed.resolve();
+            }
+          },
+        });
+      } else {
+        const runAgentAttempt = attemptRuntime.runAgentAttempt;
+        vi.spyOn(attemptRuntime, "runAgentAttempt").mockImplementation(async (params) => {
           try {
+            if (phase === "original") {
+              reached.resolve();
+              await stopped.promise;
+            }
+            if (phase === "recovery") {
+              attemptedRuns.push(params.runId);
+            }
             const result = await runAgentAttempt(params);
             if (result.meta.error) {
-              attemptErrors.push(result.meta.error);
-              completed.resolve();
+              onFailure(result.meta.error);
             }
             return result;
           } catch (error) {
-            attemptErrors.push(error instanceof Error ? error.message : "unknown attempt error");
-            completed.resolve();
+            onFailure(error);
             throw error;
           }
-        }
-        const expected = issuers[executionIndexes[effects.length]!]!;
-        const accepted = requests[executionIndexes[effects.length]!]!;
-        const admitted = await params.preparedRunAdmission.admit("embedded");
-        attemptedRuns.push(params.runId);
-        const authority = readAdmittedRunOperatorAuthority(admitted)!;
-        expect(authority.profileId).toBe(expected.profile.id);
-        expect(authority.scopes).toEqual(["operator.read", "operator.write"]);
-        assertOperatorModelAllowed(authority, { provider: "fixture", model: "allowed" });
-        authority.assertCurrent();
-        expect(params.sessionId).toBe(sessionId);
-        expect(params.sessionKey).toBe(target.sessionKey);
-        if (effects.length > 0) {
-          expect(params.runId).toBe(accepted.runId);
-          expect(params.body).toBe(accepted.text);
-        }
-        await params.onAgentEvent({ stream: "lifecycle", data: { phase: "start" } });
-        await params.opts.onExecutionStarted?.();
-        const reader = authority.createFactoryGitHubDispatchCredentialReader!({
-          ...target,
-          sessionId,
-          repositoryUrl,
-          assertCurrent: authority.assertCurrent,
         });
-        const source = await prepareRepositoryWorkerProjectSource({
-          namespace: "queued-original",
-          repository: { agentId: "main", url: repositoryUrl, ref: "main" },
-          getConfig: brokerContext.getRuntimeConfig,
-          assertCurrent: authority.assertCurrent,
-          readNativeCredential: reader,
-        }).catch((error: unknown) => {
-          if (change === "late revoke" && effects.length === 1) {
-            lateDenied.resolve();
-          }
-          throw error;
-        });
-        expect(source.project.source.url).toBe(repositoryUrl);
-        const history = await readIssuerFixtureHistory(target, sessionId);
-        expect(
-          history.filter(
-            (message) =>
-              isRecord(message) &&
-              message.role === "user" &&
-              message.idempotencyKey === `${accepted.runId}:user`,
-          ),
-        ).toEqual([expect.objectContaining({ content: accepted.text })]);
-        effects.push({ runId: params.runId, profileId: authority.profileId, body: params.body });
-        if (blockedAll) {
-          completed.resolve();
-        }
-        if ((completesQueue || cancelled) && effects.length === expectedIndexes.length) {
-          completed.resolve();
-        }
-        return {
-          payloads: [{ text: "Accepted queued work completed" }],
-          meta: {
-            durationMs: 0,
-            agentMeta: {
-              sessionId,
-              provider: "fixture",
-              model: "allowed",
-              usage: { input: 0, output: 0, total: 0 },
-            },
-            stopReason: "stop",
-          },
-        };
-      });
+      }
       const warnings = vi.spyOn(mainSessionRecoveryLog, "warn");
       const recoveryFacts: unknown[] = [];
       try {
@@ -366,8 +336,18 @@ export async function exerciseQueuedInputRecovery(
               deliver: false,
             }),
           ).resolves.toMatchObject({ status: "accepted", runId: requests[index]!.runId });
+          if (index === 0) {
+            await Promise.race([
+              reached.promise,
+              first.work.runWhenIdle(async () => {
+                throw new Error(
+                  "Primary settled before attempt: " +
+                    JSON.stringify([...first.context.dedupe.values()]),
+                );
+              }),
+            ]);
+          }
         }
-        await reached.promise;
         const acceptedRows: SessionPendingInputRow[] = [];
         for (const [index, request] of requests.entries()) {
           const saved = await readSessionPendingInputStage(
@@ -413,15 +393,16 @@ export async function exerciseQueuedInputRecovery(
           })),
           isActiveRun: () => true,
         });
-        for (const request of requests.toReversed()) {
-          expect(
-            abortChatRunById(createChatAbortOps(first.context), {
-              runId: request.runId,
-              sessionKey: target.sessionKey,
-              stopReason: "restart",
-            }).aborted,
-          ).toBe(true);
-        }
+        // Followers are durably accepted before they acquire a run controller.
+        // Restart retires those pending admissions; it does not withdraw their input.
+        expect(
+          abortChatRunById(createChatAbortOps(first.context), {
+            runId: requests[0]!.runId,
+            sessionKey: target.sessionKey,
+            stopReason: "restart",
+          }).aborted,
+        ).toBe(true);
+        rotateAgentEventLifecycleGeneration();
         stopped.resolve();
         await first.work.runWhenIdle(() => {});
         await native?.settlePrevious();
@@ -503,6 +484,7 @@ export async function exerciseQueuedInputRecovery(
           issuer.original!.release();
           issuer.deviceSource.release();
         });
+        await closeEvents();
         first.runtime.close();
         rotateAgentEventLifecycleGeneration();
         await closeOpenClawAgentDatabasesAsync();
@@ -563,11 +545,12 @@ export async function exerciseQueuedInputRecovery(
             database.close();
           }
         }
-        const gateway = createQueuedRecoveryGateway(first);
+        const gateway = createOriginalIssuerGateway(first);
         const { context } = gateway;
         nextRuntime = gateway.runtime;
         brokerContext = context;
         first.context = context;
+        closeEvents = startOriginalIssuerEvents(context);
         if (native) {
           context.workerSessionPlacementService = native.placements;
         }
@@ -620,12 +603,34 @@ export async function exerciseQueuedInputRecovery(
             await lateDenied.promise;
           }
           await first.work.runWhenIdle(() => {});
+          const history = await readIssuerFixtureHistory(target, sessionId);
+          for (const index of expectedIndexes) {
+            expect(
+              history.filter(
+                (message) =>
+                  isRecord(message) &&
+                  message.role === "user" &&
+                  message.idempotencyKey === requests[index]!.runId + ":user",
+              ),
+              JSON.stringify({
+                credentialErrors: native?.credentialErrors(),
+                effects,
+                attemptedRuns,
+                attemptErrors: attemptErrors.map((error) =>
+                  error instanceof Error ? error.message : error,
+                ),
+              }),
+            ).toEqual([expect.objectContaining({ content: requests[index]!.text })]);
+          }
           const attemptsBeforeRepeatedStartup = [...attemptedRuns];
           expect(
             effects.map(({ profileId }) => profileId),
             JSON.stringify({
               warnings: warnings.mock.calls.map(([message]) => message),
               recoveryFacts,
+              attemptErrors: attemptErrors.map((error) =>
+                error instanceof Error ? error.message : error,
+              ),
             }),
           ).toEqual(expectedIndexes.map((index) => issuers[index]!.profile.id));
           expect(effects.slice(1).map(({ runId, body }) => ({ runId, body }))).toEqual(
@@ -634,7 +639,7 @@ export async function exerciseQueuedInputRecovery(
               .map((index) => ({ runId: requests[index]!.runId, body: requests[index]!.text })),
           );
           if (legacy) {
-            await legacy.exercise(state, gateway);
+            await legacy.exercise(state, gateway, closeEvents);
             return;
           }
           await markStartupOrphanedMainSessionsForRecovery({
@@ -686,11 +691,9 @@ export async function exerciseQueuedInputRecovery(
         await first.work.drain();
         await native?.close();
       } finally {
-        unsubscribeLifecycle();
         try {
-          await lifecyclePersistence.drain();
+          await closeEvents();
         } finally {
-          await lifecycleScheduler.stop();
           nativeAttempt?.mockReset();
           vi.restoreAllMocks();
           vi.unstubAllGlobals();

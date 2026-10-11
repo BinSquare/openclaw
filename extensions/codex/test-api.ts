@@ -66,6 +66,9 @@ export const loadCodexAbortTranscriptTestFixture = () =>
 export const loadCodexNodeAppServerTestFixture = () =>
   import("./src/node-app-server.runtime.test-support.js");
 
+export const loadCodexRecoveryQueueTestFixture = () =>
+  import("./src/app-server/recovery-queue.test-support.js");
+
 type CodexHarnessPromptSnapshot = {
   developerInstructions: string;
   parentLocalInstructions: string | null;

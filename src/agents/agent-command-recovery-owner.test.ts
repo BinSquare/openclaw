@@ -8,6 +8,10 @@ import {
   getAgentEventLifecycleGeneration,
   rotateAgentEventLifecycleGeneration,
 } from "../infra/agent-events.js";
+import {
+  getAgentRunContext,
+  hasAgentRunContextExecutionOwner,
+} from "../infra/agent-run-registry.js";
 import { beginSessionWorkAdmission } from "../sessions/session-lifecycle-admission.js";
 import { useSessionStoreTempDirs } from "../test-utils/session-state-cleanup.js";
 import { runWithAgentCommandRecoveryOwner } from "./agent-command-recovery-owner.js";
@@ -34,10 +38,11 @@ afterEach(() => {
 });
 
 describe("agent command restart recovery ownership", () => {
-  function createTarget() {
+  function createTarget(runId?: string) {
     const storePath = path.join(sessionDirs.make(), "sessions.json");
     return {
       sessionAgentId: "main",
+      runId,
       isNewSession: false,
       sessionId: "session-1",
       sessionKey,
@@ -57,6 +62,7 @@ describe("agent command restart recovery ownership", () => {
     target: T,
     overrides: Partial<Parameters<typeof runWithAgentCommandRecoveryOwner<T, unknown>>[0]> = {},
   ) {
+    target.runId ??= overrides.opts?.runId;
     return runWithAgentCommandRecoveryOwner({
       lifecycleGeneration: getAgentEventLifecycleGeneration(),
       mode: "claim",
@@ -66,6 +72,39 @@ describe("agent command restart recovery ownership", () => {
       ...overrides,
     });
   }
+
+  it.each(
+    [
+      { name: "omitted", raw: undefined, canonical: "session-1" },
+      { name: "padded", raw: "  canonical-run  ", canonical: "canonical-run" },
+      { name: "explicit", raw: "explicit-run", canonical: "explicit-run" },
+    ].flatMap((identity) => [false, true].map((fails) => ({ ...identity, fails }))),
+  )(
+    "owns the prepared $name run through command settlement (fails=$fails)",
+    async ({ raw, canonical, fails }) => {
+      const target = createTarget(canonical);
+      const operation = runWithAgentCommandRecoveryOwner({
+        lifecycleGeneration: getAgentEventLifecycleGeneration(),
+        mode: "claim",
+        opts: { runId: raw, sessionEffects: "internal" } as AgentCommandOpts,
+        prepare: async () => target,
+        run: async () => {
+          expect(hasAgentRunContextExecutionOwner(canonical)).toBe(true);
+          expect(getAgentRunContext(canonical)).toMatchObject({
+            sessionId: target.sessionId,
+            sessionKey: target.sessionKey,
+            agentId: target.sessionAgentId,
+          });
+          if (raw && raw !== canonical) expect(hasAgentRunContextExecutionOwner(raw)).toBe(false);
+          if (fails) throw new Error("command failed");
+          return "settled";
+        },
+      });
+      if (fails) await expect(operation).rejects.toThrow("command failed");
+      else await expect(operation).resolves.toBe("settled");
+      expect(hasAgentRunContextExecutionOwner(canonical)).toBe(false);
+    },
+  );
 
   function runningRecovery(lifecycleGeneration: string): Partial<SessionEntry> {
     return {
@@ -689,7 +728,7 @@ describe("agent command restart recovery ownership", () => {
     }
   });
 
-  it.each(["different predecessor", "actual run"] as const)(
+  it.each(["different predecessor", "actual run", "padded run"] as const)(
     "binds a transferred recovery lease to its %s",
     async (binding) => {
       const base = createTarget();
@@ -715,7 +754,7 @@ describe("agent command restart recovery ownership", () => {
               previousSessionId: "different-predecessor",
               sessionId: "successor-session",
             }
-          : base;
+          : { ...base, runId: "foreground-run" };
       const run = vi.fn(async () => {
         const entry = read(target);
         expect(entry?.restartRecoveryRuns).toContainEqual({
@@ -731,11 +770,13 @@ describe("agent command restart recovery ownership", () => {
         lifecycleGeneration,
         opts: {
           mainRestartRecoveryOwnerLease: claim.lease,
-          ...(binding === "actual run" ? { runId: "foreground-run" } : {}),
+          ...(binding !== "different predecessor"
+            ? { runId: binding === "padded run" ? "  foreground-run  " : "foreground-run" }
+            : {}),
         } as AgentCommandOpts,
         run,
       });
-      if (binding === "actual run") {
+      if (binding !== "different predecessor") {
         await expect(execution).resolves.toBe("ran");
         expect(run).toHaveBeenCalledOnce();
       } else {

@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
 import { sha256Hex } from "@openclaw/normalization-core/node-crypto";
 import { stableStringify } from "@openclaw/normalization-core/stable-stringify";
+import type { AdmittedRunOperatorAuthority } from "../agents/admitted-run-context.js";
 import type {
   GatewayOperatorRoleDefinition,
   GatewayOperatorRolesConfig,
@@ -42,4 +43,16 @@ export function haveSameOperatorRoleSourcePolicies(
     return false;
   }
   return isDeepStrictEqual(sourceRolePolicies(previous), sourceRolePolicies(next));
+}
+
+export function prepareRunRolePolicy(
+  role: ReturnType<typeof sourceRolePolicy>,
+): AdmittedRunOperatorAuthority["rolePolicy"] {
+  return role
+    ? {
+        sessionAccessCap: role.sessions.others,
+        sandboxRequired: role.sandbox === "required",
+        agents: role.agents,
+      }
+    : undefined;
 }

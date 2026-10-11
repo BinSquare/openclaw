@@ -1,6 +1,10 @@
 import { MAX_TIMER_TIMEOUT_MS } from "@openclaw/normalization-core/number-coercion";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { createDeferred } from "../../../../test/helpers/promise.js";
+import { retainPreparedSessionSharingFacts } from "../../../config/sessions/session-accessor.sqlite-entry-cache-publication-state.js";
+import { retainSessionEntryWorkerPublication } from "../../../config/sessions/session-accessor.sqlite-entry-cache-publication.js";
+import { projectSessionSharingEntry } from "../../../config/sessions/session-accessor.sqlite-entry-cache.types.js";
+import { SessionMutationFactsUnavailableError } from "../../../gateway/session-sharing-incognito.js";
 import {
   getAgentEventLifecycleGeneration,
   resetAgentEventsForTest,
@@ -20,10 +24,19 @@ const RUNTIME_TIMEOUT_MS = 120_000;
 const cleanups: Array<() => void | Promise<void>> = [];
 type LaneController = ReturnType<typeof createEmbeddedRunLaneController>;
 
-async function createRunController(overrides: Partial<RunEmbeddedAgentParams> = {}) {
+async function createRunController(
+  overrides: Partial<RunEmbeddedAgentParams> = {},
+  assertSourceCurrent?: Parameters<typeof prepareSystemAgentRunAdmission>[4],
+) {
   let lifecycleGeneration = getAgentEventLifecycleGeneration();
   const runId = overrides.runId ?? "attempt-controls-run";
-  const admission = prepareSystemAgentRunAdmission({}, runId, "main", "lane-controls-test");
+  const admission = prepareSystemAgentRunAdmission(
+    {},
+    runId,
+    "main",
+    "lane-controls-test",
+    assertSourceCurrent,
+  );
   cleanups.push(admission.close);
   const admittedRunContext = await admission.admit("embedded");
   let params: RunEmbeddedAgentParams & { sessionFile: string } = {
@@ -216,6 +229,61 @@ describe("runtime-owned lane deadline handoff", () => {
 });
 
 describe("attempt control authority", () => {
+  test("records a terminal deadline without reading pending sharing authority", async () => {
+    const sessionKey = "agent:main:deadline-publication";
+    const databaseIdentity = "deadline-publication-database";
+    const facts = retainPreparedSessionSharingFacts({
+      databaseIdentity: "file:" + databaseIdentity,
+      sessionKey,
+      entry: projectSessionSharingEntry({
+        sessionId: "queued-session",
+        updatedAt: 1,
+        lifecycleRevision: "deadline-lifecycle",
+      }),
+      membership: new Set<string>(),
+    });
+    cleanups.push(facts.release);
+    const assertSourceCurrent = vi.fn(() => {
+      if (!facts.readCurrent()) throw new SessionMutationFactsUnavailableError();
+    });
+    const { controller, createAttemptControls } = await createRunController(
+      {},
+      assertSourceCurrent,
+    );
+    const controls = createAttemptControls({ initialTimeoutMs: RUNTIME_TIMEOUT_MS });
+    const { observed, finish } = await holdLane(controller);
+    const publication = retainSessionEntryWorkerPublication({
+      agentId: "main",
+      storePath: "/fixture/deadline.sqlite",
+      databaseIdentity,
+    });
+    publication.begin([sessionKey], []);
+    try {
+      expect(facts.readCurrent()).toBeUndefined();
+      const sourceReads = assertSourceCurrent.mock.calls.length;
+      controls.onAttemptDeadlineChanged({
+        kind: "bounded",
+        deadlineAtMs: Date.now() + 2 * RUNTIME_TIMEOUT_MS,
+      });
+      expect(assertSourceCurrent).toHaveBeenCalledTimes(sourceReads);
+    } finally {
+      // Rollback ends the actual publication hold without supplying a fake commit receipt.
+      publication.settle(undefined, false);
+    }
+    expect(controls.isCurrent()).toBe(true);
+    await vi.advanceTimersByTimeAsync(RUNTIME_TIMEOUT_MS + EMBEDDED_RUN_LANE_TIMEOUT_GRACE_MS + 1);
+    expect(controller.abortSignal.aborted).toBe(false);
+    expect(getCommandLaneSnapshot(GLOBAL_LANE).activeCount).toBe(1);
+    finish();
+    await expect(observed).resolves.toMatchObject({ meta: { durationMs: 1 } });
+    facts.release();
+    expect(controls.isCurrent()).toBe(false);
+    expect(assertSourceCurrent.mock.results.at(-1)).toMatchObject({
+      type: "throw",
+      value: expect.any(SessionMutationFactsUnavailableError),
+    });
+  });
+
   test.each([
     ["closed", true],
     ["superseded", true],

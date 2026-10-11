@@ -30,80 +30,6 @@ vi.mock("../../auto-reply/reply/conversation-label-generator.js", () => ({
 
 const settledTurn = () => ({ released: Promise.resolve(false), settled: Promise.resolve() });
 
-it("does not hold worker dispatch admission while waiting for the first reply", async () => {
-  await withOpenClawTestState({ scenario: "minimal" }, async () => {
-    const cfg = { agents: { defaults: { model: { primary: "openai/gpt-5.6-sol" } } } };
-    const scope = {
-      agentId: "main",
-      sessionKey: "agent:main:dashboard:dispatch-title",
-      sessionId: "dispatch-title-session",
-      storePath: resolveOpenClawAgentSqlitePath({ agentId: "main" }),
-    };
-    await replaceSessionEntry(scope, { sessionId: scope.sessionId, updatedAt: 1 });
-    const firstReply = createDeferredCore<boolean>();
-    const titleStarted = createDeferredCore();
-    const titleResult = createDeferredCore<string>();
-    const failure = createDeferredCore<never>();
-    const context = createDirectChatContext({ getRuntimeConfig: () => cfg });
-    context.logGateway.warn = (message) => failure.reject(new Error(message));
-    generate.mockReset().mockImplementation(async () => {
-      titleStarted.resolve();
-      return await titleResult.promise;
-    });
-    scheduleChatDashboardSessionTitle(
-      {
-        ...scope,
-        admittedSessionId: scope.sessionId,
-        cfg,
-        context,
-        request: { rawMessage: "Continue the accepted repository work", normalizedAttachments: [] },
-      },
-      { released: firstReply.promise, settled: Promise.resolve() },
-    );
-    // This canonical admission queues behind any title lease already acquiring the same identities.
-    const turn = await beginSessionWorkAdmission({
-      scope: scope.storePath,
-      identities: [scope.sessionKey, scope.sessionId],
-      assertAllowed: () => {},
-    });
-    let drained: boolean | undefined;
-    try {
-      vi.useFakeTimers();
-      const dispatch = turn.run(() =>
-        runExclusiveSessionLifecycleMutation("placement-dispatch", {
-          scope: scope.storePath,
-          identities: [scope.sessionKey, scope.sessionId],
-          prepare: async () => {
-            drained = await interruptSessionWorkAdmissions({
-              scope: scope.storePath,
-              identities: [scope.sessionKey, scope.sessionId],
-              timeoutMs: SESSION_WORK_ADMISSION_DRAIN_TIMEOUT_MS,
-            });
-          },
-          run: async () => {},
-        }),
-      );
-      await vi.advanceTimersByTimeAsync(SESSION_WORK_ADMISSION_DRAIN_TIMEOUT_MS);
-      await dispatch;
-      expect(drained).toBe(true);
-      expect(generate).not.toHaveBeenCalled();
-    } finally {
-      vi.useRealTimers();
-      turn.release();
-      firstReply.resolve(false);
-      await Promise.race([titleStarted.promise, failure.promise]);
-      const released = getSessionWorkAdmissionRelease({
-        scope: scope.storePath,
-        identities: [scope.sessionKey],
-      });
-      titleResult.resolve("Accepted repository work");
-      await released;
-    }
-    expect(generate).toHaveBeenCalledOnce();
-    expect(loadSessionEntry(scope)?.displayName).toBe("Accepted repository work");
-  });
-});
-
 it.each([
   { titleSource: undefined, expectedSource: "Original release plan" },
   { titleSource: "Accepted worktree intent", expectedSource: "Accepted worktree intent" },
@@ -214,88 +140,121 @@ it("falls back after one label attempt when naming starts after its turn settled
   });
 });
 
-it("does not hold session admission across an unresolved dashboard title gate", async () => {
-  await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
-    const cfg = {
-      agents: { defaults: { model: { primary: "openai/gpt-5.6-sol" } } },
-    };
-    await state.writeConfig(cfg);
-    const scope = {
-      agentId: "main",
-      sessionKey: "agent:main:dashboard:rollover-title-gate",
-      sessionId: "rollover-title-gate-session",
-      storePath: resolveOpenClawAgentSqlitePath({ agentId: "main" }),
-    };
-    await replaceSessionEntry(scope, {
-      sessionId: scope.sessionId,
-      updatedAt: 1,
-    });
-    await appendTranscriptMessage(scope, {
-      cwd: state.workspaceDir,
-      message: { role: "user", content: "Original release plan", timestamp: 1 },
-    });
-    const ready = createDeferredCore<boolean>();
-    const started = createDeferredCore();
-    const generation = createDeferredCore<string>();
-    const failed = createDeferredCore<never>();
-    generate.mockReset().mockImplementation(async () => {
-      started.resolve();
-      return await generation.promise;
-    });
-    const context = createDirectChatContext({ getRuntimeConfig: () => cfg });
-    context.logGateway.warn = (message) => failed.reject(new Error(message));
-    const admissionQuery = {
-      scope: scope.storePath,
-      identities: [scope.sessionKey, scope.sessionId],
-    };
-    let released: Promise<void> | undefined;
-    let competing: { release: () => void } | undefined;
-    try {
-      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-      scheduleChatDashboardSessionTitle(
-        {
-          ...scope,
-          admittedSessionId: scope.sessionId,
-          cfg,
-          context,
-          request: { rawMessage: "A later follow-up", normalizedAttachments: [] },
-        },
-        { released: ready.promise, settled: Promise.resolve() },
-      );
-      for (let step = 0; step < 8; step += 1) {
+it.each([false, true])(
+  "keeps dispatch and title admission ordered with released=%s",
+  async (releasedTurn) => {
+    await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+      const cfg = {
+        agents: { defaults: { model: { primary: "openai/gpt-5.6-sol" } } },
+      };
+      await state.writeConfig(cfg);
+      const scope = {
+        agentId: "main",
+        sessionKey: "agent:main:dashboard:rollover-title-gate",
+        sessionId: "rollover-title-gate-session",
+        storePath: resolveOpenClawAgentSqlitePath({ agentId: "main" }),
+      };
+      await replaceSessionEntry(scope, {
+        sessionId: scope.sessionId,
+        updatedAt: 1,
+      });
+      await appendTranscriptMessage(scope, {
+        cwd: state.workspaceDir,
+        message: { role: "user", content: "Original release plan", timestamp: 1 },
+      });
+      const ready = createDeferredCore<boolean>();
+      const started = createDeferredCore();
+      const generation = createDeferredCore<string>();
+      const failed = createDeferredCore<never>();
+      generate.mockReset().mockImplementation(async () => {
+        started.resolve();
+        return await generation.promise;
+      });
+      const context = createDirectChatContext({ getRuntimeConfig: () => cfg });
+      context.logGateway.warn = (message) => failed.reject(new Error(message));
+      const admissionQuery = {
+        scope: scope.storePath,
+        identities: [scope.sessionKey, scope.sessionId],
+      };
+      let released: Promise<void> | undefined;
+      let competing: { release: () => void } | undefined;
+      let dispatchTurn: Awaited<ReturnType<typeof beginSessionWorkAdmission>> | undefined;
+      try {
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+        scheduleChatDashboardSessionTitle(
+          {
+            ...scope,
+            admittedSessionId: scope.sessionId,
+            cfg,
+            context,
+            request: { rawMessage: "A later follow-up", normalizedAttachments: [] },
+          },
+          { released: ready.promise, settled: Promise.resolve() },
+        );
+        for (let step = 0; step < 8; step += 1) {
+          await vi.advanceTimersByTimeAsync(0);
+        }
+        expect(generate).not.toHaveBeenCalled();
+        dispatchTurn = await beginSessionWorkAdmission({
+          ...admissionQuery,
+          assertAllowed: () => {},
+        });
+        let drained: boolean | undefined;
+        const dispatch = dispatchTurn.run(() =>
+          runExclusiveSessionLifecycleMutation("placement-dispatch", {
+            ...admissionQuery,
+            prepare: async () => {
+              drained = await interruptSessionWorkAdmissions({
+                ...admissionQuery,
+                timeoutMs: SESSION_WORK_ADMISSION_DRAIN_TIMEOUT_MS,
+              });
+            },
+            run: async () => {},
+          }),
+        );
+        await vi.advanceTimersByTimeAsync(SESSION_WORK_ADMISSION_DRAIN_TIMEOUT_MS);
+        await dispatch;
+        expect(drained).toBe(true);
+        expect(generate).not.toHaveBeenCalled();
+        dispatchTurn.release();
+        expect(getSessionWorkAdmissionRelease(admissionQuery)).toBeUndefined();
+        const titleDrain = interruptSessionWorkAdmissions({ ...admissionQuery, timeoutMs: 0 });
         await vi.advanceTimersByTimeAsync(0);
+        await expect(titleDrain).resolves.toBe(true);
+
+        competing = await beginSessionWorkAdmission({
+          scope: scope.storePath,
+          identities: ["agent:main:dashboard:competing-title-lease"],
+          assertAllowed: () => {},
+        });
+        const competingDrain = interruptSessionWorkAdmissions({
+          scope: scope.storePath,
+          identities: ["agent:main:dashboard:competing-title-lease"],
+          timeoutMs: 0,
+        });
+        await vi.advanceTimersByTimeAsync(0);
+        await expect(competingDrain).resolves.toBe(false);
+
+        ready.resolve(releasedTurn);
+        await vi.advanceTimersByTimeAsync(0);
+        await Promise.race([started.promise, failed.promise]);
+        released = getSessionWorkAdmissionRelease(admissionQuery);
+        expect(released).toBeDefined();
+        expect(generate).toHaveBeenCalledOnce();
+      } finally {
+        dispatchTurn?.release();
+        competing?.release();
+        ready.resolve(releasedTurn);
+        generation.resolve("Original release plan");
+        try {
+          await Promise.race([started.promise, failed.promise]);
+          await (released ?? getSessionWorkAdmissionRelease(admissionQuery));
+        } finally {
+          vi.useRealTimers();
+        }
       }
-      expect(getSessionWorkAdmissionRelease(admissionQuery)).toBeUndefined();
-      const titleDrain = interruptSessionWorkAdmissions({ ...admissionQuery, timeoutMs: 0 });
-      await vi.advanceTimersByTimeAsync(0);
-      await expect(titleDrain).resolves.toBe(true);
-
-      competing = await beginSessionWorkAdmission({
-        scope: scope.storePath,
-        identities: ["agent:main:dashboard:competing-title-lease"],
-        assertAllowed: () => {},
-      });
-      const competingDrain = interruptSessionWorkAdmissions({
-        scope: scope.storePath,
-        identities: ["agent:main:dashboard:competing-title-lease"],
-        timeoutMs: 0,
-      });
-      await vi.advanceTimersByTimeAsync(0);
-      await expect(competingDrain).resolves.toBe(false);
-
-      ready.resolve(true);
-      await vi.advanceTimersByTimeAsync(0);
-      await Promise.race([started.promise, failed.promise]);
-      released = getSessionWorkAdmissionRelease(admissionQuery);
-      expect(released).toBeDefined();
       expect(generate).toHaveBeenCalledOnce();
-    } finally {
-      competing?.release();
-      ready.resolve(true);
-      generation.resolve("Original release plan");
-      await released;
-      vi.useRealTimers();
-    }
-    expect(loadSessionEntry(scope)?.displayName).toBe("Original release plan");
-  });
-});
+      expect(loadSessionEntry(scope)?.displayName).toBe("Original release plan");
+    });
+  },
+);

@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parse as parseYaml } from "yaml";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { resolveCommandEnv } from "../process/exec-spawn.js";
+import { createGitHubCommandResult as commandResult } from "./github-identity-command.test-support.js";
 import { clearGitHubCredentialVerificationCache } from "./github-oauth-client.js";
 
 const processMocks = vi.hoisted(() => ({ runCommandBuffered: vi.fn() }));
@@ -27,17 +28,6 @@ import {
 } from "./github-tool-identity.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
-
-function commandResult(stdout = "", code = 0, stderr = "") {
-  return {
-    stdout: Buffer.from(stdout),
-    stderr: Buffer.from(stderr),
-    code,
-    signal: null,
-    killed: false,
-    termination: "exit" as const,
-  };
-}
 
 async function writeProfile(profileDir: string, token: string) {
   await fs.mkdir(profileDir, { recursive: true, mode: 0o700 });

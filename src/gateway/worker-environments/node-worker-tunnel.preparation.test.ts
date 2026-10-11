@@ -1,7 +1,10 @@
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
-import { NODE_WORKER_ENVIRONMENT_STOP_COMMAND } from "../../infra/node-commands.js";
+import {
+  NODE_WORKER_ENVIRONMENT_STOP_COMMAND,
+  NODE_WORKER_WORKSPACE_EXEC_COMMAND,
+} from "../../infra/node-commands.js";
 import { NodeWorkerWorkspaceRuntime } from "../../node-host/node-worker-workspace.js";
 import { closeOpenClawStateDatabaseAsync } from "../../state/openclaw-state-db.js";
 import {
@@ -96,18 +99,27 @@ describe("node workspace preparation projection", () => {
         sessionKey: "agent:main:session-1",
       }));
       const handle = await manager.start(startRequest());
+      const commandIndex = invoke.mock.calls.length;
       const operation = handle.runWorkspaceCommand({
         argv: [NODE_WORKSPACE_DRAIN_COMMAND],
         transportRetry: "never",
       });
       if (kind === "image") {
         await expect(operation).resolves.toMatchObject({ code: 0, stdout: "drained\n" });
-        expect(invoke.mock.calls.at(-1)![0].params).not.toHaveProperty("preparationKey");
       } else {
         await expect(operation).rejects.toThrow(
           "prepared workspace registration is missing or changed",
         );
-        expect(invoke.mock.calls.at(-1)![0].params).toMatchObject({
+      }
+      // Exclude the startup drain and any later failure-cleanup drain.
+      const request = invoke.mock.calls[commandIndex]![0];
+      expect(request.command).toBe(NODE_WORKER_WORKSPACE_EXEC_COMMAND);
+      const input = parseNodeWorkerWorkspaceExecInput(JSON.stringify(request.params));
+      expect(input.argv).toEqual([NODE_WORKSPACE_DRAIN_COMMAND]);
+      if (kind === "image") {
+        expect(input).not.toHaveProperty("preparationKey");
+      } else {
+        expect(input).toMatchObject({
           preparationKey: preparation.key,
           sessionKey: "agent:main:session-1",
         });

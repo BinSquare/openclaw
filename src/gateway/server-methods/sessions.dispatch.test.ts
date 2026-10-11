@@ -9,6 +9,11 @@ import {
   setActivePluginRegistry,
 } from "../../plugins/runtime.js";
 import { sessionChanges } from "../../sessions/session-row-changes.js";
+import {
+  ensureCanonicalUserProfileForEmail,
+  setCanonicalUserProfileRole,
+} from "../../state/user-profile-writes.js";
+import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { handleGatewayRequest } from "../server-methods.js";
 import { createWorkerPlacementMoveService } from "../worker-environments/placement-move-service.js";
 import { FORCED_WORKER_ABANDONMENT_ERROR } from "../worker-environments/placement-record.js";
@@ -20,12 +25,13 @@ import {
   getSessionDispatchHandler,
   invokeSessionDispatch as invoke,
   invokeSessionMove,
+  invokeSessionReclaim,
   makeDispatchTestContext as makeContext,
   makeFailedPlacement as failedPlacementRecord,
+  makeActivePlacement as activePlacementRecord,
   makeReclaimedPlacement as reclaimedPlacementRecord,
   makeSessionTarget as targetWithEntry,
 } from "./sessions-dispatch.test-support.js";
-import { registerSessionReclaimCases } from "./sessions-reclaim.test-harness.js";
 import type { GatewayRequestContext, RespondFn } from "./types.js";
 
 const mocks = getDispatchTestMocks();
@@ -50,16 +56,6 @@ function useWorktreeSession(
   });
 }
 
-function activePlacementRecord(): Extract<WorkerSessionPlacementRecord, { state: "active" }> {
-  return {
-    ...reclaimedPlacementRecord(),
-    state: "active",
-    recoveryError: null,
-    terminalReason: null,
-    terminalAtMs: null,
-  };
-}
-
 function dispatchContext(
   dispatch: NonNullable<GatewayRequestContext["workerPlacementDispatchService"]>["dispatch"],
 ): GatewayRequestContext {
@@ -78,32 +74,6 @@ function expectDispatchError(
     false,
     undefined,
     expect.objectContaining({ code, message }),
-  );
-}
-
-function reclaimActivePlacement(): WorkerSessionPlacementRecord {
-  return { ...activePlacementRecord(), generation: 3, updatedAtMs: 1 };
-}
-
-function reclaimContext(
-  placement: () => WorkerSessionPlacementRecord,
-  reclaim: NonNullable<GatewayRequestContext["workerPlacementDispatchService"]>["reclaim"],
-  overrides: Partial<GatewayRequestContext> = {},
-) {
-  return makeContext({
-    ...overrides,
-    workerPlacementDispatchService: { dispatch: vi.fn(), reclaim },
-    workerSessionPlacementService: {
-      getMany: () => new Map([[sessionId, placement()]]),
-    },
-  });
-}
-
-function expectReclaimed(respond: unknown, state = "reclaimed") {
-  expect(respond).toHaveBeenCalledWith(
-    true,
-    expect.objectContaining({ ok: true, placement: expect.objectContaining({ state }) }),
-    undefined,
   );
 }
 
@@ -725,123 +695,129 @@ describe("sessions.dispatch", () => {
     );
   });
   it("keeps explicit Cloud dispatch inside the write role's live profile grant", async () => {
-    useWorktreeSession(
-      { createdActor: { type: "human", source: "profile", id: "engineer-profile" } },
-      "/repo/worktree",
-    );
-    let allowedProfiles = ["test"];
-    const dispatch = vi
-      .fn<NonNullable<GatewayRequestContext["workerPlacementDispatchService"]>["dispatch"]>()
-      .mockResolvedValue(activePlacementRecord());
-    const context = makeContext({
-      getRuntimeConfig: () => ({
-        cloudWorkers: { profiles: { test: { provider: "fake" }, other: { provider: "fake" } } },
-        gateway: {
-          roles: {
-            default: "observer",
-            definitions: {
-              observer: { sessions: { others: "view" }, agents: [], scopes: ["operator.read"] },
-              engineer: {
-                sessions: { others: "write" },
-                agents: ["main"],
-                scopes: ["operator.read", "operator.write"],
-                workerProfiles: allowedProfiles,
+    await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      const profile = await ensureCanonicalUserProfileForEmail(
+        "cloud-dispatch-engineer@example.test",
+      );
+      await setCanonicalUserProfileRole(profile.id, "engineer");
+      useWorktreeSession(
+        { createdActor: { type: "human", source: "profile", id: profile.id } },
+        "/repo/worktree",
+      );
+      let allowedProfiles = ["test"];
+      const dispatch = vi
+        .fn<NonNullable<GatewayRequestContext["workerPlacementDispatchService"]>["dispatch"]>()
+        .mockResolvedValue(activePlacementRecord());
+      const context = makeContext({
+        getRuntimeConfig: () => ({
+          cloudWorkers: { profiles: { test: { provider: "fake" }, other: { provider: "fake" } } },
+          gateway: {
+            roles: {
+              default: "observer",
+              definitions: {
+                observer: { sessions: { others: "view" }, agents: [], scopes: ["operator.read"] },
+                engineer: {
+                  sessions: { others: "write" },
+                  agents: ["main"],
+                  scopes: ["operator.read", "operator.write"],
+                  workerProfiles: allowedProfiles,
+                },
               },
             },
           },
-        },
-      }),
-      workerPlacementDispatchService: { dispatch },
-      workerSessionPlacementService: { getMany: () => new Map() },
-    });
-    const request = async (scope: "operator.read" | "operator.write", profileId: string) => {
-      const respond = vi.fn();
-      await handleGatewayRequest({
-        req: {
-          type: "req",
-          id: `dispatch-${scope}-${profileId}`,
-          method: "sessions.dispatch",
-          params: { key: sessionKey, profileId },
-        },
-        respond,
-        client: {
-          connId: `conn-${scope}-${profileId}`,
-          authenticatedUserProfile: {
-            profileId: "engineer-profile",
-            displayName: null,
-            hasAvatar: false,
-            updatedAt: 1,
-          },
-          preparedSessionProfile: {
-            profileId: "engineer-profile",
-            aliases: new Set(["engineer-profile"]),
-            role: "engineer",
-          },
-          connect: {
-            role: "operator",
-            scopes: [scope],
-            client: { id: "test", version: "1", platform: "test", mode: "test" },
-            minProtocol: 1,
-            maxProtocol: 1,
-          },
-        },
-        isWebchatConnect: () => false,
-        context,
-        extraHandlers: { "sessions.dispatch": getSessionDispatchHandler() },
+        }),
+        workerPlacementDispatchService: { dispatch },
+        workerSessionPlacementService: { getMany: () => new Map() },
       });
-      return respond;
-    };
-    for (const [scope, profile] of [
-      ["operator.read", "test"],
-      ["operator.write", "other"],
-    ] as const) {
-      const denied = await request(scope, profile);
-      expect(denied).toHaveBeenCalledWith(
+      const request = async (scope: "operator.read" | "operator.write", profileId: string) => {
+        const respond = vi.fn();
+        await handleGatewayRequest({
+          req: {
+            type: "req",
+            id: `dispatch-${scope}-${profileId}`,
+            method: "sessions.dispatch",
+            params: { key: sessionKey, profileId },
+          },
+          respond,
+          client: {
+            connId: `conn-${scope}-${profileId}`,
+            authenticatedUserProfile: {
+              profileId: profile.id,
+              displayName: null,
+              hasAvatar: false,
+              updatedAt: 1,
+            },
+            preparedSessionProfile: {
+              profileId: profile.id,
+              aliases: new Set([profile.id]),
+              role: "engineer",
+            },
+            connect: {
+              role: "operator",
+              scopes: [scope],
+              client: { id: "test", version: "1", platform: "test", mode: "test" },
+              minProtocol: 1,
+              maxProtocol: 1,
+            },
+          },
+          isWebchatConnect: () => false,
+          context,
+          extraHandlers: { "sessions.dispatch": getSessionDispatchHandler() },
+        });
+        return respond;
+      };
+      for (const [scope, profile] of [
+        ["operator.read", "test"],
+        ["operator.write", "other"],
+      ] as const) {
+        const denied = await request(scope, profile);
+        expect(denied).toHaveBeenCalledWith(
+          false,
+          undefined,
+          expect.objectContaining({ code: ErrorCodes.FORBIDDEN }),
+        );
+        expect(dispatch).not.toHaveBeenCalled();
+      }
+      const allowed = await request("operator.write", "test");
+      expect(allowed).toHaveBeenCalledWith(true, expect.objectContaining({ ok: true }), undefined);
+      expect(dispatch).toHaveBeenCalledWith(
+        expect.objectContaining({ profileId: "test", runSetupScript: false }),
+        expect.any(Function),
+        expect.any(Function),
+        undefined,
+      );
+
+      useWorktreeSession(
+        { createdActor: { type: "human", source: "profile", id: "other-profile" } },
+        "/repo/worktree",
+      );
+      const foreign = await request("operator.write", "test");
+      expect(foreign).toHaveBeenCalledWith(
         false,
         undefined,
         expect.objectContaining({ code: ErrorCodes.FORBIDDEN }),
       );
-      expect(dispatch).not.toHaveBeenCalled();
-    }
-    const allowed = await request("operator.write", "test");
-    expect(allowed).toHaveBeenCalledWith(true, expect.objectContaining({ ok: true }), undefined);
-    expect(dispatch).toHaveBeenCalledWith(
-      expect.objectContaining({ profileId: "test", runSetupScript: false }),
-      expect.any(Function),
-      expect.any(Function),
-      undefined,
-    );
+      expect(dispatch).toHaveBeenCalledOnce();
+      useWorktreeSession(
+        { createdActor: { type: "human", source: "profile", id: profile.id } },
+        "/repo/worktree",
+      );
 
-    useWorktreeSession(
-      { createdActor: { type: "human", source: "profile", id: "other-profile" } },
-      "/repo/worktree",
-    );
-    const foreign = await request("operator.write", "test");
-    expect(foreign).toHaveBeenCalledWith(
-      false,
-      undefined,
-      expect.objectContaining({ code: ErrorCodes.FORBIDDEN }),
-    );
-    expect(dispatch).toHaveBeenCalledOnce();
-    useWorktreeSession(
-      { createdActor: { type: "human", source: "profile", id: "engineer-profile" } },
-      "/repo/worktree",
-    );
-
-    const effect = vi.fn();
-    dispatch.mockImplementationOnce(async (_target, _onTransition, authorize) => {
-      allowedProfiles = [];
-      authorize?.();
-      effect();
-      return activePlacementRecord();
+      const effect = vi.fn();
+      dispatch.mockImplementationOnce(async (_target, _onTransition, authorize) => {
+        allowedProfiles = [];
+        authorize?.();
+        effect();
+        return activePlacementRecord();
+      });
+      const revoked = await request("operator.write", "test");
+      expect(revoked).toHaveBeenCalledWith(
+        false,
+        undefined,
+        expect.objectContaining({ code: ErrorCodes.FORBIDDEN }),
+      );
+      expect(effect).not.toHaveBeenCalled();
     });
-    const revoked = await request("operator.write", "test");
-    expect(revoked).toHaveBeenCalledWith(
-      false,
-      undefined,
-      expect.objectContaining({ code: ErrorCodes.FORBIDDEN }),
-    );
-    expect(effect).not.toHaveBeenCalled();
   });
 
   it("requires admin before resolving a configured project profile", async () => {
@@ -1022,10 +998,51 @@ describe("sessions.dispatch", () => {
     expect(changes.mock.calls).toEqual([[{ sessionKey }], [{ sessionKey }]]);
     expect(recordPlacementMoveError).not.toHaveBeenCalled();
   });
-  registerSessionReclaimCases({
-    useWorktreeSession,
-    reclaimActivePlacement,
-    reclaimContext,
-    expectReclaimed,
+  it("delegates a failed placement's local recovery to the reclaim owner", async () => {
+    useWorktreeSession();
+    const failed = {
+      ...reclaimedPlacementRecord(),
+      state: "failed",
+      environmentId: null,
+      activeOwnerEpoch: null,
+      workspaceBaseManifestRef: null,
+      remoteWorkspaceDir: null,
+      workerBundleHash: null,
+      recoveryError: "device worker is offline",
+      terminalReason: "device worker is offline",
+    } as WorkerSessionPlacementRecord;
+    const local = {
+      ...failed,
+      state: "local",
+      generation: failed.generation + 1,
+      recoveryError: null,
+      terminalReason: null,
+      terminalAtMs: null,
+    } as WorkerSessionPlacementRecord;
+    const reclaim = vi.fn().mockResolvedValue(local);
+    const recovery = { recoverToGateway: { expectedGeneration: failed.generation } };
+    const respond = await invokeSessionReclaim(
+      makeContext({
+        workerPlacementDispatchService: { dispatch: vi.fn(), reclaim },
+        workerSessionPlacementService: { getMany: () => new Map([[sessionId, failed]]) },
+      }),
+      undefined,
+      recovery,
+    );
+
+    expect(reclaim).toHaveBeenCalledExactlyOnceWith(
+      {
+        sessionId,
+        sessionKey,
+        agentId: "main",
+        ...recovery,
+      },
+      undefined,
+    );
+    expect(respond).toHaveBeenCalledWith(
+      true,
+      expect.objectContaining({ ok: true, placement: expect.objectContaining({ state: "local" }) }),
+      undefined,
+    );
   });
 });

@@ -271,3 +271,13 @@ export async function invokeSessionReclaim(
   });
   return respond;
 }
+
+export function makeActivePlacement(): Extract<WorkerSessionPlacementRecord, { state: "active" }> {
+  return {
+    ...makeReclaimedPlacement(),
+    state: "active",
+    recoveryError: null,
+    terminalReason: null,
+    terminalAtMs: null,
+  };
+}

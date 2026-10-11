@@ -641,7 +641,11 @@ async function stagePreparedPendingInput(
         assertPrepared(
           facts,
           () => {
-            assertAcceptance();
+            // The committed input may invalidate its own reviewed source snapshot.
+            // Keep its admitted caller and the exact published database current instead
+            // of reapplying the pre-commit acceptance predicate to the new state.
+            owner!.assertCurrent();
+            assertSourceCurrent();
             assertAgentRunLifecycleGenerationCurrent(lifecycleGeneration);
             registerSessionPendingInputOwner(owner!);
           },

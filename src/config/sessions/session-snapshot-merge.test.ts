@@ -544,40 +544,47 @@ describe("session snapshot merge", () => {
     expect(merged.mainRestartRecovery).toEqual(current.mainRestartRecovery);
   });
 
-  it("clears recovery after lifecycle settlement consumes its run fence", () => {
-    const initialRecovery: SessionEntry = {
-      ...initial,
-      abortedLastRun: true,
-      restartRecoveryRuns: [
-        { runId: "interrupted-run", lifecycleGeneration: "generation-1" },
-        { runId: "recovery-run", lifecycleGeneration: "generation-1" },
-      ],
-      mainRestartRecovery: {
-        cycleId: "cycle-1",
-        revision: 3,
-        chargedAttempts: 1,
-      },
-    };
-    const next: SessionEntry = {
-      ...initialRecovery,
-      updatedAt: 2,
-      abortedLastRun: false,
-      restartRecoveryRuns: undefined,
-      mainRestartRecovery: undefined,
-    };
-    const current: SessionEntry = {
-      ...structuredClone(initialRecovery),
-      updatedAt: 3,
-      abortedLastRun: false,
-      restartRecoveryRuns: [{ runId: "interrupted-run", lifecycleGeneration: "generation-1" }],
-    };
+  it.each([false, true])(
+    "settles consumed lifecycle fences while retaining queued input=%s",
+    (queued) => {
+      const initialRecovery: SessionEntry = {
+        ...initial,
+        abortedLastRun: true,
+        restartRecoveryRuns: [
+          { runId: "interrupted-run", lifecycleGeneration: "generation-1" },
+          { runId: "recovery-run", lifecycleGeneration: "generation-1" },
+        ],
+        mainRestartRecovery: {
+          cycleId: "cycle-1",
+          revision: 3,
+          chargedAttempts: 1,
+        },
+      };
+      const next: SessionEntry = {
+        ...initialRecovery,
+        updatedAt: 2,
+        abortedLastRun: false,
+        restartRecoveryRuns: undefined,
+        mainRestartRecovery: undefined,
+      };
+      const current: SessionEntry = {
+        ...structuredClone(initialRecovery),
+        updatedAt: 3,
+        abortedLastRun: false,
+        restartRecoveryRuns: [{ runId: "interrupted-run", lifecycleGeneration: "generation-1" }],
+        mainRestartRecovery: {
+          ...initialRecovery.mainRestartRecovery!,
+          ...(queued ? { queuedInputsPending: true as const } : {}),
+        },
+      };
 
-    const merged = mergeSessionSnapshotChanges({ initial: initialRecovery, next, current });
+      const merged = mergeSessionSnapshotChanges({ initial: initialRecovery, next, current });
 
-    expect(merged.abortedLastRun).toBe(false);
-    expect(merged.restartRecoveryRuns).toBeUndefined();
-    expect(merged.mainRestartRecovery).toBeUndefined();
-  });
+      expect(merged.abortedLastRun).toBe(false);
+      expect(merged.restartRecoveryRuns).toEqual(queued ? current.restartRecoveryRuns : undefined);
+      expect(merged.mainRestartRecovery).toEqual(queued ? current.mainRestartRecovery : undefined);
+    },
+  );
 
   it("preserves every concurrent owner and interruption until lifecycle settlement", () => {
     const initialRecovery: SessionEntry = {

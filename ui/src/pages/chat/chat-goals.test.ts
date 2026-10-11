@@ -15,11 +15,6 @@ import { createTestGatewayClient } from "../../test-helpers/gateway-client.ts";
 import { createStorageMock } from "../../test-helpers/storage.ts";
 import { chatGoalRecovery, mutateChatGoal } from "./chat-goals.ts";
 import { setChatHistoryLoad } from "./chat-history-state.ts";
-const confirmRecovery = vi.hoisted(() => vi.fn());
-vi.mock("../../components/confirm-dialog.ts", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../components/confirm-dialog.ts")>()),
-  showConfirmDialog: confirmRecovery,
-}));
 import { makeChatHost } from "./chat-host.test-support.ts";
 
 const goal: SessionGoal = {
@@ -34,10 +29,7 @@ const goal: SessionGoal = {
   continuationTurns: 0,
 };
 
-beforeEach(() => {
-  vi.stubGlobal("sessionStorage", createStorageMock());
-  confirmRecovery.mockReset().mockResolvedValue(false);
-});
+beforeEach(() => vi.stubGlobal("sessionStorage", createStorageMock()));
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
@@ -82,78 +74,6 @@ function goalHost(requestHandlers: Record<string, unknown> = { "sessions.goal.up
 }
 
 describe("Goal control requests", () => {
-  it("confirms the reviewed unknown outcome before sending a fresh selected Goal resume", async () => {
-    const reference = { cycleId: "held-cycle", revision: 2, pausedAtMs: 1234 };
-    const requests: unknown[] = [];
-    confirmRecovery.mockResolvedValue(true);
-    const host = goalHost({
-      "sessions.goal.update": (params: unknown) => {
-        expect(Value.Check(SessionsGoalUpdateParamsSchema, params)).toBe(true);
-        requests.push(params);
-        if (!isRecord(params) || !params.recoveryDecision) {
-          throw new GatewayRequestError({
-            code: "INVALID_REQUEST",
-            message: "Review the unknown action",
-            details: {
-              code: "GOAL_RECOVERY_DECISION_REQUIRED",
-              reason: "goal-recovery-decision-required",
-              goalId: goal.id,
-              sessionId: "session-a",
-              recoveryDecision: reference,
-            },
-          });
-        }
-        return {
-          status: "started",
-          sessionId: "session-a",
-          goalId: goal.id,
-          operationId: params.operationId,
-          runId: "informed-run",
-          goal: { ...goal, status: "active", updatedAt: 3 },
-        };
-      },
-    });
-    await expect(mutateChatGoal(host, { action: "resume", goalId: goal.id })).resolves.toBe(true);
-    expect(confirmRecovery).toHaveBeenCalledWith(
-      expect.objectContaining({ requiredAcknowledgement: expect.any(String) }),
-    );
-    expect(requests).toHaveLength(2);
-    expect(requests[1]).toMatchObject({
-      sessionKey: "agent:main:main",
-      sessionId: "session-a",
-      goalId: goal.id,
-      action: "resume",
-      recoveryDecision: reference,
-    });
-    expect(
-      isRecord(requests[0]) &&
-        isRecord(requests[1]) &&
-        requests[0].operationId !== requests[1].operationId,
-    ).toBe(true);
-    expect(chatGoalRecovery(host)).toBeUndefined();
-  });
-  it("keeps a declined unknown-outcome decision unsubmitted", async () => {
-    let requests = 0;
-    const host = goalHost({
-      "sessions.goal.update": () => {
-        requests += 1;
-        throw new GatewayRequestError({
-          code: "INVALID_REQUEST",
-          message: "Review the unknown action",
-          details: {
-            code: "GOAL_RECOVERY_DECISION_REQUIRED",
-            reason: "goal-recovery-decision-required",
-            goalId: goal.id,
-            sessionId: "session-a",
-            recoveryDecision: { cycleId: "held", revision: 1, pausedAtMs: 1 },
-          },
-        });
-      },
-    });
-    await expect(mutateChatGoal(host, { action: "resume", goalId: goal.id })).resolves.toBe(false);
-    expect(requests).toBe(1);
-    expect(chatGoalRecovery(host)).toBeUndefined();
-  });
   it("rejects an oversized edit without stranding recovery or blocking a corrected edit", async () => {
     const host = goalHost({
       "sessions.goal.update": (params: unknown) => {

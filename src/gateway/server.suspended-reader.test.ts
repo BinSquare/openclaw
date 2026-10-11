@@ -10,6 +10,7 @@ import { loadChatRoute } from "../../ui/src/pages/chat/route-loader.ts";
 import { createSessionRouteContext } from "../../ui/src/pages/chat/route-resolution.test-support.ts";
 import { isMissingPathError } from "../infra/errors.js";
 import { currentSuspension } from "../infra/gateway-suspend-coordinator-state.js";
+import * as suspendCoordinator from "../infra/gateway-suspend-coordinator.js";
 import {
   onGatewaySuspendAdmissionChange,
   resetGatewayWorkAdmission,
@@ -20,6 +21,7 @@ import { resolveOpenClawAgentSqlitePath } from "../state/openclaw-agent-db.paths
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 import * as profileReads from "../state/user-profile-reads.js";
 import { getGatewayProcessInstanceId } from "./process-instance.js";
+import * as activeWork from "./server-active-work.js";
 import { createGatewaySuspendedReaderFixture } from "./server-close.metadata.test-support.js";
 import { gatewayKernelLogs } from "./server-kernel.js";
 import type { GatewayReaderReceipt } from "./server-public.js";
@@ -64,6 +66,25 @@ it("joins native writer custody before the registered reader receipt and retains
       fileURLToPath(new URL("../../../../lobster/teamclaw-release-lobster-16598", import.meta.url)),
     );
   }
+  let inspectorsRetired = false;
+  const inspected = vi.fn();
+  const createInspectors = activeWork.createGatewayServerActiveWorkInspectors;
+  using inspectorFactory = vi
+    .spyOn(activeWork, "createGatewayServerActiveWorkInspectors")
+    .mockImplementation((context) => {
+      const actual = createInspectors(context);
+      assert(actual.getChatRuns);
+      const read = actual.getChatRuns;
+      return {
+        ...actual,
+        getChatRuns: () => {
+          inspected();
+          if (inspectorsRetired) throw new Error("Retired application inspector called");
+          return read();
+        },
+      };
+    });
+  using coordinatorPrepare = vi.spyOn(suspendCoordinator, "prepareGatewaySuspendedReader");
   const readerFixture = await createGatewaySuspendedReaderFixture(
     pairedSelected ? { port: 18789, roleName: "administrator" } : {},
   );
@@ -93,6 +114,7 @@ it("joins native writer custody before the registered reader receipt and retains
   if (pairedSelected) {
     expect(port).toBe(18789);
   }
+  using nativePrepare = vi.spyOn(readerFixture.server, "prepareReader");
   const closeErrors = vi.spyOn(gatewayKernelLogs.log, "error");
   let writerSettled = false;
   let paired: PairedReader | undefined;
@@ -288,9 +310,8 @@ it("joins native writer custody before the registered reader receipt and retains
       const retirement =
         pairedRetirement ??
         client.request("gateway.suspend.reader", request).then((response) => {
-          expect(response.ok, JSON.stringify(response)).toBe(true);
           delivered = true;
-          return response.payload;
+          return response;
         });
       await Promise.race([
         enteredWriterJoin.promise,
@@ -336,15 +357,71 @@ it("joins native writer custody before the registered reader receipt and retains
       const deniedUi = await fetch(`http://127.0.0.1:${port}/`, { headers: { origin } });
       expect(deniedUi.status).toBe(401);
       await paired?.assertJoining();
+      const acceptedReader = coordinatorPrepare.mock.calls.find(
+        ([params]) => params.suspensionId === payload.suspensionId,
+      )?.[0];
+      assert(acceptedReader);
+      expect(acceptedReader.owner).toBe(readerFixture.host.capability.externalRestart);
+      if (!paired) nativeClient.authenticatedUserId = guestPrincipal;
       finishWriterJoin.resolve();
-      const receipt = await retirement;
+      const result = await retirement;
+      assert(held.reader);
+      const receipt = paired ? result : await held.reader.receipt;
       writerSettled = true;
+      if (!paired) {
+        expect(result).toMatchObject({ type: "res", ok: false, error: { code: "UNAVAILABLE" } });
+        expect(client.socket.readyState).toBe(client.socket.OPEN);
+        await expect(
+          suspendCoordinator.prepareGatewaySuspendedReader(acceptedReader),
+        ).rejects.toThrow("Gateway requester authority changed");
+        nativeClient.authenticatedUserId = before.user;
+      }
+      expect(nativePrepare).toHaveBeenCalledOnce();
+      expect(held.reader.owner).toBe(acceptedReader.owner);
+      expect(held.reader.expiresAtMs).toBe(expiresAtMs);
       expect(receipt).toMatchObject({
         version: 1,
         status: "reader-ready",
         ...request.target,
         expiresAtMs: request.expiresAtMs,
       });
+      if (!paired) {
+        expect(inspected).toHaveBeenCalled();
+        const inspectionCount = inspected.mock.calls.length;
+        inspectorsRetired = true;
+        const captured = await privateControl.request("gateway.suspend.status", {
+          ...payload,
+          includeLifecycle: true,
+        });
+        expect(captured).toMatchObject({
+          ok: true,
+          payload: {
+            status: "ready",
+            ownerId: "reader-replacement",
+            expiresAtMs,
+            writeCustody: held.reader.snapshot.writeCustody,
+          },
+        });
+        expect(inspected).toHaveBeenCalledTimes(inspectionCount);
+        const replay = await privateControl.request("gateway.suspend.reader", request);
+        expect(replay).toMatchObject({ ok: true, payload: receipt });
+        expect(replay.payload).toEqual(receipt);
+        expect(held.reader.owner).toBe(acceptedReader.owner);
+        expect(held.reader.expiresAtMs).toBe(expiresAtMs);
+        const changed = await privateControl.request("gateway.suspend.reader", {
+          ...request,
+          expiresAtMs: expiresAtMs + 1,
+        });
+        expect(changed).toMatchObject({
+          ok: false,
+          error: {
+            message: "Gateway reader retirement is already bound to another deadline or owner",
+          },
+        });
+        expect(coordinatorPrepare.mock.calls.at(-1)?.[0].request.expiresAtMs).toBe(expiresAtMs + 1);
+        expect(nativePrepare).toHaveBeenCalledOnce();
+        expect(inspected).toHaveBeenCalledTimes(inspectionCount);
+      }
       const frozen = await fs.readFile(resolveOpenClawStateSqlitePath());
       const readWal = (path: string) =>
         fs.readFile(`${path}-wal`).catch((error: unknown) => {

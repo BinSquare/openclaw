@@ -2,20 +2,25 @@ import fs from "node:fs/promises";
 import { expectDefined } from "@openclaw/normalization-core/expect";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { expect, type Mock } from "vitest";
+import { loadSessionEntry } from "../../config/sessions/session-accessor.js";
+import { listSessionPendingInputs } from "../../config/sessions/session-accessor.pending-inputs.js";
 import { prepareGoalRecoveryNativeFixture } from "../../gateway/server-methods/session-goal-recovery-native.test-support.js";
 import { prepareRepositoryWorkerProjectSource } from "../../gateway/worker-environments/repository-project-admission.js";
+import { hasAgentRunContextExecutionOwner } from "../../infra/agent-run-registry.js";
 import { getPluginRuntimeGatewayRequestScope } from "../../plugins/runtime/gateway-request-scope.js";
 import { buildRunUserTurnIdempotencyKey } from "../../sessions/user-turn-transcript.js";
 import { createDeferredCore } from "../../shared/deferred.js";
-import { makeAttemptResult } from "../embedded-agent-runner/run.overflow-compaction.fixture.js";
+import { resolveActiveEmbeddedRunOwner } from "../embedded-agent-runner/runs.js";
 import type { AgentHarnessV2 } from "../harness/types.js";
-import { makeAgentAssistantMessage } from "../test-helpers/agent-message-fixtures.js";
 import { getGatewayToolCallerIdentity } from "../tools/gateway-caller-context.js";
 import { installFactoryRestartRepositoryFixture } from "./main-session-recovery-factory-read.test-support.js";
 import {
   type createOriginalIssuerFixture,
   readIssuerFixtureHistory,
 } from "./main-session-recovery-original-issuer.test-support.js";
+export type QueuedNativeModel = (
+  params: Parameters<AgentHarnessV2["runAttempt"]>[0],
+) => Promise<void>;
 
 type NativeQueuedParams = Parameters<typeof prepareQueuedNativeRecoveryFixture>[0];
 export const freshNativeRecoveryChanges = [
@@ -62,9 +67,9 @@ export async function prepareQueuedNativeFixtureOwner(
   const firstNativeStarted = createDeferredCore();
   const releaseFirstNative = createDeferredCore();
   const repositoryProof = installFactoryRestartRepositoryFixture({
+    ...(params.nativeCase ? { allowPublicationPreflight: true as const } : {}),
     ...(params.failedBeforeSelection
       ? {
-          allowPublicationPreflight: true as const,
           repositorySnapshot: () => native?.failedRecovery?.repositorySnapshot,
         }
       : {}),
@@ -179,7 +184,9 @@ export async function exerciseFreshQueuedNativeFixture(
         expect(native!.credentialErrors()).toContain(
           "Unallocated worker recovery repository profile changed",
         );
-        expect(attemptErrors).toEqual([
+        expect(
+          attemptErrors.map((error) => (error instanceof Error ? error.message : error)),
+        ).toEqual([
           "The effective GitHub identity could not be verified; retry or reconnect the agent's GitHub identity.",
         ]);
         expect(native!.coldAllocations()).toBe(0);
@@ -190,18 +197,57 @@ export async function exerciseFreshQueuedNativeFixture(
       if (index === 0) {
         await Promise.race([
           firstNativeStarted.promise,
+          first.work.runWhenIdle(() => {
+            throw new Error(
+              "Fresh native turn settled before model entry: " +
+                JSON.stringify(
+                  [...first.context.dedupe.values()].map(({ ok, error }) => ({ ok, error })),
+                ),
+            );
+          }),
           completed.promise.then(() => {
             throw new Error(
-              `Fresh first native turn did not acquire its owner: ${JSON.stringify(attemptErrors)}`,
+              `Fresh first native turn did not acquire its owner: ${JSON.stringify(attemptErrors.map((error) => (error instanceof Error ? error.message : error)))}`,
             );
           }),
         ]);
+        expect(resolveActiveEmbeddedRunOwner(sessionId)).toMatchObject({
+          runId: requests[0]!.runId,
+        });
       }
     }
   } finally {
     releaseFirstNative.resolve();
   }
-  await completed.promise;
+  await Promise.race([
+    completed.promise,
+    first.work.runWhenIdle(async () => {
+      if (effects.length !== requests.length) {
+        const pending = await listSessionPendingInputs({ ...target, sessionId });
+        throw new Error(
+          "Native queue became idle before FIFO completed: " +
+            JSON.stringify({
+              effects,
+              attemptedRuns,
+              attemptErrors: attemptErrors.map((error) =>
+                error instanceof Error ? error.message : error,
+              ),
+              pending: pending.items.map(({ runId, state }) => ({ runId, state })),
+              entry: {
+                status: loadSessionEntry(target)?.status,
+                recovery: loadSessionEntry(target)?.mainRestartRecovery,
+              },
+              responses: [...first.context.dedupe.entries()].map(([key, value]) => ({
+                key,
+                ok: value.ok,
+                error: value.error,
+                status: isRecord(value.payload) ? value.payload.status : undefined,
+              })),
+            }),
+        );
+      }
+    }),
+  ]);
   await first.work.runWhenIdle(() => {});
   const fetchOutcomes = await Promise.allSettled(
     repositoryProof.fetchFixture.mock.results.flatMap((result) =>
@@ -224,6 +270,17 @@ export async function exerciseFreshQueuedNativeFixture(
   expect(effects.map(({ runId, body }) => ({ runId, body }))).toEqual(
     requests.map(({ runId, text }) => ({ runId, body: text })),
   );
+  expect(requests.some(({ runId }) => hasAgentRunContextExecutionOwner(runId))).toBe(false);
+  const history = await readIssuerFixtureHistory(target, sessionId);
+  for (const request of requests) {
+    expect(
+      history.filter(
+        (message) =>
+          isRecord(message) &&
+          message.idempotencyKey === buildRunUserTurnIdempotencyKey(request.runId),
+      ),
+    ).toEqual([expect.objectContaining({ role: "user", content: request.text })]);
+  }
   expect(native!.coldAllocations()).toBe(0);
   expect(native!.redispatches()).toBe(1);
   const warm = expectDefined(native!.warmReceipt(), "original warm reserve receipt");
@@ -246,7 +303,7 @@ export async function prepareQueuedNativeRecoveryFixture(params: {
   target: { agentId: string; sessionKey: string };
   sessionId: string;
   workerRoot: string;
-  nativeAttempt: Mock<AgentHarnessV2["runAttempt"]>;
+  nativeAttempt: Mock<QueuedNativeModel>;
   requests: readonly { runId: string; text: string }[];
   issuers: readonly Awaited<ReturnType<typeof createOriginalIssuerFixture>>[];
   effects: Array<{ runId: string; profileId: string; body: string }>;
@@ -271,7 +328,6 @@ export async function prepareQueuedNativeRecoveryFixture(params: {
     params.target,
     params.sessionId,
     params.workerRoot,
-    true,
     params.failedBeforeSelection && !params.failedBeforeActivation,
     params.repositoryProof,
     params.failedBeforeSelection ? "warm" : undefined,
@@ -356,15 +412,6 @@ export async function prepareQueuedNativeRecoveryFixture(params: {
     });
     expect(source.project.source.url).toBe(native.repository.url);
     assertCurrent();
-    const history = await readIssuerFixtureHistory(params.target, params.sessionId);
-    expect(
-      history.filter(
-        (message) =>
-          isRecord(message) &&
-          message.idempotencyKey === buildRunUserTurnIdempotencyKey(accepted.runId),
-      ),
-    ).toEqual([expect.objectContaining({ role: "user", content: accepted.text })]);
-    assertCurrent();
     const tunnel = await expectDefined(
       native.environments.startTunnel,
       "current native transport",
@@ -393,16 +440,6 @@ export async function prepareQueuedNativeRecoveryFixture(params: {
     if (params.effects.length === params.executionIndexes.length) {
       params.onCompleted();
     }
-    return makeAttemptResult({
-      terminal: { kind: "ok" },
-      sessionIdUsed: params.sessionId,
-      agentHarnessId: "codex",
-      assistantTexts: ["Accepted native queued input completed"],
-      lastAssistant: makeAgentAssistantMessage({
-        content: [{ type: "text", text: "Accepted native queued input completed" }],
-        timestamp: Date.now(),
-      }),
-    });
   });
   return native;
 }

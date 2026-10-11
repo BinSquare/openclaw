@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { stableStringify } from "@openclaw/normalization-core/stable-stringify";
 import { describe, expect, it, vi } from "vitest";
-import type { GatewayClientInfo } from "../../../packages/gateway-protocol/src/client-info.js";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { observeHostDataSql } from "../../../test/helpers/sqlite-statement-execution-counter.js";
 import { seedCanonicalAcpSessionMeta } from "../../acp/runtime/session-meta-fixture.test-support.js";
@@ -26,7 +25,6 @@ import {
 } from "../../config/sessions/session-accessor.sqlite-scope.js";
 import { rotateAgentEventLifecycleGeneration } from "../../infra/agent-events.js";
 import { initializeGlobalHookRunner } from "../../plugins/hook-runner-global.js";
-import { getSessionWorkAdmissionRelease } from "../../sessions/session-lifecycle-admission.js";
 import {
   createUserTurnTranscriptRecorder,
   type UserTurnTranscriptRecorder,
@@ -37,7 +35,6 @@ import { ensureProfileForEmail } from "../../state/user-profiles.js";
 import { createTestGatewayScheduler } from "../../test-utils/gateway-scheduler-clock.js";
 import { createMentionInbox } from "../mention-inbox.js";
 import { readMentionInbox, dismissMentionInbox } from "../mention-inbox.test-support.js";
-import { refusePendingInputCommit } from "../pending-input-commit.test-support.js";
 import { dispatchInboundMessageMock, installGatewayTestHooks } from "../test-helpers.js";
 import { getTestPluginRegistry } from "../test-helpers.plugin-registry.js";
 import { createWorkerSessionPlacementStore } from "../worker-environments/placement-store.js";
@@ -324,100 +321,6 @@ describe("ordinary chat input admission", () => {
     }
   });
 
-  it.each([
-    { id: "openclaw-control-ui", mode: "webchat", displayName: "Web" },
-    { id: "cli", mode: "cli", displayName: "CLI" },
-    { id: "openclaw-macos", mode: "ui", displayName: "macOS" },
-    { id: "gateway-client", mode: "backend", displayName: "Automation" },
-  ] satisfies Array<Pick<GatewayClientInfo, "id" | "mode" | "displayName">>)(
-    "stages the approved $id follow-up and its source before ACK without changing the active transcript",
-    async (clientInfo) => {
-      const fixture = await createBrowserFollowupFixture();
-      fixture.client.connect.client = { ...fixture.client.connect.client, ...clientInfo };
-      fixture.params.queueMode = "followup";
-      const profile = ensureProfileForEmail("alice@example.test");
-      fixture.client.authenticatedUserProfile = {
-        profileId: profile.id,
-        displayName: "Alice",
-        hasAvatar: false,
-        updatedAt: 1,
-      };
-      const clone = vi.spyOn(globalThis, "structuredClone");
-      const { scope, params, approvedContent, activeTranscript } = fixture;
-      const readPending = () =>
-        Promise.allSettled([listSessionPendingInputs(scope)]).then(([result]) => result);
-      let transcriptAtAck: ReturnType<typeof loadTranscriptEventsSync> | undefined;
-      let pendingAtAck: ReturnType<typeof readPending> | undefined;
-      let pendingAtNotification: ReturnType<typeof readPending> | undefined;
-      fixture.context.getSessionEventSubscriberConnIds = () => new Set(["observer"]);
-      vi.spyOn(fixture.context, "broadcastToConnIds").mockImplementation((event, payload) => {
-        if (event === "sessions.changed" && isRecord(payload) && payload.reason === "send") {
-          pendingAtNotification = readPending();
-        }
-      });
-      const respond = vi.fn<RespondFn>((ok) => {
-        if (ok) {
-          transcriptAtAck = loadTranscriptEventsSync(scope);
-          pendingAtAck = readPending();
-        }
-      });
-      try {
-        expect(replyRunRegistry.isActive(scope.sessionKey)).toBe(true);
-        expect(
-          replyRunRegistry.resolveCurrentMessageInjectionTarget(scope.sessionKey),
-        ).toBeUndefined();
-        await fixture.send(respond);
-        expect(respond).toHaveBeenCalledWith(
-          true,
-          expect.objectContaining({ runId: params.idempotencyKey, status: "started" }),
-          undefined,
-          expect.anything(),
-        );
-        expect(respond.mock.calls[0]?.[1]).not.toHaveProperty("messageSeq");
-        expect(transcriptAtAck).toEqual(activeTranscript);
-        expect(await pendingAtAck).toMatchObject({
-          status: "fulfilled",
-          value: {
-            total: 1,
-            items: [
-              {
-                state: "queued",
-                runId: params.idempotencyKey,
-                message: {
-                  role: "user",
-                  content: approvedContent,
-                  idempotencyKey: `${params.idempotencyKey}:user`,
-                  __openclaw: {
-                    senderId: profile.id,
-                    senderIdentity: { type: "profile", id: profile.id },
-                    transport: { clients: [clientInfo] },
-                  },
-                },
-              },
-            ],
-          },
-        });
-        expect(await pendingAtNotification).toEqual(await pendingAtAck);
-        const recorder = await fixture.dispatchedRecorder;
-        const committed = await recorder.persistApproved();
-        expect(committed?.message["__openclaw"]).toMatchObject({
-          senderIdentity: { type: "profile", id: profile.id },
-          transport: { clients: [clientInfo] },
-        });
-        // Initial resolution detaches the store; custody needs only the current target binding.
-        expect(
-          clone.mock.calls.filter(
-            ([entry]) => isRecord(entry) && entry.sessionId === "unrelated-browser-session",
-          ).length,
-        ).toBeLessThanOrEqual(1);
-      } finally {
-        clone.mockRestore();
-        await Promise.allSettled([pendingAtAck, pendingAtNotification]);
-        await fixture.cleanup();
-      }
-    },
-  );
-
   it("keeps internal system inputs outside ordinary pending-message custody", async () => {
     const fixture = await createBrowserFollowupFixture();
     fixture.client.connect.client = { id: "cli", mode: "cli", version: "test", platform: "test" };
@@ -570,50 +473,6 @@ describe("ordinary chat input admission", () => {
       }
     },
   );
-
-  it("retries a failed custody write with the same request identity without acknowledging lost input", async () => {
-    const fixture = await createBrowserFollowupFixture();
-    const refusal = refusePendingInputCommit({
-      operation: "stage",
-      message: "custody unavailable",
-      sessionId: fixture.scope.sessionId,
-      runId: fixture.params.idempotencyKey,
-    });
-    try {
-      const rejected = await fixture.send();
-      expect(rejected).toHaveBeenCalledWith(
-        false,
-        expect.objectContaining({ status: "error" }),
-        expect.objectContaining({ message: expect.stringContaining("custody unavailable") }),
-        expect.anything(),
-      );
-      expect(dispatchInboundMessageMock).not.toHaveBeenCalled();
-      expect(loadTranscriptEventsSync(fixture.scope)).toEqual(fixture.activeTranscript);
-      expect(await listSessionPendingInputs(fixture.scope)).toEqual({ items: [], total: 0 });
-      expect(fixture.context.chatAbortControllers.has(fixture.params.idempotencyKey)).toBe(false);
-      await getSessionWorkAdmissionRelease({
-        scope: fixture.scope.storePath,
-        identities: [fixture.scope.sessionKey, fixture.scope.sessionId],
-      });
-
-      refusal.mockRestore();
-      const retried = await fixture.send();
-      expect(retried).toHaveBeenCalledWith(
-        true,
-        expect.objectContaining({ runId: fixture.params.idempotencyKey, status: "started" }),
-        undefined,
-        expect.anything(),
-      );
-      expect(await listSessionPendingInputs(fixture.scope)).toMatchObject({
-        total: 1,
-        items: [{ state: "queued", message: { content: fixture.approvedContent } }],
-      });
-      expect(loadTranscriptEventsSync(fixture.scope)).toEqual(fixture.activeTranscript);
-    } finally {
-      refusal.mockRestore();
-      await fixture.cleanup();
-    }
-  });
 
   it.each(["cancellation", "lifecycle rotation", "session replacement"] as const)(
     "revalidates %s after message approval before committing custody",

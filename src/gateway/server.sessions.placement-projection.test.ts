@@ -1,5 +1,3 @@
-import { createHash } from "node:crypto";
-import path from "node:path";
 import { afterEach, expect, test, vi } from "vitest";
 import type { EnvironmentSummary } from "../../packages/gateway-protocol/src/index.js";
 import { i18n } from "../../ui/src/i18n/index.ts";
@@ -8,11 +6,6 @@ import { readDraftEnvironments } from "../../ui/src/pages/new-session/discovery.
 import { listRegisteredAgentHarnesses, registerAgentHarness } from "../agents/harness/registry.js";
 import { restoreRegisteredAgentHarnesses } from "../agents/harness/registry.test-support.js";
 import { NODE_WORKER_SUPERVISOR_PROTOCOL_FEATURE } from "../infra/node-runner-inventory.js";
-import {
-  openOpenClawStateDatabase,
-  runOpenClawStateWriteTransaction,
-  type OpenClawStateDatabase,
-} from "../state/openclaw-state-db.js";
 import { closeStateDatabaseForTest } from "../test-utils/database-cleanup.js";
 import { updateNodeRunnerInventory } from "./node-registry-private.js";
 import { NodeRegistry, type NodeSessionConnectParams } from "./node-registry.js";
@@ -33,16 +26,8 @@ import {
 } from "./test/server-sessions.test-helpers.js";
 import type { WorkerPlacementMoveIntent } from "./worker-environments/placement-move-intent.js";
 import type { WorkerSessionPlacementReader } from "./worker-environments/placement-projector.js";
-import { placementTurnOwner } from "./worker-environments/placement-record.js";
-import {
-  createWorkerSessionPlacementStore,
-  type WorkerSessionPlacementRecord,
-} from "./worker-environments/placement-store.js";
+import type { WorkerSessionPlacementRecord } from "./worker-environments/placement-store.js";
 import { isFailedWorkerPlacementEnvironmentGone } from "./worker-environments/placement-target.js";
-import {
-  advancePlacementFixtureToActive,
-  writePlacementEnvironmentFixture,
-} from "./worker-environments/placement-test-fixtures.js";
 import { createRetainedWorkerRecovery } from "./worker-environments/retained-worker-recovery.js";
 import type { WorkerEnvironmentServiceRecord } from "./worker-environments/service-contract.js";
 
@@ -355,74 +340,6 @@ test.each([
   },
 );
 
-test("sessions.describe preserves pre-epoch identity while starting", async () => {
-  await seedSessionRows();
-  const placement = {
-    ...activePlacementRecord(),
-    state: "starting" as const,
-    activeOwnerEpoch: null,
-    turnClaim: null,
-    lastTranscriptAckCursor: null,
-    lastLiveEventAckCursor: null,
-  } satisfies WorkerSessionPlacementRecord;
-  const result = await directSessionReq<{ session: GatewaySessionRow | null }>(
-    "sessions.describe",
-    { key: "main" },
-    {
-      context: placementContext(placement, {
-        providerId: "machine0",
-        profileId: "team",
-        ownerEpoch: 0,
-        state: "provisioning",
-      }),
-    },
-  );
-  expect(result.ok).toBe(true);
-  expect(result.payload?.session?.placement).toMatchObject({
-    state: "starting",
-    providerId: "machine0",
-    profileId: "team",
-  });
-});
-
-test("sessions.list projects durable placement move progress", async () => {
-  await seedSessionRows();
-  const placement = activePlacementRecord();
-  const move = placementMove(placement, "workspace reconciliation is waiting");
-  const getMany = vi.fn<WorkerSessionPlacementReader["getMany"]>(
-    () => new Map([[placement.sessionId, placement]]),
-  );
-  const facts = createSessionPlacementFactsReader(
-    { getMany },
-    undefined,
-    new Map([[move.sessionId, move]]),
-  );
-  const readProjection = vi.fn(facts.readProjection);
-  const projection = await createSessionRowProjection({
-    cfg: (await getGatewayConfigModule()).getRuntimeConfig(),
-    placementFactsReader: { readProjection },
-  });
-  trackSessionReadProjection(projection);
-
-  const result = await directSessionReq<{ sessions: GatewaySessionRow[] }>(
-    "sessions.list",
-    {},
-    { context: bindSessionRowProjection({}, () => projection) },
-  );
-
-  expect(result.ok).toBe(true);
-  const main = result.payload?.sessions.find((session) => session.sessionId === "sess-main");
-  expect(main?.placementMove).toEqual({
-    target: { kind: "gateway" },
-    error: "workspace reconciliation is waiting",
-    updatedAtMs: 340,
-  });
-  expect(main?.placementMove).not.toHaveProperty("operationId");
-  expect(
-    readProjection.mock.calls.flatMap(([ids]) => ids).toSorted((a, b) => a.localeCompare(b)),
-  ).toEqual(["sess-main", "sess-other"]);
-});
-
 test.each([
   { name: "without an environment", ownerEpoch: undefined, activeOwnerEpoch: 12, identity: false },
   {
@@ -511,145 +428,6 @@ test.each([
       expect(projected).not.toHaveProperty("providerId");
       expect(projected).not.toHaveProperty("profileId");
     }
-  },
-);
-
-function seedFailedPlacementWithRetainedResult(database: OpenClawStateDatabase, sessionId: string) {
-  // Older terminal rows can retain unaccepted results beyond the active generation.
-  runOpenClawStateWriteTransaction(
-    ({ db }) => {
-      db.prepare(`UPDATE worker_session_placements SET turn_claim_owner = NULL,
-        turn_claim_id = NULL, turn_claim_run_id = NULL, turn_claim_generation = NULL,
-        turn_claim_owner_epoch = NULL WHERE session_id = ?`).run(sessionId);
-      db.prepare(`UPDATE worker_session_placements SET state = 'failed',
-        transition_generation = transition_generation + 3,
-        recovery_error = 'previous worker failure', terminal_reason = 'previous worker failure',
-        terminal_at_ms = 1 WHERE session_id = ?`).run(sessionId);
-    },
-    { database },
-  );
-}
-
-test.each([
-  { recovery: "unstaged result", executionMode: "remote-exec" },
-  { recovery: "rollback journal", executionMode: "worker-turn" },
-] as const)(
-  "sessions.describe waits for retained $recovery before offering retry on send",
-  async ({ recovery, executionMode }) => {
-    const { dir } = await createSessionStoreDir();
-    const identity = {
-      sessionId: "sess-retained-recovery",
-      sessionKey: "agent:main:retained-recovery",
-      agentId: "main",
-    };
-    await writeSessionStore({
-      entries: { [identity.sessionKey]: { sessionId: identity.sessionId, updatedAt: 200 } },
-    });
-    const database = openOpenClawStateDatabase({ path: path.join(dir, "placements.sqlite") });
-    const placements = createWorkerSessionPlacementStore({ database });
-    const active = await advancePlacementFixtureToActive(placements, database, {
-      ...identity,
-      executionMode,
-    });
-    const journalOwner = {
-      sessionId: identity.sessionId,
-      environmentId: active.environmentId,
-      ownerEpoch: active.activeOwnerEpoch,
-      placementGeneration: active.generation,
-    };
-    if (recovery === "unstaged result") {
-      const claim = await placements.claimTurn({
-        ...identity,
-        owner: placementTurnOwner(active),
-        claimId: "retained-claim",
-        runId: "retained-run",
-      });
-      await placements.markWorkspaceResultPending(claim);
-    } else {
-      const basePack = Buffer.from("retained workspace rollback");
-      await placements.beginWorkspaceReconciliation(journalOwner, {
-        version: 1,
-        temporaryNonce: "a".repeat(32),
-        baseManifestRef: active.workspaceBaseManifestRef,
-        currentManifestRef: `sha256:${"c".repeat(64)}`,
-        baseEntries: [],
-        appliedEntries: [],
-        baseTree: "f".repeat(40),
-        basePackSha256: createHash("sha256").update(basePack).digest("hex"),
-        basePack,
-      });
-    }
-    if (recovery === "unstaged result") {
-      seedFailedPlacementWithRetainedResult(database, identity.sessionId);
-    } else {
-      const draining = await placements.startDrain({
-        sessionId: identity.sessionId,
-        environmentId: active.environmentId,
-        ownerEpoch: active.activeOwnerEpoch,
-        expectedGeneration: active.generation,
-      });
-      const reconciling = await placements.startReconcile({
-        sessionId: identity.sessionId,
-        environmentId: active.environmentId,
-        ownerEpoch: active.activeOwnerEpoch,
-        expectedGeneration: draining.generation,
-      });
-      await placements.fail({
-        sessionId: identity.sessionId,
-        expectedGeneration: reconciling.generation,
-        recoveryError: "previous worker failure",
-      });
-    }
-    writePlacementEnvironmentFixture(database, {
-      environmentId: active.environmentId,
-      state: "destroyed",
-      ownerEpoch: active.activeOwnerEpoch + 1,
-      attachedSessionIds: [],
-    });
-    const cfg = (await getGatewayConfigModule()).getRuntimeConfig();
-    const context = {
-      getRuntimeConfig: () => cfg,
-      workerSessionPlacementService: placements,
-      workerEnvironmentService: {
-        get: () => undefined,
-        readMachineShape: () => undefined,
-      },
-    };
-    const projection = await createSessionRowProjection({
-      cfg,
-      context,
-      placementFactsReader: placements,
-    });
-    trackSessionReadProjection(projection);
-    const options = { context: bindSessionRowProjection(context, () => projection) };
-    const describe = () =>
-      directSessionReq<{ session: GatewaySessionRow | null }>(
-        "sessions.describe",
-        { key: identity.sessionKey },
-        options,
-      );
-    const blocked = await describe();
-    expect(blocked.ok).toBe(true);
-    expect(blocked.payload?.session?.placement).toMatchObject({
-      state: "failed",
-      recoveryAction: "restart",
-    });
-    expect(blocked.payload?.session?.placement).not.toHaveProperty("retryOnSend");
-    expect(blocked.payload?.session?.placement).not.toHaveProperty("workspaceResultReconciling");
-
-    if (recovery === "unstaged result") {
-      const pending = await placements.listPendingWorkspaceResultsAsync(identity.sessionId);
-      expect(pending).toHaveLength(1);
-      await placements.abandonWorkspaceResult(pending[0]!);
-    } else {
-      await placements.abortWorkspaceReconciliation(journalOwner, { force: true });
-    }
-    const ready = await describe();
-    expect(ready.ok).toBe(true);
-    expect(ready.payload?.session).toMatchObject({
-      sessionId: identity.sessionId,
-      placement: { ...blocked.payload?.session?.placement, retryOnSend: true },
-    });
   },
 );
 

@@ -1,6 +1,7 @@
 import "../flows/doctor-health.test-support.js";
 import fs from "node:fs";
 import path from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { runCommandWithRuntime } from "../cli/cli-utils.js";
@@ -13,11 +14,28 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { runDoctorHealthFlow } from "../flows/doctor-health.js";
 import { requireNodeSqlite } from "../infra/node-sqlite.js";
 import { corruptSqliteIndexKey } from "../infra/sqlite-index-corruption.test-support.js";
+import { readSqliteArtifactBytesFromChild } from "../infra/sqlite-posix-locks.test-support.js";
 import { cleanupSnapshotOperations } from "../infra/sqlite-readonly-location-cleanup.js";
 import { extractSqliteTableSchema } from "../infra/sqlite-schema-sql.js";
 import { createLegacyDatabaseFixture } from "../infra/state-migrations.media-persistence.test-support.js";
+import {
+  recordLegacyMigrationRun,
+  recordLegacyMigrationSource,
+} from "../infra/state-migrations.receipts.js";
+import {
+  detectSharedAuthStoreMigration,
+  migrateSharedAuthStore,
+} from "../infra/state-migrations.shared-auth-store.js";
 import { setLoggerOverride } from "../logging/logger.js";
 import { testApi } from "../logging/logger.test-support.js";
+import {
+  hasPersistedOpenClawAgentCanonicalValidation,
+  inspectSharedAuthPluginArtifactsReadOnly,
+  withFreshOpenClawAgentDatabaseReadOnly,
+} from "../plugin-sdk/sqlite-runtime.js";
+import { runSqliteDeferredTransactionSync } from "../plugin-sdk/sqlite-worker-runtime.js";
+import { writePersistedInstalledPluginIndex } from "../plugins/installed-plugin-index-store-write.js";
+import { createInstalledPluginIndex } from "../plugins/test-helpers/installed-plugin-index.js";
 import { readAgentDeletionRecoveryHolds } from "../state/agent-deletion-journal-recovery.kernel.js";
 import { OPENCLAW_AGENT_SCHEMA_VERSION } from "../state/openclaw-agent-db-contract.js";
 import { assertNoOpenClawAgentDatabaseLeasesReadOnly } from "../state/openclaw-agent-db-lease.js";
@@ -32,7 +50,9 @@ import {
   closeOpenClawStateDatabaseForTest,
   openOpenClawStateDatabase,
   repairOpenClawStateDatabaseSchema,
+  runOpenClawStateWriteTransaction,
 } from "../state/openclaw-state-db.js";
+import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 import { claimOpenClawStateOwnership } from "../state/openclaw-state-ownership-operations.js";
 import { STATE_SUPERVISION_KEY } from "../state/openclaw-state-ownership.js";
 import { OPENCLAW_STATE_SCHEMA_SQL } from "../state/openclaw-state-schema.js";
@@ -92,6 +112,8 @@ it.each(["valid", "invalid", "cleanup failed"] as const)(
               pending: db
                 .prepare("SELECT session_key FROM session_canonical_validation_pending")
                 .all(),
+              contract: db.prepare("SELECT * FROM session_key_contract WHERE id=1").get(),
+              version: db.prepare("PRAGMA user_version").get(),
             };
           } finally {
             db.close();
@@ -119,6 +141,37 @@ it.each(["valid", "invalid", "cleanup failed"] as const)(
           ]);
         }
         await closeOpenClawAgentDatabasesAsync();
+        const primary = sources[0]!;
+        const files = [primary.path, resolveOpenClawStateSqlitePath(state.env)];
+        const observe = () => {
+          let connection: DatabaseSync | undefined;
+          const result = withFreshOpenClawAgentDatabaseReadOnly((native) => {
+            connection = native.db;
+            return runSqliteDeferredTransactionSync(native.db, () => {
+              const bytes = files.map(readSqliteArtifactBytesFromChild);
+              const facts = inspectSharedAuthPluginArtifactsReadOnly(native, { env: state.env });
+              expect(files.map(readSqliteArtifactBytesFromChild)).toEqual(bytes);
+              expect(native.db.isOpen).toBe(true);
+              return facts;
+            });
+          }, primary);
+          expect(connection?.isOpen).toBe(false);
+          if (!result.found || result.value.status !== "observed")
+            throw new Error("Expected current admitted SDK observation: " + JSON.stringify(result));
+          return result.value.facts;
+        };
+        if (scenario === "valid") {
+          await migrateSharedAuthStore({
+            detected: detectSharedAuthStoreMigration({
+              stateDir: state.stateDir,
+              env: state.env,
+              doctorOnlyStateMigrations: true,
+            }),
+            stateDir: state.stateDir,
+            env: state.env,
+          });
+          expect(observe().canonicalValidation).toBe(false);
+        }
         const expected = new Map<string, ReturnType<typeof snapshot>>();
         const begin = doctorMaintenance.beginDoctorMaintenance;
         vi.spyOn(doctorMaintenance, "beginDoctorMaintenance").mockImplementation(async (params) => {
@@ -164,6 +217,30 @@ it.each(["valid", "invalid", "cleanup failed"] as const)(
           expect(after.nodes).toEqual(before.nodes);
           expect(after.events).toEqual(before.events);
           expect(after.cold).toEqual(before.cold);
+          if (scenario === "valid") {
+            const bytes = fs.readFileSync(source.path);
+            let connection: DatabaseSync | undefined;
+            expect(
+              withFreshOpenClawAgentDatabaseReadOnly((native) => {
+                connection = native.db;
+                expect(() => native.db.exec("CREATE TABLE unexpected (value TEXT)")).toThrow(
+                  /readonly/u,
+                );
+                return runSqliteDeferredTransactionSync(native.db, () => ({
+                  contract: native.db
+                    .prepare("SELECT * FROM session_key_contract WHERE id=1")
+                    .get(),
+                  version: native.db.prepare("PRAGMA user_version").get(),
+                  valid: hasPersistedOpenClawAgentCanonicalValidation(native),
+                }));
+              }, source),
+            ).toEqual({
+              found: true,
+              value: { contract: after.contract, version: after.version, valid: true },
+            });
+            expect(connection?.isOpen).toBe(false);
+            expect(fs.readFileSync(source.path)).toEqual(bytes);
+          }
           if (scenario !== "invalid" || source.agentId === "main") {
             expect(
               after.pending,
@@ -177,6 +254,92 @@ it.each(["valid", "invalid", "cleanup failed"] as const)(
         if (scenario === "valid") {
           expect(runtime.exit).not.toHaveBeenCalled();
           expect(mocks.outro).toHaveBeenCalledWith("Doctor complete.");
+          const facts = observe();
+          expect(facts).toMatchObject({
+            canonicalValidation: true,
+            ownership: { location: "state-db" },
+            pendingCleanup: false,
+            source: { store: { rowCount: 0 }, state: { rowCount: 0 } },
+            target: { store: { rowCount: 0 }, state: { rowCount: 0 } },
+            migration: {
+              sourceCount: 2,
+              unexpectedSourceCount: 0,
+              runCount: 1,
+              unexpectedRunCount: 0,
+            },
+            pluginInstallState: { status: "missing" },
+          });
+          for (const receipt of facts.migration.sources)
+            expect(receipt).toMatchObject({
+              status: "present",
+              sourcePathMatches: true,
+              targetMatches: true,
+              sourceRecordCount: 0,
+              sourceSha256: "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+              stage: "completed",
+              removedSource: true,
+              removalValid: true,
+              sourceReportMatches: true,
+              run: {
+                present: true,
+                expectedRunMatches: true,
+                stage: "completed",
+                reportMatches: true,
+              },
+            });
+          expect(JSON.stringify(facts)).not.toContain(state.stateDir);
+          const secret = "synthetic-private-plugin-payload";
+          for (const [records, count] of [
+            [{}, 0],
+            [{ demo: { source: "npm" as const, spec: secret } }, 1],
+          ] as const) {
+            await writePersistedInstalledPluginIndex(
+              createInstalledPluginIndex({ plugins: [], installRecords: records }),
+              { env: state.env },
+            );
+            const current = observe();
+            expect(current.pluginInstallState).toMatchObject({
+              status: "valid",
+              recordCount: count,
+            });
+            expect(JSON.stringify(current)).not.toContain(secret);
+          }
+          runOpenClawStateWriteTransaction(
+            ({ db }) => {
+              recordLegacyMigrationRun(db, {
+                runId: "shared-auth-store:fixture-extra",
+                startedAt: 1,
+                finishedAt: null,
+                status: "copied",
+                reportJson: "synthetic-private-report",
+              });
+              recordLegacyMigrationSource(db, {
+                sourceKey: "fixture-extra",
+                migrationKind: "shared-auth-store-state-db",
+                sourcePath: primary.path,
+                targetTable: "auth_profile_stores",
+                sourceSha256: null,
+                sourceSizeBytes: null,
+                sourceRecordCount: null,
+                runId: "shared-auth-store:fixture-extra",
+                status: "copied",
+                importedAt: 1,
+                reportJson: "synthetic-private-report",
+              });
+            },
+            { env: state.env },
+          );
+          const unexpected = observe();
+          expect(unexpected).toMatchObject({
+            pendingCleanup: true,
+            migration: {
+              sourceCount: 3,
+              unexpectedSourceCount: 1,
+              runCount: 2,
+              unexpectedRunCount: 1,
+            },
+          });
+          expect(JSON.stringify(unexpected)).not.toContain("synthetic-private-report");
         } else {
           expect(runtime.exit).toHaveBeenCalledExactlyOnceWith(1);
           expect(mocks.outro).not.toHaveBeenCalledWith("Doctor complete.");
