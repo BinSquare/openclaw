@@ -7,7 +7,11 @@ import type {
 } from "../../api/types.ts";
 import { t } from "../../i18n/index.ts";
 import { registerModelControlsEnglish } from "../../i18n/locales/en-model-controls.ts";
-import { resolveModelRuntimeEntry, type ModelRuntimeEntry } from "../model-runtime-choice.ts";
+import {
+  resolveModelRuntimeEntry,
+  runtimeOffersUltrafast,
+  type ModelRuntimeEntry,
+} from "../../../../src/shared/model-runtime-entry.js";
 import {
   buildCatalogDisplayLookup,
   buildChatModelOptionFromLookup,
@@ -425,10 +429,7 @@ export function resolveChatFastModeSelectState(
     predicate: (selected: (typeof selectedEntries)[number]) => boolean | undefined,
   ) => selectedEntries.length > 0 && selectedEntries.every(predicate);
   const ultrafastOffered =
-    requestSupported &&
-    everySelected(
-      ({ runtime }) => runtime?.available === true && runtime.serviceTiers?.includes("ultrafast"),
-    );
+    requestSupported && everySelected(({ runtime }) => runtimeOffersUltrafast(runtime));
   // The transport owns recovery support; provider and runtime names do not identify the endpoint.
   const canRecoverRejectedTier = everySelected(
     ({ runtime }) => runtime?.supportsServiceTierRecovery === true,

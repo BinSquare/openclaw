@@ -28,7 +28,7 @@ import type { ChatModelCatalogState } from "../../lib/model-catalog-store.ts";
 import {
   resolveModelRuntimeEntry,
   type ModelRuntimeEntry,
-} from "../../lib/model-runtime-choice.ts";
+} from "../../../../src/shared/model-runtime-entry.js";
 import { draftCloudProfileSupportsExecutionMode, type DraftCloudProfile } from "./discovery.ts";
 
 registerNewSessionSetupEnglish();

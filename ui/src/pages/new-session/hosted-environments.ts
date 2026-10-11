@@ -2,7 +2,7 @@ import type { ModelCatalogEntry } from "../../api/types.ts";
 import { t } from "../../i18n/index.ts";
 import { registerNewSessionSetupEnglish } from "../../i18n/locales/en-new-session-setup.ts";
 import { buildQualifiedChatModelValue } from "../../lib/chat/model-ref.ts";
-import { resolveModelRuntimeEntry } from "../../lib/model-runtime-choice.ts";
+import { resolveModelRuntimeEntry } from "../../../../src/shared/model-runtime-entry.js";
 import type { DraftCloudProfile } from "./discovery.ts";
 import type { NewSessionModelSelection } from "./model-selection.ts";
 import {

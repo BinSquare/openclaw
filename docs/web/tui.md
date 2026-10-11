@@ -163,7 +163,7 @@ for admins. The embedded local TUI stays session-only regardless of this setting
 Session controls:
 
 - `/think <off|minimal|low|medium|high|default>` (higher tiers may add levels like `xhigh`/`max` depending on the model). `default` clears the session override.
-- `/fast <status|auto|on|off|ultrafast|default>` (`default` clears the session override)
+- `/fast <status|auto|on|off|ultrafast|default>` (`default` clears the session override). Autocomplete offers `ultrafast` only when the model catalog advertises that tier for the session's model and runtime.
 - `/verbose <on|full|off>`
 - `/trace <on|off>`
 - `/reasoning <on|off|stream>`

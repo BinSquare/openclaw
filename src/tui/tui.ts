@@ -71,6 +71,7 @@ import { createTuiQuestionController } from "./tui-questions.js";
 import { createSessionActions } from "./tui-session-actions.js";
 import { createTuiRunIdTracker } from "./tui-session-run-coordinator.js";
 import { beginTuiShutdown } from "./tui-shutdown.js";
+import { createTuiSlashSessionOptions } from "./tui-slash-session-options.js";
 import {
   createEditorSubmitHandler,
   createSubmitBurstCoalescer,
@@ -771,10 +772,7 @@ async function runTuiUnlocked(opts: RunTuiOptions): Promise<TuiResult> {
     const slashCommands = getSlashCommands({
       cfg: config,
       local: isLocalMode,
-      provider: state.sessionInfo.modelProvider,
-      model: state.sessionInfo.model,
-      agentRuntime: state.sessionInfo.agentRuntime?.id,
-      thinkingLevels: state.sessionInfo.thinkingLevels,
+      ...slashOptions(),
       dynamicCommands: dynamicSlashCommandsKey === dynamicKey ? dynamicSlashCommands : [],
     });
     editor.shouldSubmitAutocomplete = (text) =>
@@ -783,6 +781,7 @@ async function runTuiUnlocked(opts: RunTuiOptions): Promise<TuiResult> {
       createTuiAutocompleteProvider(slashCommands, resolveUsableCwd(), autocompleteFdPath),
     );
   };
+  const slashOptions = createTuiSlashSessionOptions(client, state, applyAutocompleteProvider);
 
   const autocompleteReady = import("../agents/utils/tools-manager.js")
     .then(({ ensureTool }) => ensureTool("fd"))

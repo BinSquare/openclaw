@@ -16,7 +16,7 @@ import type { OpenClawConfig } from "../config/types.js";
 
 const VERBOSE_LEVELS = ["on", "off", "full"] satisfies VerboseLevel[];
 const TRACE_LEVELS = ["on", "off"];
-const FAST_LEVELS = ["status", "auto", "on", "off", "ultrafast", "default"];
+const FAST_LEVELS = ["status", "auto", "on", "off"];
 const REASONING_LEVELS = ["on", "off", "stream"] satisfies ReasoningLevel[];
 const ELEVATED_LEVELS = ["on", "off", "ask", "full"];
 const ACTIVATION_LEVELS = ["mention", "always"];
@@ -51,6 +51,8 @@ type SlashCommandOptions = {
   model?: string;
   agentRuntime?: string;
   thinkingLevels?: Array<{ id: string; label: string }>;
+  /** Selected model runtime advertises Ultrafast in the authenticated catalog. */
+  ultrafast?: boolean;
   local?: boolean;
   dynamicCommands?: CommandEntry[];
 };
@@ -87,14 +89,14 @@ type TuiCommandDescriptor = {
   shared?: boolean;
   handler?: true;
   help?: string | readonly string[];
-  completions?: readonly string[] | "thinking";
+  completions?: readonly string[] | "thinking" | "fast";
 };
 
 type TuiCommandRow = readonly [
   name: string,
   description?: string,
   help?: string | readonly string[],
-  completions?: readonly string[] | "thinking",
+  completions?: readonly string[] | "thinking" | "fast",
   options?: Pick<TuiCommandDescriptor, "aliases" | "scope" | "shared"> & { handler?: false },
 ];
 
@@ -141,7 +143,7 @@ const TUI_COMMAND_ROWS = [
     "fast",
     "Set fast mode auto/on/off/ultrafast",
     "/fast <status|auto|on|off|ultrafast|default>",
-    FAST_LEVELS,
+    "fast",
   ],
   [
     "verbose",
@@ -260,6 +262,7 @@ export function parseCommand(input: string): ParsedCommand {
 
 export function getSlashCommands(options: SlashCommandOptions = {}): SlashCommand[] {
   const thinkLevels = resolveThinkingLevelLabels(options);
+  const fastLevels = [...FAST_LEVELS, ...(options.ultrafast ? ["ultrafast"] : []), "default"];
   const commands: SlashCommand[] = [];
   const seen = new Map<string, SlashCommand["getArgumentCompletions"]>();
   for (const command of TUI_COMMAND_DESCRIPTORS) {
@@ -273,9 +276,11 @@ export function getSlashCommands(options: SlashCommandOptions = {}): SlashComman
     const completions =
       command.completions === "thinking"
         ? createLevelCompletion([...thinkLevels, "default"])
-        : command.completions
-          ? createLevelCompletion([...command.completions])
-          : undefined;
+        : command.completions === "fast"
+          ? createLevelCompletion(fastLevels)
+          : command.completions
+            ? createLevelCompletion([...command.completions])
+            : undefined;
     appendSlashCommand(commands, seen, command.name, command.description, completions);
     for (const alias of command.aliases ?? []) {
       if (!alias.hidden) {

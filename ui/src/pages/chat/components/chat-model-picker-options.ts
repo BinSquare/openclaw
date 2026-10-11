@@ -10,7 +10,7 @@ import "../../../components/tooltip.ts";
 import { t } from "../../../i18n/index.ts";
 import { registerModelControlsEnglish } from "../../../i18n/locales/en-model-controls.ts";
 import { formatContextTokenCapacity } from "../../../lib/format.ts";
-import type { ModelRuntimeEntry } from "../../../lib/model-runtime-choice.ts";
+import type { ModelRuntimeEntry } from "../../../../../src/shared/model-runtime-entry.js";
 import { formatModelRuntimeLabel } from "../../../lib/model-runtime-label.ts";
 import { handleModelOptionMouseEnter } from "./chat-model-picker-search.ts";
 

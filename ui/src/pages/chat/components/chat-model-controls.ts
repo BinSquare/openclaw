@@ -31,10 +31,8 @@ import {
   describeModelProviderAuth,
   type ModelProviderAuthLabel,
 } from "../../../lib/model-provider-auth-label.ts";
-import {
-  isSessionRuntimePinned,
-  resolveModelRuntimeEntry,
-} from "../../../lib/model-runtime-choice.ts";
+import { resolveModelRuntimeEntry } from "../../../../../src/shared/model-runtime-entry.js";
+import { isSessionRuntimePinned } from "../../../lib/model-runtime-choice.ts";
 import { areUiSessionKeysEquivalent } from "../../../lib/sessions/session-key.ts";
 import { renderChatEffortPicker } from "./chat-effort-picker.ts";
 import type { ChatModelAccountSection } from "./chat-model-account-control.ts";

@@ -136,6 +136,9 @@ export type TuiModelChoice = Pick<
   | "available"
   | "unavailableReason"
   | "recommended"
+  | "agentRuntime"
+  | "runtimeChoices"
+  | "serviceTiers"
 >;
 
 export type TuiSessionMutationResult = {

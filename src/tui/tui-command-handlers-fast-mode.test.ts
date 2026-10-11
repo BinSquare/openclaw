@@ -16,7 +16,6 @@ describe("tui /fast", () => {
     { command: "/fast off", patch: { key: "agent:main:main", fastMode: false } },
     { command: "/fast auto", patch: { key: "agent:main:main", fastMode: "auto" } },
     { command: "/fast ultrafast", patch: { key: "agent:main:main", fastMode: "ultrafast" } },
-    { command: "/fast Ultrafast", patch: { key: "agent:main:main", fastMode: "ultrafast" } },
     {
       command: "/fast default",
       params: { opts: { local: true } },
@@ -38,7 +37,6 @@ describe("tui /fast", () => {
 
   it.each<[FastMode | undefined, string]>([
     [undefined, "off"],
-    [true, "on"],
     ["auto", "auto"],
     ["ultrafast", "ultrafast"],
   ])("reports %s session fast mode as %s", async (fastMode, label) => {

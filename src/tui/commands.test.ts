@@ -74,12 +74,13 @@ describe("getSlashCommands", () => {
     ]);
   });
 
-  it("offers /fast ultrafast", () => {
-    const fast = getSlashCommands().find((candidate) => candidate.name === "fast");
+  it.each([
+    { ultrafast: true, expected: [{ value: "ultrafast", label: "ultrafast" }] },
+    { ultrafast: false, expected: [] },
+  ])("offers /fast ultrafast only when ultrafast is $ultrafast", ({ ultrafast, expected }) => {
+    const fast = getSlashCommands({ ultrafast }).find((candidate) => candidate.name === "fast");
 
-    expect(fast?.getArgumentCompletions?.("u")).toEqual([
-      { value: "ultrafast", label: "ultrafast" },
-    ]);
+    expect(fast?.getArgumentCompletions?.("u")).toEqual(expected);
   });
 
   it.each([
