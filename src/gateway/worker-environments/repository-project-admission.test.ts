@@ -181,6 +181,7 @@ describe("repository project admission", () => {
   it.each([
     "unpublished",
     "uninitialized",
+    "uninitialized original branch",
     "uninitialized attempted",
     "uninitialized checkpoint",
     "attempted",
@@ -192,7 +193,7 @@ describe("repository project admission", () => {
     "recovers only a proven generated local branch from its original immutable base: %s",
     async (state) => {
       const workspaceId = "db9ec53a-081a-4343-8bf8-64810cf01793";
-      const branch = `clawson/${workspaceId}`;
+      const branch = state === "uninitialized original branch" ? "main" : `clawson/${workspaceId}`;
       const workspace: SessionRepositoryWorkspaceRecord = {
         workspaceId,
         agentId: "main",
@@ -241,7 +242,11 @@ describe("repository project admission", () => {
         sessionId: "original",
         assertCurrent: () => {},
       });
-      if (state === "unpublished" || state === "uninitialized") {
+      if (
+        state === "unpublished" ||
+        state === "uninitialized" ||
+        state === "uninitialized original branch"
+      ) {
         await recovered;
         expect(mocks.advance).toHaveBeenCalledWith(
           expect.objectContaining({
@@ -253,9 +258,11 @@ describe("repository project admission", () => {
           }),
         );
         expect(requestPaths()).toContain(
-          state === "uninitialized"
-            ? "/repos/acme/project/commits/main"
-            : `/repos/acme/project/git/commits/${commit}`,
+          state === "uninitialized original branch"
+            ? "/repos/acme/project/commits/heads%2Fmain"
+            : state === "uninitialized"
+              ? "/repos/acme/project/commits/main"
+              : `/repos/acme/project/git/commits/${commit}`,
         );
         expect(requestPaths().some((value) => value.includes("/commits/heads%2Fclawson"))).toBe(
           false,
@@ -277,6 +284,31 @@ describe("repository project admission", () => {
       expect(mocks.release).toHaveBeenCalledOnce();
     },
   );
+
+  it("correlates exact source-ref422 with safe request ID and no raw error or credential", async () => {
+    const transport = fetchImpl.getMockImplementation()!;
+    fetchImpl.mockImplementation(async (input, init) =>
+      new Request(input).url.includes("/commits/")
+        ? new Response(JSON.stringify({ message: "synthetic-private-error" }), {
+            status: 422,
+            headers: { "x-github-request-id": "ABCD:1234" },
+          })
+        : transport(input, init),
+    );
+    await expect(prepareRepositoryWorkerProjectSource(initial)).rejects.toThrow();
+    expect(mocks.phaseLog).toHaveBeenCalledWith(
+      "repository admission request",
+      expect.objectContaining({
+        operation: "source_ref",
+        status: 422,
+        githubRequestId: "ABCD:1234",
+        outcome: "rejected",
+      }),
+    );
+    const raw = JSON.stringify(mocks.phaseLog.mock.calls);
+    expect(raw).not.toContain("synthetic-private-error");
+    expect(raw).not.toContain(token);
+  });
 
   it.each(["current", "credential changed", "authority revoked", "caller aborted"] as const)(
     "bounds metadata credential verification while preserving %s refusal",

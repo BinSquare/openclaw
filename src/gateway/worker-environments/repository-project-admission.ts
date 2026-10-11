@@ -201,6 +201,23 @@ export async function prepareRepositoryWorkerProjectSource(params: AdmissionRequ
           graphql,
         ),
       );
+      try {
+        const trace = createDiagnosticTraceContextFromActiveScope();
+        const requestId = response.headers.get("x-github-request-id");
+        admissionLog.info("repository admission request", {
+          traceId: trace.traceId,
+          requestSpanId: trace.spanId,
+          operation,
+          admissionPhase: phase,
+          api: graphql ? "graphql" : "rest",
+          status: response.status,
+          githubRequestId:
+            requestId && /^[A-Za-z0-9:-]{1,128}$/u.test(requestId) ? requestId : undefined,
+          outcome: response.status >= 400 ? "rejected" : "responded",
+        });
+      } catch {
+        /* Diagnostics cannot change repository admission. */
+      }
       let value: unknown;
       try {
         assertOwner();
