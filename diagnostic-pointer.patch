@@ -1,0 +1,65 @@
+--- a/ui/src/e2e/chat-composer-pointer-activation.e2e.test.ts
++++ b/ui/src/e2e/chat-composer-pointer-activation.e2e.test.ts
+@@ -137,6 +137,10 @@
+     });
+     try {
+       const page = await context.newPage();
++      page.on("console", (message) => {
++        if (message.text().startsWith("[composer-")) console.log(message.text());
++      });
++
+       const gateway = await installMockGateway(page, {
+         assistantName: "OpenClaw",
+         deferredMethods: ["chat.send"],
+@@ -163,7 +167,33 @@
+       const send = page.getByRole("button", { name: "Send message" });
+       await expect.poll(() => send.isVisible()).toBe(true);
+       await installPointerTrace(page, send);
++      await textarea.evaluate((node) => {
++        const diagnosticWindow = window as Window & {
++          composerDiagnostic?: { original: HTMLTextAreaElement; event?: Event };
++        };
++        const state = { original: node as HTMLTextAreaElement, event: undefined as Event | undefined };
++        diagnosticWindow.composerDiagnostic = state;
++        window.addEventListener("pointerdown", (event) => { state.event = event; }, { once: true });
++      });
+       await send.tap();
++      console.log("[pointer-diagnostic]", await page.evaluate(() => {
++        const state = (window as Window & {
++          composerDiagnostic?: { original: HTMLTextAreaElement; event?: Event };
++        }).composerDiagnostic;
++        const current = document.querySelector(".agent-chat__input textarea");
++        return {
++          defaultPrevented: state?.event?.defaultPrevented,
++          cancelable: state?.event?.cancelable,
++          activeTag: document.activeElement?.tagName,
++          activeClass: document.activeElement?.className,
++          activeAriaLabel: document.activeElement?.getAttribute("aria-label"),
++          originalConnected: state?.original.isConnected,
++          sameTextarea: state?.original === current,
++          currentFocused: document.activeElement === current,
++        };
++      }));
++      await page.screenshot({ path: ".artifacts/pointer-diagnostic/after-tap.png", fullPage: false });
++
+       expectStablePointerActivation(await readPointerTrace(page));
+       await expect
+         .poll(() => textarea.evaluate((node) => document.activeElement === node))
+--- a/ui/src/pages/chat/components/chat-composer-dom.ts
++++ b/ui/src/pages/chat/components/chat-composer-dom.ts
+@@ -466,6 +466,15 @@
+   textarea: HTMLTextAreaElement | null,
+ ): void {
+   const composerShell = textarea?.closest<HTMLElement>(".agent-chat__composer-shell");
++  console.log("[composer-pointer-handler]", JSON.stringify({
++    activeTag: document.activeElement?.tagName,
++    activeClass: document.activeElement?.className,
++    activeIsTextarea: document.activeElement === textarea,
++    textareaConnected: textarea?.isConnected,
++    composerShell: Boolean(composerShell),
++    cancelable: event.cancelable,
++    defaultPrevented: event.defaultPrevented,
++  }));
+   if (document.activeElement === textarea && composerShell) {
+     event.preventDefault();
+   }

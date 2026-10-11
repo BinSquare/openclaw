@@ -1,17 +1,38 @@
-name: Composer Home candidate proof
+name: Composer projection and pointer handler diagnostics
 on:
   push:
     branches: [solid2/w-chat-5-evidence]
 permissions:
   contents: read
 concurrency:
-  group: composer-home-candidate-proof
+  group: composer-projection-handler-diagnostics
   cancel-in-progress: false
 jobs:
-  home-candidate:
-    name: Home stable child-owner candidate
+  diagnostic:
+    name: ${{ matrix.label }} diagnostic
     runs-on: blacksmith-16vcpu-ubuntu-2404
-    timeout-minutes: 25
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - label: home
+            patch: diagnostic-home.patch
+            sha256: b88605ff9e036491c716bfac32dce77d74e5a219a1f9cd01bde0ac3af4b6cbe5
+            test: ui/src/e2e/session-progress-motion.e2e.test.ts
+            pattern: scrubs embedded Home.*no-preference
+            paths: |-
+              ui/src/e2e/session-progress-motion.e2e.test.ts
+              ui/src/pages/chat/components/chat-composer-controls.ts
+          - label: pointer
+            patch: diagnostic-pointer.patch
+            sha256: 3276d20cee773c1a613cd350351bdca381a237cd283f5cfc9ab15c666c150f5a
+            test: ui/src/e2e/chat-composer-pointer-activation.e2e.test.ts
+            pattern: Android-like tap
+            paths: |-
+              ui/src/e2e/chat-composer-pointer-activation.e2e.test.ts
+              ui/src/pages/chat/components/chat-composer-dom.ts
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -22,17 +43,18 @@ jobs:
           ref: ${{ github.sha }}
           path: .evidence
           persist-credentials: false
-      - name: Verify and apply the exact candidate
+      - name: Apply exact diagnostic patch
+        env:
+          PATCH_FILE: ${{ matrix.patch }}
+          PATCH_SHA: ${{ matrix.sha256 }}
         run: |
           set -euo pipefail
-          mkdir -p .artifacts/home-candidate
-          git rev-parse HEAD > .artifacts/home-candidate/source.txt
-          echo "d4a29358b9d7cd7f6c6aec932fb30f670a9aac3cfe5b2b393e0ba9b35b14a491  .evidence/home-progress-candidate.patch" | sha256sum --check
-          echo "72ac4d6964acb70fea7d7b66e710dca5190a8996b415b50517b7680df75241c2  ui/src/pages/chat/components/chat-composer-regions.tsx" | sha256sum --check
-          git apply --check .evidence/home-progress-candidate.patch
-          git apply .evidence/home-progress-candidate.patch
-          git diff --binary > .artifacts/home-candidate/applied.patch
-          sha256sum .evidence/home-progress-candidate.patch ui/src/pages/chat/components/chat-composer-regions.tsx > .artifacts/home-candidate/candidate.sha256
+          mkdir -p .artifacts/diagnostic .artifacts/pointer-diagnostic
+          git rev-parse HEAD > .artifacts/diagnostic/source.txt
+          echo "$PATCH_SHA  .evidence/$PATCH_FILE" | sha256sum --check
+          git apply --check ".evidence/$PATCH_FILE"
+          git apply ".evidence/$PATCH_FILE"
+          git diff --binary > .artifacts/diagnostic/applied.patch
       - uses: ./.github/actions/setup-node-env
         with:
           node-version: 24.x
@@ -43,82 +65,31 @@ jobs:
       - uses: ./.github/actions/setup-playwright-chromium
         with:
           cache-mode: restore
-      - name: Exercise the four failing Home progress suites
+      - name: Run only the requested diagnostic case
         env:
-          OPENCLAW_CAPTURE_UI_PROOF: "1"
-          OPENCLAW_UI_E2E_ARTIFACT_DIR: .artifacts/home-candidate/screenshots
-          OPENCLAW_UI_E2E_DIAGNOSTIC_DIR: .artifacts/home-candidate/diagnostics
+          EVIDENCE_TEST: ${{ matrix.test }}
+          EVIDENCE_PATTERN: ${{ matrix.pattern }}
+          OPENCLAW_UI_E2E_DIAGNOSTIC_DIR: .artifacts/diagnostic/failures
         run: |
           set -euo pipefail
-          node scripts/run-vitest.mjs run --config test/vitest/vitest.ui-e2e.config.ts --configLoader runner --maxWorkers 1 \
-            ui/src/e2e/session-progress-motion.e2e.test.ts \
-            ui/src/e2e/session-progress-scroll.e2e.test.ts \
-            ui/src/e2e/session-progress-disclosure.e2e.test.ts \
-            ui/src/e2e/session-progress-polish.e2e.test.ts 2>&1 | tee .artifacts/home-candidate/results.log
-      - name: Verify only the candidate changed
+          node scripts/run-vitest.mjs run --config test/vitest/vitest.ui-e2e.config.ts --configLoader runner --maxWorkers 1 "$EVIDENCE_TEST" -t "$EVIDENCE_PATTERN" 2>&1 | tee .artifacts/diagnostic/results.log
+      - name: Verify diagnostic source boundary
         if: always()
+        env:
+          EXPECTED_PATHS: ${{ matrix.paths }}
         run: |
-          test "$(git diff --name-only)" = ui/src/pages/chat/components/chat-composer-regions.tsx
+          set -euo pipefail
+          test "$(git diff --name-only)" = "$EXPECTED_PATHS"
           git diff --cached --exit-code
-          cmp .artifacts/home-candidate/applied.patch <(git diff --binary)
+          cmp .artifacts/diagnostic/applied.patch <(git diff --binary)
+          git diff --name-only -z | xargs -0 sha256sum > .artifacts/diagnostic/changed-source.sha256
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: composer-home-candidate-${{ github.run_id }}
-          path: .artifacts/home-candidate
-          if-no-files-found: warn
-          retention-days: 7
-  pointer-diagnostic:
-    name: Native pointer focus diagnostic (unpatched head)
-    runs-on: blacksmith-16vcpu-ubuntu-2404
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          ref: f07d1401ab94efa7e4128b13a6219004a7c8b248
-          persist-credentials: false
-      - uses: ./.github/actions/setup-node-env
-        with:
-          node-version: 24.x
-          install-bun: "false"
-          cache-mode: restore
-          dependency-cache: "true"
-          restore-test-caches: "true"
-      - uses: ./.github/actions/setup-playwright-chromium
-        with:
-          cache-mode: restore
-      - name: Add native pointer and textarea identity capture
-        run: |
-          set -euo pipefail
-          mkdir -p .artifacts/pointer-diagnostic
-          git rev-parse HEAD > .artifacts/pointer-diagnostic/source.txt
-          sha256sum ui/src/e2e/chat-composer-pointer-activation.e2e.test.ts > .artifacts/pointer-diagnostic/test-before.sha256
-          python3 - <<'PY_DIAGNOSTIC'
-          from pathlib import Path
-          p = Path("ui/src/e2e/chat-composer-pointer-activation.e2e.test.ts")
-          s = p.read_text()
-          marker = "      await send.tap();"
-          assert s.count(marker) == 1
-          s = s.replace(marker, '      await textarea.evaluate((node) => {\n        const diagnosticWindow = window as Window & {\n          composerDiagnostic?: { original: HTMLTextAreaElement; event?: Event };\n        };\n        const state = { original: node as HTMLTextAreaElement, event: undefined as Event | undefined };\n        diagnosticWindow.composerDiagnostic = state;\n        window.addEventListener("pointerdown", (event) => { state.event = event; }, { once: true });\n      });\n' + marker + "\n" + '      console.log("[pointer-diagnostic]", await page.evaluate(() => {\n        const state = (window as Window & {\n          composerDiagnostic?: { original: HTMLTextAreaElement; event?: Event };\n        }).composerDiagnostic;\n        const current = document.querySelector(".agent-chat__input textarea");\n        return {\n          defaultPrevented: state?.event?.defaultPrevented,\n          cancelable: state?.event?.cancelable,\n          activeTag: document.activeElement?.tagName,\n          activeClass: document.activeElement?.className,\n          activeAriaLabel: document.activeElement?.getAttribute("aria-label"),\n          originalConnected: state?.original.isConnected,\n          sameTextarea: state?.original === current,\n          currentFocused: document.activeElement === current,\n        };\n      }));\n      await page.screenshot({ path: ".artifacts/pointer-diagnostic/after-tap.png", fullPage: false });\n')
-          p.write_text(s)
-          PY_DIAGNOSTIC
-          git diff -- ui/src/e2e/chat-composer-pointer-activation.e2e.test.ts > .artifacts/pointer-diagnostic/diagnostic-test.patch
-          sha256sum ui/src/e2e/chat-composer-pointer-activation.e2e.test.ts > .artifacts/pointer-diagnostic/test-after.sha256
-      - name: Diagnose native touch focus
-        env:
-          OPENCLAW_UI_E2E_DIAGNOSTIC_DIR: .artifacts/pointer-diagnostic/failures
-        run: |
-          set -euo pipefail
-          node scripts/run-vitest.mjs run --config test/vitest/vitest.ui-e2e.config.ts --configLoader runner --maxWorkers 1 ui/src/e2e/chat-composer-pointer-activation.e2e.test.ts -t 'Android-like tap' 2>&1 | tee .artifacts/pointer-diagnostic/results.log
-      - name: Verify only the diagnostic test changed
-        if: always()
-        run: |
-          test "$(git diff --name-only)" = ui/src/e2e/chat-composer-pointer-activation.e2e.test.ts
-          git diff --cached --exit-code
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        if: always()
-        with:
-          name: composer-pointer-diagnostic-${{ github.run_id }}
-          path: .artifacts/pointer-diagnostic
+          name: composer-owner-${{ matrix.label }}-${{ github.run_id }}
+          path: |
+            .artifacts/diagnostic
+            .artifacts/home-diagnostic
+            .artifacts/pointer-diagnostic
           if-no-files-found: warn
           retention-days: 7

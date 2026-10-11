@@ -1,0 +1,107 @@
+--- a/ui/src/e2e/session-progress-motion.e2e.test.ts
++++ b/ui/src/e2e/session-progress-motion.e2e.test.ts
+@@ -244,12 +244,58 @@
+           await page.screenshot({ fullPage: false }),
+         );
+       };
++      const captureHomeDiagnostic = async (label: string) => {
++        const snapshot = await page.evaluate(() => {
++          const host = document.querySelector("openclaw-home-session");
++          const pane = host?.querySelector("openclaw-chat-pane") as (HTMLElement & {
++            presented?: boolean;
++            visuallyPresented?: boolean;
++            compact?: boolean;
++            progressCard?: { card?: unknown };
++            progressCardPresentation?: { card?: unknown; identity?: string } | null;
++            progressCardInitialLoading?: boolean;
++          }) | null;
++          const shell = host?.querySelector(".agent-chat__composer-shell");
++          const float = host?.querySelector<HTMLElement>(".agent-chat__progress-float");
++          const footer = float?.closest(".chat-footer__context");
++          const layout = (element: Element | null | undefined) => element ? { hidden: element.hasAttribute("hidden"), display: getComputedStyle(element).display, visibility: getComputedStyle(element).visibility, rects: element.getClientRects().length } : null;
++          return {
++            paneFound: Boolean(pane),
++            presented: pane?.presented,
++            visuallyPresented: pane?.visuallyPresented,
++            compact: pane?.compact,
++            card: pane?.progressCard?.card,
++            presentation: pane?.progressCardPresentation ? { card: pane.progressCardPresentation.card, identity: pane.progressCardPresentation.identity } : null,
++            initialLoading: pane?.progressCardInitialLoading,
++            floatClass: float?.className,
++            floatHtml: float?.outerHTML.slice(0, 3000),
++            floatLayout: layout(float),
++            footerLayout: layout(footer),
++            shellLayout: layout(shell),
++            litContents: float?.querySelectorAll(".chat-composer-lit-content").length,
++            litHtml: float?.querySelector(".chat-composer-lit-content")?.innerHTML.slice(0, 3000),
++            progressFloats: host?.querySelectorAll(".agent-chat__progress-float").length,
++            progressCards: host?.querySelectorAll("[data-progress-card-placement]").length,
++            composerVisible: Boolean(shell?.getClientRects().length),
++            childText: host?.textContent?.slice(-2500),
++          };
++        });
++        console.log("[home-progress-diagnostic]", label, JSON.stringify(snapshot));
++        const directory = ".artifacts/home-diagnostic";
++        await mkdir(directory, { recursive: true });
++        await writeFile(path.join(directory, `${reducedMotion}-${mobile}-${label}.png`),
++          await page.screenshot({ fullPage: false }));
++      };
+       try {
+         // The dock requires advertised history/send capabilities and is suppressed
+         // when its own Home conversation already owns the primary chat page.
++        page.on("console", (message) => {
++          if (message.text().startsWith("[composer-")) console.log(message.text());
++        });
+         await page.goto(suite.server.baseUrl + "new");
+         await openProgressHomeDock(page);
+         await gateway.waitForRequest("chat.startup", { match: { sessionKey } });
++        await captureHomeDiagnostic("after-startup");
+         if (mobile) {
+           await card.locator("summary").click();
+         }
+@@ -409,6 +455,7 @@
+           await expect.poll(() => card.getAttribute("open")).toBeNull();
+         }
+       } finally {
++        await captureHomeDiagnostic("before-close");
+         await page.close();
+         if (proofDir && video) {
+           await video.saveAs(path.join(proofDir, "gesture-cycle.webm"));
+--- a/ui/src/pages/chat/components/chat-composer-controls.ts
++++ b/ui/src/pages/chat/components/chat-composer-controls.ts
+@@ -20,7 +20,20 @@
+   const value = (key: PropertyKey) => {
+     let projection = values.get(key);
+     if (!projection) {
+-      projection = runWithOwner(owner, () => createMemo(() => Reflect.get(read(), key)));
++      projection = runWithOwner(owner, () => createMemo(() => {
++        const raw = read();
++        const result = Reflect.get(raw, key);
++        const paneId = Reflect.get(raw, "paneId");
++        if (typeof paneId === "string" && paneId.startsWith("home-dock") &&
++            (key === "progressCard" || key === "progressCardInitialLoading")) {
++          console.log("[composer-home-projection]", JSON.stringify({
++            paneId, key, hasValue: Boolean(result),
++            revision: result && typeof result === "object" ? Reflect.get(result, "revision") : undefined,
++            initialLoading: key === "progressCardInitialLoading" ? result : undefined,
++          }));
++        }
++        return result;
++      }));
+       values.set(key, projection);
+     }
+     return projection();
+@@ -106,6 +119,13 @@
+       this.component = component;
+     }
+     this.latestProps = props;
++    const paneId = Reflect.get(props, "paneId");
++    if (typeof paneId === "string" && paneId.startsWith("home-dock")) {
++      console.log("[composer-directive-render]", JSON.stringify({
++        paneId, hasCard: Boolean(Reflect.get(props, "progressCard")),
++        initialLoading: Reflect.get(props, "progressCardInitialLoading"),
++      }));
++    }
+     this.mount = () => {
+       const [read, write] = createSignal<object>(() => this.latestProps, { equals: false });
+       this.updateProps = (next) => write(() => next);
