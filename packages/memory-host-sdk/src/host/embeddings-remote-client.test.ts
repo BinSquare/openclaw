@@ -1,8 +1,13 @@
 // Memory Host SDK tests cover embeddings remote client behavior.
 import "openclaw/plugin-sdk/compiled-subprocess-testing";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { resolveRemoteEmbeddingBearerClient } from "./embeddings-remote-client.js";
+import { withEnvOnlyAuthProfileStore } from "../../../../src/agents/auth-profiles/store.js";
+import { resolveRemoteEmbeddingBearerClient as resolveConfiguredClient } from "./embeddings-remote-client.js";
 import type { EmbeddingProviderOptions } from "./embeddings.types.js";
+
+// Destination tests use config credentials, not persisted or external accounts.
+const resolveRemoteEmbeddingBearerClient: typeof resolveConfiguredClient = (params) =>
+  withEnvOnlyAuthProfileStore(() => resolveConfiguredClient(params));
 
 const configuredProvider = {
   baseUrl: "https://provider.example.test/v1",
