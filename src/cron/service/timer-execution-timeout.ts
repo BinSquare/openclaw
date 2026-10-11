@@ -56,6 +56,7 @@ export type TimedCronRunOutcome = CronJobExecutionResult & {
   request?: {
     executionJob: CronJob;
     preserveCadence: boolean;
+    onExitWatcherCompletion?: boolean;
     scheduleOwnershipAtMs: number;
     runId?: string;
     terminalTracker?: { emitted: boolean };

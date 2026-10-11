@@ -199,6 +199,7 @@ export async function finalizeCompletedCronRunOutcomes(
             },
             request: request && {
               preserveCadence: request.preserveCadence,
+              onExitWatcherCompletion: request.onExitWatcherCompletion,
               scheduleOwnershipAtMs: request.scheduleOwnershipAtMs,
             },
           };

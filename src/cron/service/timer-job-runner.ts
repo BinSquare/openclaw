@@ -257,9 +257,8 @@ async function executeJobCoreWithTimeoutUnfinalized(
       error,
       // A timeout raised by this service-owned watchdog is authoritative even
       // when the interrupted main-session heartbeat has no model attribution.
-      ...(interruption !== "cancelled" && {
-        errorClassification: { kind: "reason", reason: "timeout" },
-      }),
+      errorClassification:
+        interruption === "cancelled" ? { kind: "aborted" } : { kind: "reason", reason: "timeout" },
       // The abort race must retain attribution already reported by the runner.
       ...(execution && {
         provider: execution.provider,

@@ -111,6 +111,7 @@ async function finishPreparedManualRun(
           request: {
             executionJob,
             preserveCadence: isImmediateCronRunMode(mode),
+            onExitWatcherCompletion: prepared.onExit !== undefined,
             scheduleOwnershipAtMs: prepared.scheduleOwnershipAtMs,
             runId: prepared.runId,
             terminalTracker: prepared.terminalTracker,
