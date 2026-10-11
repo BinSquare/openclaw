@@ -22,6 +22,14 @@ With a repository selected, the branch picker shows **From main** (or the select
 
 For a repository on an assigned worker, **Current checkout** uses the selected named branch. An omitted ref resolves to that repository's authenticated default branch; it does not assume `main`. **New worktree** starts a separate session branch from the selected branch, tag, or commit. Both choices use a session-isolated directory on the worker. Neither materializes a checkout on the Gateway. The existing `sessions.create` parameters express this choice as `repository: { url, ref? }` with `worktree: false` or `worktree: true`; omitting `worktree` preserves the separate-session-branch behavior. An accepted Current branch stays bound across creation retries even if the upstream default changes.
 
+When Current checkout names a branch explicitly, session creation records that
+selection without waiting for a second GitHub metadata read. Repository
+preparation still verifies the repository, caller access, and selected branch
+before repository commands can execute. Profiles that support background
+repository preparation can overlap that verification with worker startup;
+other profiles verify during dispatch. An omitted ref still needs an
+authenticated default-branch lookup before creation can bind the branch.
+
 If the Gateway restarts during provisioning, the pending first message waits for recovery and continues automatically when its worker is ready. Temporary startup or suspension errors do not cancel setup. The first message stays before later recovery notices in the chat, including after reconnecting.
 
 If startup recovery times out, the notice distinguishes setup still in progress from a Gateway that could not confirm completion, and confirms that the first message has not been sent. **Retry** checks the existing worker first. It waits for setup already in progress and sends the preserved first message once that worker is ready. A replacement is requested only when the placement permits a new dispatch; a failed worker that still needs cleanup must be stopped first. Reconnecting alone never requests a replacement.

@@ -261,6 +261,7 @@ test("sessions.create carries Current default/selected and New checkout to isola
       contents: "selected branch\n",
     },
   ]) {
+    vi.mocked(fetch).mockClear();
     // Only external metadata and Git transport are synthetic. Public creation,
     // SQLite ownership, node workspace isolation and Git branch binding run.
     const created = await withEnvAsync(
@@ -294,6 +295,11 @@ test("sessions.create carries Current default/selected and New checkout to isola
         ),
     );
     expect(created.ok, JSON.stringify(created.error)).toBe(true);
+    if (choice.worktree === false && choice.ref) {
+      // Selected branches are verified during dispatch, not by a duplicate
+      // network admission before session creation.
+      expect(fetch).not.toHaveBeenCalled();
+    }
     const { key, entry } = created.payload!;
     const saved = loadSessionEntry({ agentId: "main", sessionKey: key, storePath });
     expect(saved).not.toHaveProperty("worktree");
@@ -304,6 +310,25 @@ test("sessions.create carries Current default/selected and New checkout to isola
       throw new Error("Created repository workspace is unavailable");
     }
     expect(row.branch).toBe(choice.branch ?? `openclaw/${row.workspaceId}`);
+    if (choice.worktree === false && choice.ref) {
+      const retry = await directSessionReq<{
+        entry: { repositoryWorkspaceId: string };
+      }>(
+        "sessions.create",
+        {
+          key,
+          agentId: "main",
+          repository: { url, ref: choice.ref },
+          worktree: false,
+        },
+        controlUiClient,
+      );
+      expect(retry.ok, JSON.stringify(retry.error)).toBe(true);
+      expect(retry.payload?.entry.repositoryWorkspaceId).toBe(row.workspaceId);
+      expect((await getSessionRepositoryWorkspaceStore().get(row.workspaceId))?.requestedRef).toBe(
+        "refs/heads/selected/branch",
+      );
+    }
     const worker = createNodeWorkerRepositoryPreparation((command) =>
       runtime.exec({
         gatewayNamespace: "checkout-fixture",

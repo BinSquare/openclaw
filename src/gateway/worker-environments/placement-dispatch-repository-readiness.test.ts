@@ -6,6 +6,7 @@ import { createDeferred } from "../../../test/helpers/promise.js";
 import { createAdmittedRunOperatorAuthority } from "../../agents/admitted-run-context.js";
 import { openOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
 import { closeStateDatabaseForTest } from "../../test-utils/database-cleanup.js";
+import { createNodeRepositoryReadiness } from "./node-worker-repository-readiness.js";
 import * as diagnostics from "./placement-diagnostics.js";
 import { createPlacementFailureActions } from "./placement-dispatch-failure.js";
 import { createWorkerPlacementDispatchStartup } from "./placement-dispatch-startup.js";
@@ -50,16 +51,37 @@ it.each(["failed", "revoked"] as const)(
         },
         retain: () => release,
       });
+      const baseTunnel = harness.tunnelHandle(2);
+      const repositoryCommand = vi.fn(baseTunnel.runWorkspaceCommand);
+      const readiness = createNodeRepositoryReadiness({
+        signal: new AbortController().signal,
+        assertCurrent: () => {},
+        run: async (command) => ({
+          ...(await baseTunnel.runWorkspaceCommand(command)),
+          stdout: command.repositoryPreparation?.status ?? "",
+          workspaceDir: "/worker/workspace",
+        }),
+      });
       const tunnel: WorkerTunnelHandle = {
-        ...harness.tunnelHandle(2),
-        prepareRepositoryWorkspace: async () => "/worker/workspace",
-        settleRepositoryWorkspace: vi.fn(async () => {}),
+        ...baseTunnel,
+        prepareRepositoryWorkspace: readiness.prepare,
+        settleRepositoryWorkspace: readiness.settle,
+        runWorkspaceCommand: (command) => readiness.execute(command, repositoryCommand),
       };
       vi.mocked(harness.environments.startTunnel).mockImplementation(async () => tunnel);
-      vi.mocked(harness.environments.prepareProjectIntent).mockImplementation(async () => {
+      const prepareIntent = vi
+        .mocked(harness.environments.prepareProjectIntent)
+        .getMockImplementation();
+      if (!prepareIntent) {
+        throw new Error("Repository intent fixture is unavailable");
+      }
+      vi.mocked(harness.environments.prepareProjectIntent).mockImplementation(async (...args) => {
         entered.resolve();
         await delayed.promise;
-        throw new Error("fixture repository admission failed");
+        if (outcome === "failed") {
+          throw new Error("fixture repository admission failed");
+        }
+        return await prepareIntent(...args);
       });
       const startup = createWorkerPlacementDispatchStartup({
         placements: placementStore,
@@ -79,8 +101,8 @@ it.each(["failed", "revoked"] as const)(
           agentId: REQUEST.agentId,
           sessionKey: REQUEST.sessionKey,
           url: "https://github.com/fixture/source.git",
-          requestedRef: "topic",
-          branch: "fixture/topic",
+          requestedRef: "refs/heads/topic",
+          branch: "topic",
           baseCommit: null,
           baseManifestHash: null,
           checkpointRef: null,
@@ -133,19 +155,38 @@ it.each(["failed", "revoked"] as const)(
         repositoryPreparation: "pending",
         remoteWorkspaceDir: "/worker/workspace",
       });
+      // The readiness handshake itself uses this transport; only a subsequent
+      // repository command must remain withheld.
+      const pendingCommand = tunnel.runWorkspaceCommand({
+        argv: ["git", "status"],
+        transportRetry: "never",
+      });
+      void pendingCommand.catch(() => undefined);
+      expect(repositoryCommand.mock.calls.some(([command]) => command.argv[0] === "git")).toBe(
+        false,
+      );
       expect(release).not.toHaveBeenCalled();
       if (outcome === "revoked") {
         current = false;
       }
       delayed.resolve();
-      await expect(background[0]).rejects.toThrow("fixture repository admission failed");
+      await expect(background[0]).rejects.toThrow(
+        outcome === "revoked"
+          ? "fixture original authority revoked"
+          : "fixture repository admission failed",
+      );
+      await expect(pendingCommand).rejects.toThrow(
+        "Repository preparation failed; this operation did not run",
+      );
+      expect(repositoryCommand.mock.calls.some(([command]) => command.argv[0] === "git")).toBe(
+        false,
+      );
       expect(placementStore.get(REQUEST.sessionId)).toMatchObject({
         state: "active",
         generation: active.generation,
         repositoryPreparation: "failed",
         workspaceBaseManifestRef: null,
       });
-      expect(tunnel.settleRepositoryWorkspace).toHaveBeenCalledWith("failed");
       expect(release).toHaveBeenCalledOnce();
       expect(stage).toHaveBeenCalledWith(
         REQUEST.sessionId,

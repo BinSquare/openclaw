@@ -102,6 +102,32 @@ function sourceChanged(): never {
   );
 }
 
+/** A named Current checkout can be recorded before dispatch admits its source. */
+export function selectedCurrentCheckoutRef(ref: string, defaultBranch?: string) {
+  let requestedRef =
+    ref === "HEAD"
+      ? defaultBranch
+        ? `heads/${defaultBranch}`
+        : ""
+      : ref.replace(/^refs\/(?=heads\/|tags\/)/u, "");
+  if (
+    !requestedRef ||
+    requestedRef === "heads/" ||
+    requestedRef.startsWith("tags/") ||
+    requestedRef.startsWith("refs/") ||
+    GitObject.test(requestedRef)
+  ) {
+    throw new Error(
+      "Current checkout requires a named branch; use New worktree for a tag or commit.",
+    );
+  }
+  requestedRef = requestedRef.startsWith("heads/") ? requestedRef : `heads/${requestedRef}`;
+  if (requestedRef.length > 1024 || /\p{Cc}/u.test(requestedRef)) {
+    throw new Error("GitHub repository has no valid source reference; select a branch or commit.");
+  }
+  return { branch: requestedRef.slice("heads/".length), ref: `refs/${requestedRef}` };
+}
+
 /** Admit source before capacity selection; credentials remain with this Gateway owner. */
 export async function prepareRepositoryWorkerProjectSource(params: AdmissionRequest) {
   const expected = params.expected && readRepositoryWorkerProjectSnapshot(params.expected);
@@ -338,18 +364,10 @@ export async function prepareRepositoryWorkerProjectSource(params: AdmissionRequ
         : request.ref.replace(/^refs\/(?=heads\/|tags\/)/u, "");
     const currentBranch = params.repository?.currentBranch === true;
     if (currentBranch) {
-      if (
-        !requestedRef ||
-        requestedRef === "heads/" ||
-        requestedRef.startsWith("tags/") ||
-        requestedRef.startsWith("refs/") ||
-        GitObject.test(requestedRef)
-      ) {
-        throw new Error(
-          "Current checkout requires a named branch; use New worktree for a tag or commit.",
-        );
-      }
-      requestedRef = requestedRef.startsWith("heads/") ? requestedRef : `heads/${requestedRef}`;
+      requestedRef = selectedCurrentCheckoutRef(
+        request.ref ?? "HEAD",
+        typeof metadata.defaultBranch === "string" ? metadata.defaultBranch : undefined,
+      ).ref.slice("refs/".length);
     }
     if (
       !request.baseCommit &&

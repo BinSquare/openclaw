@@ -128,50 +128,57 @@ export function prepareSessionRepositoryWorkspace(
     let ref = repository.ref;
     let branch: string | undefined;
     if (options.currentCheckout) {
-      const { prepareRepositoryWorkerProjectSource } =
+      const { prepareRepositoryWorkerProjectSource, selectedCurrentCheckoutRef } =
         await import("../worker-environments/repository-project-admission.js");
       assertCurrent();
-      const selected = await prepareRepositoryWorkerProjectSource({
-        namespace: "session-create",
-        repository: {
-          agentId: target.agentId,
-          url: repository.url,
-          ref: ref ?? (existing ? `refs/heads/${existing.branch}` : undefined),
-          currentBranch: true,
-        },
-        getConfig: options.getConfig,
-        assertCurrent: assertNativeCurrent,
-        ...(process.env.FACTORY_AUTH_MODE === "github"
-          ? {
-              readNativeCredential: async (_selectedEnv, admission) => {
-                assertCurrent();
-                const env = factoryGitHubActorEnvironment(options.client, target.key);
-                if (!env) {
-                  throw new Error("Factory GitHub caller authority changed.");
-                }
-                return await readFactoryGitHubToken(
-                  env,
-                  factoryGitHubClientProof({
-                    client: options.client,
-                    claim: {
-                      purpose: "session-create-project",
-                      binding: {
-                        kind: "session-create",
-                        agentId: target.agentId,
-                        sessionKey: target.key,
-                        ...(target.entry ? { sessionId: target.entry.sessionId } : {}),
-                        requestDigest: factoryGitHubRequestDigest(repository.url),
+      const selectedRef = ref && ref !== "HEAD" ? selectedCurrentCheckoutRef(ref) : undefined;
+      // Dispatch verifies an explicit branch before any repository command
+      // executes; omitted or HEAD refs need a remote default-branch lookup here.
+      const selected =
+        selectedRef ??
+        (await prepareRepositoryWorkerProjectSource({
+          namespace: "session-create",
+          repository: {
+            agentId: target.agentId,
+            url: repository.url,
+            ref: ref ?? (existing ? `refs/heads/${existing.branch}` : undefined),
+            currentBranch: true,
+          },
+          getConfig: options.getConfig,
+          assertCurrent: assertNativeCurrent,
+          ...(process.env.FACTORY_AUTH_MODE === "github"
+            ? {
+                readNativeCredential: async (_selectedEnv, admission) => {
+                  assertCurrent();
+                  const env = factoryGitHubActorEnvironment(options.client, target.key);
+                  if (!env) {
+                    throw new Error("Factory GitHub caller authority changed.");
+                  }
+                  return await readFactoryGitHubToken(
+                    env,
+                    factoryGitHubClientProof({
+                      client: options.client,
+                      claim: {
+                        purpose: "session-create-project",
+                        binding: {
+                          kind: "session-create",
+                          agentId: target.agentId,
+                          sessionKey: target.key,
+                          ...(target.entry ? { sessionId: target.entry.sessionId } : {}),
+                          requestDigest: factoryGitHubRequestDigest(repository.url),
+                        },
                       },
-                    },
-                    assertCurrent,
-                  }),
-                  admission,
-                );
-              },
-            }
-          : {}),
-      });
-      assertRepositoryCurrent = selected.assertCurrent;
+                      assertCurrent,
+                    }),
+                    admission,
+                  );
+                },
+              }
+            : {}),
+        }));
+      if ("assertCurrent" in selected) {
+        assertRepositoryCurrent = selected.assertCurrent;
+      }
       assertCurrent();
       branch = selected.branch;
       if (!branch) {
