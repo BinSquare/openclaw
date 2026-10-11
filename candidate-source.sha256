@@ -1,0 +1,7 @@
+9b899e59b8604bfcf7b32dd98e28286edda167abba806c1cb6b74c78377b65eb  ui/src/pages/chat/chat-composer-pointer-activation.test.ts
+8a90b832523f3f13a90e5e7f1637777a7570c2fd3602e12e1205510e7a6d69e4  ui/src/pages/chat/chat-composer-queue.test.ts
+21d45e9d09e157550d353a3c40ccfa326abff5de8ce79b744accda3fb863491f  ui/src/pages/chat/chat-view-goals.test.ts
+5c767e595f1dd4609456460f1bd2d1013870418cf7824586108df1a0e248c1e7  ui/src/pages/chat/components/chat-composer-controls.tsx
+2181370d623390ad21bf24119044254f16cf3fe3282c7c31ccbb0dfc1fb3a749  ui/src/pages/chat/components/chat-composer-queue.tsx
+72ac4d6964acb70fea7d7b66e710dca5190a8996b415b50517b7680df75241c2  ui/src/pages/chat/components/chat-composer-regions.tsx
+a19344dcbb37240b7449652079ea800dfac6eb85e2ea97fdce66df29b85b48a8  ui/src/pages/chat/components/chat-composer-view.tsx

@@ -1,38 +1,22 @@
-name: Composer projection and pointer handler diagnostics
+name: Composer owner fixes candidate proof
 on:
   push:
     branches: [solid2/w-chat-5-evidence]
 permissions:
   contents: read
 concurrency:
-  group: composer-projection-handler-diagnostics
+  group: composer-owner-fixes-candidate
   cancel-in-progress: false
 jobs:
-  diagnostic:
-    name: ${{ matrix.label }} diagnostic
+  candidate:
+    name: Owner fixes (${{ matrix.group }})
     runs-on: blacksmith-16vcpu-ubuntu-2404
-    timeout-minutes: 15
+    timeout-minutes: 25
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 3
       matrix:
-        include:
-          - label: home
-            patch: diagnostic-home.patch
-            sha256: b88605ff9e036491c716bfac32dce77d74e5a219a1f9cd01bde0ac3af4b6cbe5
-            test: ui/src/e2e/session-progress-motion.e2e.test.ts
-            pattern: scrubs embedded Home.*no-preference
-            paths: |-
-              ui/src/e2e/session-progress-motion.e2e.test.ts
-              ui/src/pages/chat/components/chat-composer-controls.ts
-          - label: pointer
-            patch: diagnostic-pointer.patch
-            sha256: 3276d20cee773c1a613cd350351bdca381a237cd283f5cfc9ab15c666c150f5a
-            test: ui/src/e2e/chat-composer-pointer-activation.e2e.test.ts
-            pattern: Android-like tap
-            paths: |-
-              ui/src/e2e/chat-composer-pointer-activation.e2e.test.ts
-              ui/src/pages/chat/components/chat-composer-dom.ts
+        group: [home, controls, unit]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -43,18 +27,18 @@ jobs:
           ref: ${{ github.sha }}
           path: .evidence
           persist-credentials: false
-      - name: Apply exact diagnostic patch
-        env:
-          PATCH_FILE: ${{ matrix.patch }}
-          PATCH_SHA: ${{ matrix.sha256 }}
+      - name: Verify source and apply the immutable candidate
         run: |
           set -euo pipefail
-          mkdir -p .artifacts/diagnostic .artifacts/pointer-diagnostic
-          git rev-parse HEAD > .artifacts/diagnostic/source.txt
-          echo "$PATCH_SHA  .evidence/$PATCH_FILE" | sha256sum --check
-          git apply --check ".evidence/$PATCH_FILE"
-          git apply ".evidence/$PATCH_FILE"
-          git diff --binary > .artifacts/diagnostic/applied.patch
+          mkdir -p .artifacts/owner-candidate
+          git rev-parse HEAD > .artifacts/owner-candidate/source.txt
+          echo "f69f8c6be4df3cce613412273cba677a51eefedc090e28fa92e6881330b62609  .evidence/composer-owner-fixes.patch" | sha256sum --check
+          sha256sum --check .evidence/candidate-source.sha256
+          git apply --check .evidence/composer-owner-fixes.patch
+          git apply .evidence/composer-owner-fixes.patch
+          git diff --binary > .artifacts/owner-candidate/applied.patch
+          git diff --name-only > .artifacts/owner-candidate/changed-paths.txt
+          git diff --name-only -z | xargs -0 sha256sum > .artifacts/owner-candidate/candidate.sha256
       - uses: ./.github/actions/setup-node-env
         with:
           node-version: 24.x
@@ -65,31 +49,58 @@ jobs:
       - uses: ./.github/actions/setup-playwright-chromium
         with:
           cache-mode: restore
-      - name: Run only the requested diagnostic case
+      - name: Test Home progress
+        if: matrix.group == 'home'
         env:
-          EVIDENCE_TEST: ${{ matrix.test }}
-          EVIDENCE_PATTERN: ${{ matrix.pattern }}
-          OPENCLAW_UI_E2E_DIAGNOSTIC_DIR: .artifacts/diagnostic/failures
+          OPENCLAW_CAPTURE_UI_PROOF: "1"
+          OPENCLAW_UI_E2E_ARTIFACT_DIR: .artifacts/owner-candidate/screenshots
+          OPENCLAW_UI_E2E_DIAGNOSTIC_DIR: .artifacts/owner-candidate/diagnostics
         run: |
           set -euo pipefail
-          node scripts/run-vitest.mjs run --config test/vitest/vitest.ui-e2e.config.ts --configLoader runner --maxWorkers 1 "$EVIDENCE_TEST" -t "$EVIDENCE_PATTERN" 2>&1 | tee .artifacts/diagnostic/results.log
-      - name: Verify diagnostic source boundary
+          node scripts/run-vitest.mjs run --config test/vitest/vitest.ui-e2e.config.ts --configLoader runner --maxWorkers 1 \
+            ui/src/e2e/session-progress-motion.e2e.test.ts \
+            ui/src/e2e/session-progress-scroll.e2e.test.ts \
+            ui/src/e2e/session-progress-disclosure.e2e.test.ts \
+            ui/src/e2e/session-progress-polish.e2e.test.ts 2>&1 | tee .artifacts/owner-candidate/results.log
+      - name: Test pointer, queue, and goal controls
+        if: matrix.group == 'controls'
+        env:
+          OPENCLAW_CAPTURE_UI_PROOF: "1"
+          OPENCLAW_UI_E2E_ARTIFACT_DIR: .artifacts/owner-candidate/screenshots
+          OPENCLAW_UI_E2E_DIAGNOSTIC_DIR: .artifacts/owner-candidate/diagnostics
+        run: |
+          set -euo pipefail
+          node scripts/run-vitest.mjs run --config test/vitest/vitest.ui-e2e.config.ts --configLoader runner --maxWorkers 1 \
+            ui/src/e2e/chat-composer-pointer-activation.e2e.test.ts \
+            ui/src/e2e/chat-flow.queue-edit.e2e.test.ts \
+            ui/src/e2e/chat-flow.queue-reorder.e2e.test.ts \
+            ui/src/e2e/chat-goal-recovery.e2e.test.ts 2>&1 | tee .artifacts/owner-candidate/results.log
+      - name: Test four focused unit files separately
+        if: matrix.group == 'unit'
+        run: |
+          set -euo pipefail
+          tests=(
+            ui/src/pages/chat/chat-composer-queue.test.ts
+            ui/src/pages/chat/chat-composer-pointer-activation.test.ts
+            ui/src/pages/chat/chat-view-goals.test.ts
+            ui/src/pages/chat/chat-composer-progress-refresh.test.ts
+          )
+          failed=0
+          for test_file in "${tests[@]}"; do
+            pnpm test "$test_file" --maxWorkers=1 2>&1 | tee ".artifacts/owner-candidate/${test_file##*/}.log" || failed=1
+          done
+          exit "$failed"
+      - name: Verify the candidate did not change during testing
         if: always()
-        env:
-          EXPECTED_PATHS: ${{ matrix.paths }}
         run: |
           set -euo pipefail
-          test "$(git diff --name-only)" = "$EXPECTED_PATHS"
           git diff --cached --exit-code
-          cmp .artifacts/diagnostic/applied.patch <(git diff --binary)
-          git diff --name-only -z | xargs -0 sha256sum > .artifacts/diagnostic/changed-source.sha256
+          cmp .artifacts/owner-candidate/applied.patch <(git diff --binary)
+          cmp .artifacts/owner-candidate/changed-paths.txt <(git diff --name-only)
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: composer-owner-${{ matrix.label }}-${{ github.run_id }}
-          path: |
-            .artifacts/diagnostic
-            .artifacts/home-diagnostic
-            .artifacts/pointer-diagnostic
+          name: composer-owner-candidate-${{ matrix.group }}-${{ github.run_id }}
+          path: .artifacts/owner-candidate
           if-no-files-found: warn
           retention-days: 7
