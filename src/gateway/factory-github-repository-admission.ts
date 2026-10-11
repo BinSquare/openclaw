@@ -38,7 +38,8 @@ export async function readFactoryRepositoryAdmission(params: {
   if (!proof || !password || !Number.isSafeInteger(actorId) || actorId <= 0) {
     throw new Error("Factory repository admission authority is unavailable.");
   }
-  const signal = AbortSignal.timeout(5_000);
+  // Match the existing Factory broker client budget; private proof redemption alone permits 10s.
+  const signal = AbortSignal.timeout(15_000);
   const lookupId = randomUUID();
   const trace = createDiagnosticTraceContextFromActiveScope();
   const startedAt = performance.now();
@@ -127,7 +128,7 @@ export async function readFactoryRepositoryAdmission(params: {
       operation: "repository_admission",
       phase,
       outcome,
-      code,
+      diagnosticCode: code,
       httpStatus,
       elapsedMs: Math.round(Math.max(0, performance.now() - startedAt)),
     });

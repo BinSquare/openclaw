@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import { GitHubCredentialLookupError } from "../agents/github-credential-lookup-error.js";
 import type { GitHubRepositoryAdmissionRequest } from "../agents/github-credential-reader.js";
+import { serializeRedactedFileLogRecord } from "../logging/redact.js";
 import type { FactoryGitHubProofClaim } from "./factory-github-proof.js";
 import { readFactoryRepositoryAdmission } from "./factory-github-repository-admission.js";
 const logs = vi.hoisted(() => ({ info: vi.fn() }));
@@ -93,7 +94,7 @@ describe("Factory App repository admission", () => {
         lookupId: expect.stringMatching(/^[a-f0-9-]{36}$/u),
         operation: "repository_admission",
         outcome: "resolved",
-        code: "authorized",
+        diagnosticCode: "authorized",
         httpStatus: 200,
       }),
     );
@@ -107,6 +108,47 @@ describe("Factory App repository admission", () => {
       expect(text).not.toContain(secret);
     }
   });
+  it.each([true, false])(
+    "accepts a slow broker only while original authority stays current (%s)",
+    async (current) => {
+      const controller = new AbortController();
+      vi.spyOn(AbortSignal, "timeout").mockImplementation((milliseconds) => {
+        setTimeout(
+          () => controller.abort(new DOMException("deadline", "TimeoutError")),
+          milliseconds,
+        );
+        return controller.signal;
+      });
+      const response = createDeferred<Response>();
+      const transport = vi.fn(() => response.promise);
+      vi.stubGlobal("fetch", transport);
+      let active = true;
+      const observed = readFactoryRepositoryAdmission({
+        env,
+        request,
+        claim,
+        profileId: "original-human",
+        assertCurrent: () => {
+          if (!active) {
+            throw new Error("original owner closed");
+          }
+        },
+      }).then(
+        () => "accepted",
+        (error: unknown) => error,
+      );
+      await vi.advanceTimersByTimeAsync(9_000);
+      active = current;
+      response.resolve(Response.json(receipt()));
+      const result = await observed;
+      if (current) {
+        expect(result).toBe("accepted");
+      } else {
+        expect(result).toMatchObject({ message: "original owner closed" });
+      }
+      expect(transport).toHaveBeenCalledTimes(1);
+    },
+  );
   it("classifies a deadline and refuses a late valid receipt without retry", async () => {
     const controller = new AbortController();
     const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(controller.signal);
@@ -131,9 +173,13 @@ describe("Factory App repository admission", () => {
         lookupId: expect.stringMatching(/^[a-f0-9-]{36}$/u),
       },
     });
-    expect(timeout).toHaveBeenCalledWith(5_000);
+    expect(timeout).toHaveBeenCalledWith(15_000);
     expect(transport).toHaveBeenCalledTimes(1);
     expect(JSON.stringify(error)).not.toContain("synthetic-password");
+    const meta = logs.info.mock.calls.at(-1)?.[1];
+    const redacted = serializeRedactedFileLogRecord({ "0": meta });
+    expect(redacted).toContain('"diagnosticCode":"deadline_exceeded"');
+    expect(redacted).not.toContain("synthetic-password");
     timeout.mockRestore();
   });
   it.each(["actor", "profile", "installation", "binding", "expired", "bearer"])(
