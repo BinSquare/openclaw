@@ -149,23 +149,20 @@ export async function prepareActiveRepository(params: {
     });
     try {
       params.assertCleanupCurrent();
-      const settled = await Promise.allSettled([
-        params.tunnel.settleRepositoryWorkspace!("failed"),
-        params.placements.settleRepository(
-          { ...owner, status: "failed" },
-          params.assertCleanupCurrent,
-        ),
-      ]);
-      const placementOutcome = settled[1];
-      if (placementOutcome.status === "rejected") {
-        throw placementOutcome.reason;
-      }
-      const failed = placementOutcome.value;
+      // Node failure wakes blocked commands immediately. Publish durable placement
+      // custody first so their terminal result cannot race its pending publication.
+      const failed = await params.placements.settleRepository(
+        { ...owner, status: "failed" },
+        params.assertCleanupCurrent,
+      );
       reportPlacementTransition(params.onTransition, failed);
-      if (settled[0].status === "rejected") {
+      try {
+        params.assertCleanupCurrent();
+        await params.tunnel.settleRepositoryWorkspace!("failed");
+      } catch (publicationError) {
         params.assertCleanupCurrent();
         await params.environments.stopTunnel(placement.environmentId, placement.activeOwnerEpoch);
-        throw settled[0].reason;
+        throw publicationError;
       }
     } catch (settlementError) {
       recordWorkerPlacementStage(request.sessionId, "workspace_sync_failed", {

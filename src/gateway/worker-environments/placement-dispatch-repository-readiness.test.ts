@@ -14,7 +14,7 @@ import { REQUEST } from "./placement-dispatch-test-fixtures.js";
 import { createHarness } from "./placement-dispatch-test-harness.js";
 import { createWorkerSessionPlacementStore } from "./placement-store.js";
 import type { WorkerTunnelHandle } from "./tunnel-contract.js";
-it.each(["failed", "revoked"] as const)(
+it.each(["failed", "revoked", "retired"] as const)(
   "activates hosted Codex before delayed repository admission and settles %s preparation",
   async (outcome) => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "placement-async-repository-"));
@@ -41,6 +41,21 @@ it.each(["failed", "revoked"] as const)(
       const release = vi.fn();
       const stage = vi.spyOn(diagnostics, "recordWorkerPlacementStage");
       let current = true;
+      const retired = new AbortController();
+      const settleRepository = placementStore.settleRepository.bind(placementStore);
+      vi.spyOn(placementStore, "settleRepository").mockImplementation(async (...args) => {
+        const receipt = await settleRepository(...args);
+        if (outcome === "retired") {
+          await placementStore.startDrain({
+            sessionId: receipt.sessionId,
+            environmentId: harness.ready.environmentId,
+            ownerEpoch: 2,
+            expectedGeneration: receipt.generation,
+          });
+          retired.abort(new Error("fixture placement retired"));
+        }
+        return receipt;
+      });
       const authority = createAdmittedRunOperatorAuthority({
         profileId: "fixture",
         scopes: ["operator.write"],
@@ -54,7 +69,7 @@ it.each(["failed", "revoked"] as const)(
       const baseTunnel = harness.tunnelHandle(2);
       const repositoryCommand = vi.fn(baseTunnel.runWorkspaceCommand);
       const readiness = createNodeRepositoryReadiness({
-        signal: new AbortController().signal,
+        signal: retired.signal,
         assertCurrent: () => {},
         run: async (command) => ({
           ...(await baseTunnel.runWorkspaceCommand(command)),
@@ -65,7 +80,7 @@ it.each(["failed", "revoked"] as const)(
       const tunnel: WorkerTunnelHandle = {
         ...baseTunnel,
         prepareRepositoryWorkspace: readiness.prepare,
-        settleRepositoryWorkspace: readiness.settle,
+        settleRepositoryWorkspace: vi.fn(readiness.settle),
         runWorkspaceCommand: (command) => readiness.execute(command, repositoryCommand),
       };
       vi.mocked(harness.environments.startTunnel).mockImplementation(async () => tunnel);
@@ -78,7 +93,7 @@ it.each(["failed", "revoked"] as const)(
       vi.mocked(harness.environments.prepareProjectIntent).mockImplementation(async (...args) => {
         entered.resolve();
         await delayed.promise;
-        if (outcome === "failed") {
+        if (outcome !== "revoked") {
           throw new Error("fixture repository admission failed");
         }
         return await prepareIntent(...args);
@@ -123,6 +138,11 @@ it.each(["failed", "revoked"] as const)(
             void operation.catch(() => undefined);
           },
           assertRepositoryPreparationCurrent: () => {},
+          assertRepositoryCleanupCurrent: () => {
+            if (placementStore.get(REQUEST.sessionId)?.state !== "active") {
+              throw new Error("fixture placement retired");
+            }
+          },
         },
         placement: provisioning,
         environment: harness.ready,
@@ -176,18 +196,21 @@ it.each(["failed", "revoked"] as const)(
           : "fixture repository admission failed",
       );
       await expect(pendingCommand).rejects.toThrow(
-        "Repository preparation failed; this operation did not run",
+        outcome === "retired"
+          ? "Operation aborted"
+          : "Repository preparation failed; this operation did not run",
       );
       expect(repositoryCommand.mock.calls.some(([command]) => command.argv[0] === "git")).toBe(
         false,
       );
       expect(placementStore.get(REQUEST.sessionId)).toMatchObject({
-        state: "active",
-        generation: active.generation,
+        state: outcome === "retired" ? "draining" : "active",
+        generation: active.generation + (outcome === "retired" ? 1 : 0),
         repositoryPreparation: "failed",
         workspaceBaseManifestRef: null,
       });
       expect(release).toHaveBeenCalledOnce();
+      expect(tunnel.settleRepositoryWorkspace).toHaveBeenCalledTimes(outcome === "retired" ? 0 : 1);
       expect(stage).toHaveBeenCalledWith(
         REQUEST.sessionId,
         "workspace_sync_failed",
