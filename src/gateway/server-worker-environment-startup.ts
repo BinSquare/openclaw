@@ -64,6 +64,7 @@ export type GatewayWorkerEnvironmentStartupState = Awaited<
 
 export type GatewayWorkerEnvironmentRuntime = {
   workerEnvironmentService?: WorkerEnvironmentService;
+  prepareRuntimeArtifacts?: () => void;
   workerLiveEvents?: WorkerLiveEventReceiver;
   workerTunnelManager?: WorkerTunnelManager;
   nodeWorkerGatewayNamespace?: string;
@@ -620,15 +621,16 @@ export async function createGatewayWorkerEnvironmentRuntime(params: {
     }
     throw error;
   }
-  scheduleWorkerRuntimeArtifactPreparation({
-    scope: artifactPreparation,
-    getConfig: getRuntimeConfig,
-    resolveProvider: (id) => resolveWorkerProvider(params.getPluginRegistry(), id),
-    hasMetadata: () => getGatewayPluginMetadataSnapshot() !== undefined,
-    prepareBundle: (signal) => prepareInstallation("bundle", signal),
-    prepareBootstrap: prepareNodeArtifact,
-    log: workerEnvironmentLog,
-  });
+  const prepareRuntimeArtifacts = () =>
+    scheduleWorkerRuntimeArtifactPreparation({
+      scope: artifactPreparation,
+      getConfig: getRuntimeConfig,
+      resolveProvider: (id) => resolveWorkerProvider(params.getPluginRegistry(), id),
+      hasMetadata: () => getGatewayPluginMetadataSnapshot() !== undefined,
+      prepareBundle: (signal) => prepareInstallation("bundle", signal),
+      prepareBootstrap: prepareNodeArtifact,
+      log: workerEnvironmentLog,
+    });
   bindDeviceWorkerAvailability(workerEnvironmentService, deviceRuntime.resolveAvailability);
   bindDeviceWorkerReconciliation(workerEnvironmentService, async (deviceId) => {
     const environmentIds = params.startup.store
@@ -682,6 +684,7 @@ export async function createGatewayWorkerEnvironmentRuntime(params: {
       : undefined;
   return {
     workerEnvironmentService,
+    prepareRuntimeArtifacts,
     workerLiveEvents,
     workerTunnelManager,
     nodeWorkerGatewayNamespace,

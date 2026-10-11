@@ -90,7 +90,9 @@ const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
 );
 
 async function withWorkerRuntime(
-  run: () => Promise<void>,
+  run: (
+    runtime: Awaited<ReturnType<typeof createGatewayWorkerEnvironmentRuntime>>,
+  ) => Promise<void>,
   options: {
     config?: OpenClawConfig;
     registry?: ReturnType<typeof createEmptyPluginRegistry>;
@@ -104,7 +106,7 @@ async function withWorkerRuntime(
     if (options.config) {
       setRuntimeConfigSnapshot(options.config);
     }
-    await createGatewayWorkerEnvironmentRuntime({
+    const runtime = await createGatewayWorkerEnvironmentRuntime({
       scheduler: createTestGatewayScheduler(options.clock?.clock),
       getPluginRegistry: () => registry,
       getPortalRuntime: () => undefined,
@@ -114,7 +116,7 @@ async function withWorkerRuntime(
       log: { child: () => ({ info: () => {}, warn: () => {} }) },
     });
 
-    await run();
+    await run(runtime);
   });
 }
 
@@ -153,7 +155,7 @@ describe("gateway worker tool-surface startup", () => {
   });
 });
 
-it.each(["ready", "shutdown", "generation changed"] as const)(
+it.each(["ready", "shutdown", "generation changed", "late registry"] as const)(
   "prepares immutable node artifacts before a turn without allocation: %s",
   async (outcome) => {
     const nodeArtifact = {
@@ -208,10 +210,23 @@ it.each(["ready", "shutdown", "generation changed"] as const)(
     const config: OpenClawConfig = {
       cloudWorkers: { profiles: { test: { provider: "fixture" } } },
     };
+    const provider = registry.workerProviders.get("fixture")!;
+    if (outcome === "late registry") {
+      registry.workerProviders.clear();
+    }
     await withWorkerRuntime(
-      async () => {
+      async (runtime) => {
         expect(mocks.service.ready).toHaveBeenCalledOnce();
         expect(prepareNode).not.toHaveBeenCalled();
+        if (outcome === "late registry") {
+          await clock.wake();
+          expect(prepareNode).not.toHaveBeenCalled();
+          registry.workerProviders.set("fixture", provider);
+          runtime.prepareRuntimeArtifacts?.();
+        }
+        if (outcome !== "late registry") {
+          runtime.prepareRuntimeArtifacts?.();
+        }
         const wake = clock.wake();
         await vi.dynamicImportSettled();
         expect(prepareNode).toHaveBeenCalledOnce();
@@ -232,7 +247,7 @@ it.each(["ready", "shutdown", "generation changed"] as const)(
         expect(prepareNode.mock.calls[0]?.[0]?.aborted).toBe(true);
         if (outcome === "generation changed") {
           await expect(request).rejects.toThrow("generation changed");
-        } else if (outcome === "ready") {
+        } else if (outcome === "ready" || outcome === "late registry") {
           const result = await request;
           result.assertCurrent();
           expect(result.artifacts.workerArchiveSha256).toBe(bundleArtifact.tarballSha256);
