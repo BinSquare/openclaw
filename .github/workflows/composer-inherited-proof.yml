@@ -1,50 +1,30 @@
-name: Composer exact three-worker CI proof
+name: Composer remaining contract comparison
 on:
   push:
     branches: [solid2/w-chat-5-evidence]
 permissions:
   contents: read
 concurrency:
-  group: composer-exact-three-worker-proof
+  group: composer-final-contract-comparison
   cancel-in-progress: false
 jobs:
   compare:
-    name: Exact E2E (${{ matrix.label }}, ${{ matrix.shard }}/8)
+    name: Contract comparison (${{ matrix.label }})
     runs-on: blacksmith-16vcpu-ubuntu-2404
     timeout-minutes: 45
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 2
       matrix:
         include:
           - label: head
             source: f07d1401ab94efa7e4128b13a6219004a7c8b248
-            shard: 1
-          - label: head
-            source: f07d1401ab94efa7e4128b13a6219004a7c8b248
-            shard: 3
-          - label: head
-            source: f07d1401ab94efa7e4128b13a6219004a7c8b248
-            shard: 4
-          - label: head
-            source: f07d1401ab94efa7e4128b13a6219004a7c8b248
-            shard: 8
-          - label: head
-            source: f07d1401ab94efa7e4128b13a6219004a7c8b248
-            shard: 7
           - label: base
             source: ed684fc775159cb4a3294667789c4e9e86e9293e
-            shard: 7
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ matrix.source }}
-          persist-credentials: false
-      - name: Read the exact original CI selection
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          ref: ${{ github.sha }}
-          path: .evidence
           persist-credentials: false
       - uses: ./.github/actions/setup-node-env
         with:
@@ -56,20 +36,24 @@ jobs:
       - uses: ./.github/actions/setup-playwright-chromium
         with:
           cache-mode: restore
-      - name: Install the selected native bundle suite browser
-        run: pnpm --dir ui exec playwright install --with-deps webkit
-      - name: Run the exact original three-worker shard
+      - name: Compare remaining failures
         env:
-          OPENCLAW_VITEST_INCLUDE_FILE: .evidence/include-patterns.json
-          OPENCLAW_VITEST_MAX_WORKERS: "3"
-          EVIDENCE_SHARD: ${{ matrix.shard }}
+          OPENCLAW_CAPTURE_UI_PROOF: "1"
           OPENCLAW_UI_E2E_ARTIFACT_DIR: .artifacts/inherited-proof/screenshots
           OPENCLAW_UI_E2E_DIAGNOSTIC_DIR: .artifacts/inherited-proof/diagnostics
         run: |
           set -euo pipefail
           mkdir -p .artifacts/inherited-proof
           git rev-parse HEAD | tee .artifacts/inherited-proof/source.txt
-          node scripts/run-vitest.mjs run --config test/vitest/vitest.ui-e2e.config.ts --configLoader runner --maxWorkers 3 --shard "$EVIDENCE_SHARD/8" 2>&1 | tee .artifacts/inherited-proof/results.log
+          node scripts/run-vitest.mjs run --config test/vitest/vitest.ui-e2e.config.ts --configLoader runner --maxWorkers 1 \
+            ui/src/e2e/chat-composer-pointer-activation.e2e.test.ts \
+            ui/src/e2e/chat-scroll.e2e.test.ts \
+            ui/src/e2e/chat-flow.queue-edit.e2e.test.ts \
+            ui/src/e2e/chat-flow.queue-reorder.e2e.test.ts \
+            ui/src/e2e/chat-goal-recovery.e2e.test.ts \
+            ui/src/e2e/session-progress-disclosure.e2e.test.ts \
+            ui/src/e2e/model-provider-usage-outcomes.e2e.test.ts \
+            ui/src/e2e/session-progress-polish.e2e.test.ts 2>&1 | tee .artifacts/inherited-proof/results.log
       - name: Verify source remained unchanged
         if: always()
         run: git diff --exit-code && git diff --cached --exit-code
@@ -77,7 +61,67 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: composer-exact-${{ matrix.label }}-${{ matrix.shard }}-${{ github.run_id }}
+          name: composer-contract-${{ matrix.label }}-${{ github.run_id }}
           path: .artifacts/inherited-proof
+          if-no-files-found: warn
+          retention-days: 7
+  home-diagnostic:
+    name: Home progress diagnostic (head only)
+    runs-on: blacksmith-16vcpu-ubuntu-2404
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: f07d1401ab94efa7e4128b13a6219004a7c8b248
+          persist-credentials: false
+      - uses: ./.github/actions/setup-node-env
+        with:
+          node-version: 24.x
+          install-bun: "false"
+          cache-mode: restore
+          dependency-cache: "true"
+          restore-test-caches: "true"
+      - uses: ./.github/actions/setup-playwright-chromium
+        with:
+          cache-mode: restore
+      - name: Add bounded diagnostic snapshots only to the remote test
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts/home-diagnostic
+          git rev-parse HEAD > .artifacts/home-diagnostic/source.txt
+          sha256sum ui/src/e2e/session-progress-motion.e2e.test.ts > .artifacts/home-diagnostic/test-before.sha256
+          python3 - <<'PY_DIAGNOSTIC'
+          from pathlib import Path
+          p = Path("ui/src/e2e/session-progress-motion.e2e.test.ts")
+          s = p.read_text()
+          helper_marker = "      try {\n        // The dock requires advertised history/send capabilities"
+          assert s.count(helper_marker) == 1
+          s = s.replace(helper_marker, '      const captureHomeDiagnostic = async (label: string) => {\n        const snapshot = await page.evaluate(() => {\n          const host = document.querySelector("openclaw-home-session");\n          const pane = host?.querySelector("openclaw-chat-pane") as (HTMLElement & {\n            presented?: boolean;\n            visuallyPresented?: boolean;\n            compact?: boolean;\n            progressCard?: { card?: unknown };\n            progressCardPresentation?: { card?: unknown; identity?: string } | null;\n            progressCardInitialLoading?: boolean;\n          }) | null;\n          const shell = host?.querySelector(".chat-composer");\n          return {\n            paneFound: Boolean(pane),\n            presented: pane?.presented,\n            visuallyPresented: pane?.visuallyPresented,\n            compact: pane?.compact,\n            card: pane?.progressCard?.card,\n            presentation: pane?.progressCardPresentation ? { card: pane.progressCardPresentation.card, identity: pane.progressCardPresentation.identity } : null,\n            initialLoading: pane?.progressCardInitialLoading,\n            progressFloats: host?.querySelectorAll(".agent-chat__progress-float").length,\n            progressCards: host?.querySelectorAll("[data-progress-card-placement]").length,\n            composerVisible: Boolean(shell?.getClientRects().length),\n            childText: host?.textContent?.slice(-2500),\n          };\n        });\n        console.log("[home-progress-diagnostic]", label, JSON.stringify(snapshot));\n        const directory = ".artifacts/home-diagnostic";\n        await mkdir(directory, { recursive: true });\n        await writeFile(path.join(directory, `${reducedMotion}-${mobile}-${label}.png`),\n          await page.screenshot({ fullPage: false }));\n      };\n' + helper_marker)
+          startup_marker = '        await openProgressHomeDock(page);\n        await gateway.waitForRequest("chat.startup", { match: { sessionKey } });'
+          assert s.count(startup_marker) == 1
+          s = s.replace(startup_marker, startup_marker + '\n        await captureHomeDiagnostic("after-startup");')
+          cleanup_marker = "      } finally {\n        await page.close();"
+          assert s.count(cleanup_marker) == 1
+          s = s.replace(cleanup_marker, '      } finally {\n        await captureHomeDiagnostic("before-close");\n        await page.close();')
+          p.write_text(s)
+          PY_DIAGNOSTIC
+          git diff -- ui/src/e2e/session-progress-motion.e2e.test.ts > .artifacts/home-diagnostic/diagnostic-test.patch
+          sha256sum ui/src/e2e/session-progress-motion.e2e.test.ts > .artifacts/home-diagnostic/test-after.sha256
+      - name: Capture Home owner and renderer state
+        env:
+          OPENCLAW_UI_E2E_DIAGNOSTIC_DIR: .artifacts/home-diagnostic/failures
+        run: |
+          set -euo pipefail
+          node scripts/run-vitest.mjs run --config test/vitest/vitest.ui-e2e.config.ts --configLoader runner --maxWorkers 1 ui/src/e2e/session-progress-motion.e2e.test.ts -t 'scrubs embedded Home' 2>&1 | tee .artifacts/home-diagnostic/results.log
+      - name: Verify only the diagnostic test changed
+        if: always()
+        run: |
+          test "$(git diff --name-only)" = ui/src/e2e/session-progress-motion.e2e.test.ts
+          git diff --cached --exit-code
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: composer-home-diagnostic-${{ github.run_id }}
+          path: .artifacts/home-diagnostic
           if-no-files-found: warn
           retention-days: 7
