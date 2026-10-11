@@ -184,9 +184,9 @@ suite.define(() => {
                 settingsKey,
                 JSON.stringify({
                   sidebarAgentsMode: "roster",
-                  sidebarEntries: pins,
+                  railShortcuts: pins,
                   navigationByProfile: {
-                    riley: { sidebarEntries: pins },
+                    riley: { railShortcuts: pins },
                   },
                 }),
               );
@@ -250,7 +250,7 @@ suite.define(() => {
             },
           ],
           methodResponses: {
-            "users.prefs.get": { status: "ok", entries: { "ui.sidebarEntries": railPins } },
+            "users.prefs.get": { status: "ok", entries: { "ui.railShortcuts": railPins } },
             "agents.list": agents,
             "agent.identity.get": {
               cases: agents.agents.map((agent) => ({
@@ -459,7 +459,7 @@ suite.define(() => {
         await expect.poll(() => pluginPin.count()).toBe(0);
         const savedPins = await page.evaluate((settingsKey) => {
           const settings = JSON.parse(localStorage.getItem(settingsKey) ?? "{}");
-          return settings.navigationByProfile?.riley?.sidebarEntries;
+          return settings.navigationByProfile?.riley?.railShortcuts;
         }, controlUiBundledSettingsStorageKey(suite.server.baseUrl));
         expect(savedPins).toContain("plugin:reports/overview");
         await waitForSavedSidebar(page);
