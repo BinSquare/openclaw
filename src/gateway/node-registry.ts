@@ -148,6 +148,41 @@ const AUTHORIZED_SYSTEM_RUN_EVENT_GRACE_MS = 5 * 60 * 1000;
 const FAILED_EVENT_LOG_INTERVAL_MS = 30_000;
 const log = createSubsystemLogger("gateway/nodes");
 const failedEventLogAtByNode = new WeakMap<NodeSession, number>();
+const pairingFailureLogAtByNode = new WeakMap<NodeSession, number>();
+
+function logPairingReadFailure(
+  node: NodeSession,
+  phase: "resolve" | "currentness",
+  error: unknown,
+): void {
+  const now = Date.now();
+  if (now - (pairingFailureLogAtByNode.get(node) ?? -Infinity) < FAILED_EVENT_LOG_INTERVAL_MS) {
+    return;
+  }
+  pairingFailureLogAtByNode.set(node, now);
+  const reportedPublicationState =
+    error instanceof Error && error.name === "DevicePairingPublicationUnavailableError"
+      ? Object.getOwnPropertyDescriptor(error, "publicationState")?.value
+      : undefined;
+  const publicationState =
+    reportedPublicationState === "absent" ||
+    reportedPublicationState === "blocked" ||
+    reportedPublicationState === "incomplete"
+      ? reportedPublicationState
+      : undefined;
+  const name =
+    error instanceof Error && /^[A-Za-z][A-Za-z0-9]{0,63}$/.test(error.name)
+      ? error.name
+      : "unknown";
+  log.warn("node pairing state unavailable before dispatch", {
+    nodeId: node.nodeId,
+    phase,
+    cause: publicationState ? "publication" : "resolver",
+    publicationState,
+    errorName: name,
+  });
+}
+
 /** Event transport for nodes that cannot keep a WebSocket open, such as watchOS. */
 export type NodeEventTransport = {
   send: (event: string, payload: unknown) => boolean;
@@ -344,7 +379,8 @@ export class NodeRegistry {
     let currentPairingState: PairedDeviceNodeBinding | undefined;
     try {
       currentPairingState = await resolveCurrentPairingState(lease.nodeId);
-    } catch {
+    } catch (error) {
+      logPairingReadFailure(lease.session, "resolve", error);
       return { status: "unavailable" };
     }
     let isCurrent = pairingStateMatchesBinding(lease.binding, currentPairingState);
@@ -352,7 +388,8 @@ export class NodeRegistry {
       if (isCurrent && this.options.isPairingStateCurrent) {
         isCurrent = this.options.isPairingStateCurrent(lease.nodeId, lease.binding);
       }
-    } catch {
+    } catch (error) {
+      logPairingReadFailure(lease.session, "currentness", error);
       return { status: "unavailable" };
     }
     return this.settlePairingLease({ lease, isCurrent, invalidateStale: options.invalidateStale });

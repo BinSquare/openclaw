@@ -785,6 +785,28 @@ describe("gateway/node-registry", () => {
     },
   );
 
+  it("keeps pairing diagnostics observational when an error has an accessor", async () => {
+    const error = new Error("pairing read failed");
+    error.name = "DevicePairingPublicationUnavailableError";
+    Object.defineProperty(error, "publicationState", {
+      get: () => {
+        throw new Error("diagnostic accessor must not run");
+      },
+    });
+    const frames: string[] = [];
+    const registry = createNodeRegistry({
+      resolveCurrentPairingState: async () => {
+        throw error;
+      },
+    });
+    registerNodeSession(registry, makeClient("conn-1", "node-1", frames), pairingA);
+
+    await expect(registry.invoke({ nodeId: "node-1", command: "system.which" })).resolves.toEqual(
+      failure("UNAVAILABLE", "node pairing state unavailable before dispatch"),
+    );
+    expect(frames).toEqual([]);
+  });
+
   it.each(["prompt-context", "authority"] as const)(
     "rechecks %s after the private launch pairing await",
     async (closed) => {
