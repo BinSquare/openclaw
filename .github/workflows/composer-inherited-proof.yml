@@ -1,44 +1,33 @@
-name: Composer owner fixes candidate proof
+name: Composer final retention and chat gates
 on:
   push:
     branches: [solid2/w-chat-5-evidence]
 permissions:
   contents: read
 concurrency:
-  group: composer-owner-fixes-candidate
+  group: composer-final-retention-gates
   cancel-in-progress: false
 jobs:
-  candidate:
-    name: Owner fixes (${{ matrix.group }})
+  proof:
+    name: Final composer ${{ matrix.group }}
     runs-on: blacksmith-16vcpu-ubuntu-2404
-    timeout-minutes: 25
+    timeout-minutes: 30
     strategy:
       fail-fast: false
-      max-parallel: 3
+      max-parallel: 2
       matrix:
-        group: [home, controls, unit]
+        group: [retention-context, chat-gates]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: f07d1401ab94efa7e4128b13a6219004a7c8b248
+          ref: d103e26be23aa984f243f19206d52b35772b2dcd
           persist-credentials: false
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          ref: ${{ github.sha }}
-          path: .evidence
-          persist-credentials: false
-      - name: Verify source and apply the immutable candidate
+      - name: Record exact source
         run: |
           set -euo pipefail
-          mkdir -p .artifacts/owner-candidate
-          git rev-parse HEAD > .artifacts/owner-candidate/source.txt
-          echo "f69f8c6be4df3cce613412273cba677a51eefedc090e28fa92e6881330b62609  .evidence/composer-owner-fixes.patch" | sha256sum --check
-          sha256sum --check .evidence/candidate-source.sha256
-          git apply --check .evidence/composer-owner-fixes.patch
-          git apply .evidence/composer-owner-fixes.patch
-          git diff --binary > .artifacts/owner-candidate/applied.patch
-          git diff --name-only > .artifacts/owner-candidate/changed-paths.txt
-          git diff --name-only -z | xargs -0 sha256sum > .artifacts/owner-candidate/candidate.sha256
+          mkdir -p .artifacts/final-composer-proof
+          test "$(git rev-parse HEAD)" = d103e26be23aa984f243f19206d52b35772b2dcd
+          git rev-parse HEAD > .artifacts/final-composer-proof/source.txt
       - uses: ./.github/actions/setup-node-env
         with:
           node-version: 24.x
@@ -49,58 +38,37 @@ jobs:
       - uses: ./.github/actions/setup-playwright-chromium
         with:
           cache-mode: restore
-      - name: Test Home progress
-        if: matrix.group == 'home'
+      - name: Run retention, IME, undo, and changed context tests
+        if: matrix.group == 'retention-context'
+        run: |
+          set -euo pipefail
+          pnpm test \
+            ui/src/pages/chat/chat-pane-retention.test.ts \
+            ui/src/pages/chat/chat-thread-retention.test.ts \
+            ui/src/pages/chat/session-snapshot-store.test.ts \
+            ui/src/pages/chat/chat-composer-ime.test.ts \
+            ui/src/pages/chat/chat-composer-undo-redo.browser.test.ts \
+            ui/src/pages/chat/chat-composer-context.test.ts \
+            ui/src/pages/chat/chat-composer-context.palette.browser.test.ts \
+            --maxWorkers=1 2>&1 | tee .artifacts/final-composer-proof/results.log
+      - name: Run four chat E2E gates
+        if: matrix.group == 'chat-gates'
         env:
-          OPENCLAW_CAPTURE_UI_PROOF: "1"
-          OPENCLAW_UI_E2E_ARTIFACT_DIR: .artifacts/owner-candidate/screenshots
-          OPENCLAW_UI_E2E_DIAGNOSTIC_DIR: .artifacts/owner-candidate/diagnostics
+          OPENCLAW_UI_E2E_DIAGNOSTIC_DIR: .artifacts/final-composer-proof/diagnostics
         run: |
           set -euo pipefail
           node scripts/run-vitest.mjs run --config test/vitest/vitest.ui-e2e.config.ts --configLoader runner --maxWorkers 1 \
-            ui/src/e2e/session-progress-motion.e2e.test.ts \
-            ui/src/e2e/session-progress-scroll.e2e.test.ts \
-            ui/src/e2e/session-progress-disclosure.e2e.test.ts \
-            ui/src/e2e/session-progress-polish.e2e.test.ts 2>&1 | tee .artifacts/owner-candidate/results.log
-      - name: Test pointer, queue, and goal controls
-        if: matrix.group == 'controls'
-        env:
-          OPENCLAW_CAPTURE_UI_PROOF: "1"
-          OPENCLAW_UI_E2E_ARTIFACT_DIR: .artifacts/owner-candidate/screenshots
-          OPENCLAW_UI_E2E_DIAGNOSTIC_DIR: .artifacts/owner-candidate/diagnostics
-        run: |
-          set -euo pipefail
-          node scripts/run-vitest.mjs run --config test/vitest/vitest.ui-e2e.config.ts --configLoader runner --maxWorkers 1 \
-            ui/src/e2e/chat-composer-pointer-activation.e2e.test.ts \
-            ui/src/e2e/chat-flow.queue-edit.e2e.test.ts \
-            ui/src/e2e/chat-flow.queue-reorder.e2e.test.ts \
-            ui/src/e2e/chat-goal-recovery.e2e.test.ts 2>&1 | tee .artifacts/owner-candidate/results.log
-      - name: Test four focused unit files separately
-        if: matrix.group == 'unit'
-        run: |
-          set -euo pipefail
-          tests=(
-            ui/src/pages/chat/chat-composer-queue.test.ts
-            ui/src/pages/chat/chat-composer-pointer-activation.test.ts
-            ui/src/pages/chat/chat-view-goals.test.ts
-            ui/src/pages/chat/chat-composer-progress-refresh.test.ts
-          )
-          failed=0
-          for test_file in "${tests[@]}"; do
-            pnpm test "$test_file" --maxWorkers=1 2>&1 | tee ".artifacts/owner-candidate/${test_file##*/}.log" || failed=1
-          done
-          exit "$failed"
-      - name: Verify the candidate did not change during testing
+            ui/src/e2e/chat-stream-runtime-budgets.e2e.test.ts \
+            ui/src/e2e/chat-composer-input-measurement.e2e.test.ts \
+            ui/src/e2e/chat-flow.composer-shortcuts.e2e.test.ts \
+            ui/src/e2e/new-session-page.instant-thread.e2e.test.ts 2>&1 | tee .artifacts/final-composer-proof/results.log
+      - name: Verify source remained unchanged
         if: always()
-        run: |
-          set -euo pipefail
-          git diff --cached --exit-code
-          cmp .artifacts/owner-candidate/applied.patch <(git diff --binary)
-          cmp .artifacts/owner-candidate/changed-paths.txt <(git diff --name-only)
+        run: git diff --exit-code && git diff --cached --exit-code
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: composer-owner-candidate-${{ matrix.group }}-${{ github.run_id }}
-          path: .artifacts/owner-candidate
+          name: composer-final-${{ matrix.group }}-${{ github.run_id }}
+          path: .artifacts/final-composer-proof
           if-no-files-found: warn
           retention-days: 7
