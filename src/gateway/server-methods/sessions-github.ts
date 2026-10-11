@@ -444,10 +444,10 @@ export const sessionsGitHubHandlers: GatewayRequestHandlers = {
         phase = next;
         nextPhase(next);
       };
-      const boundedRead = <T>(run: () => Promise<T>) =>
+      const boundedRead = <T>(run: () => Promise<T>, timeoutMs = GITHUB_OPTIONS_TIMEOUT_MS) =>
         raceWithTimeout(
           run,
-          GITHUB_OPTIONS_TIMEOUT_MS,
+          timeoutMs,
           () => {
             const error = new GitHubOptionsTimeoutError(phase, options.req.id);
             onReadTimeout();
@@ -505,6 +505,20 @@ export const sessionsGitHubHandlers: GatewayRequestHandlers = {
           );
           return;
         }
+        const selected =
+          resolveConfiguredGitHubToolIdentity({
+            config: currentGitHubPublicationConfig(),
+            agentId: read.session.agentId,
+            scope: "agent",
+          }) ??
+          resolveConfiguredGitHubToolIdentity({
+            config: currentGitHubPublicationConfig(),
+            agentId: read.session.agentId,
+            scope: "system",
+          });
+        // App reads include the 15s broker admission and 10s issuer verification budgets.
+        const identityBudget =
+          selected?.kind === "app-installation" ? 25_000 : GITHUB_OPTIONS_TIMEOUT_MS;
         await boundedRead(async () => {
           let shared = null;
           const requester = admitted?.requester;
@@ -599,7 +613,7 @@ export const sessionsGitHubHandlers: GatewayRequestHandlers = {
             personal = null;
           }
           options.respond(true, { personal, shared, pendingPersonal, latestShared });
-        });
+        }, identityBudget);
       } finally {
         admitted?.release();
       }

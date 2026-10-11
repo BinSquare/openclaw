@@ -52,11 +52,39 @@ afterEach(() => {
 });
 
 describe("publication receipt reads", () => {
-  it.each(["cold", "requester timeout", "credential timeout", "revoked"] as const)(
+  it.each([
+    "cold",
+    "requester timeout",
+    "credential timeout",
+    "revoked",
+    "app cold",
+    "app timeout",
+    "app revoked",
+  ] as const)(
     "bounds admitted options separately from cold requester preparation: %s",
     async (mode) => {
       await withReadFixture(async (fixture) => {
         vi.stubEnv("FACTORY_AUTH_MODE", "github");
+        const app = mode.startsWith("app ");
+        if (app) {
+          vi.spyOn(publicationAvailability, "currentGitHubPublicationConfig").mockReturnValue({
+            tools: {
+              github: {
+                profileId: "ghp_11111111111111111111111111111111",
+                kind: "app-installation",
+                app: {
+                  appId: 1,
+                  installationId: 2,
+                  accountId: 3,
+                  repositories: [{ id: 4, fullName: "synthetic/repo" }],
+                  permissions: { metadata: "read" },
+                  privateKey: { source: "env", provider: "default", id: "SYNTHETIC_KEY" },
+                  keyVersion: "synthetic",
+                },
+              },
+            },
+          });
+        }
         const captured = createDeferredCore();
         const requester = createDeferredCore();
         const credential = createDeferredCore();
@@ -136,8 +164,16 @@ describe("publication receipt reads", () => {
               request,
               "Credential preparation not entered",
             );
-            await vi.advanceTimersByTimeAsync(mode === "credential timeout" ? 5_000 : 3_228);
-            if (mode === "credential timeout") {
+            await vi.advanceTimersByTimeAsync(
+              mode === "app timeout"
+                ? 25_000
+                : mode === "credential timeout"
+                  ? 5_000
+                  : app
+                    ? 6_000
+                    : 3_228,
+            );
+            if (mode === "credential timeout" || mode === "app timeout") {
               await request;
               expect(respond).toHaveBeenCalledExactlyOnceWith(
                 false,
@@ -149,7 +185,7 @@ describe("publication receipt reads", () => {
               );
             } else {
               expect(respond).not.toHaveBeenCalled();
-              if (mode === "revoked") {
+              if (mode === "revoked" || mode === "app revoked") {
                 current = false;
               }
             }
@@ -157,12 +193,12 @@ describe("publication receipt reads", () => {
             await request;
             await vi.advanceTimersByTimeAsync(0);
             expect(respond).toHaveBeenCalledOnce();
-            if (mode === "cold") {
+            if (mode === "cold" || mode === "app cold") {
               expect(respond).toHaveBeenCalledWith(
                 true,
                 expect.objectContaining({ shared: { ...publisher, source: "system-detected" } }),
               );
-            } else if (mode === "revoked") {
+            } else if (mode === "revoked" || mode === "app revoked") {
               expect(respond).toHaveBeenCalledWith(false, undefined, expect.any(Object));
             }
             expect(release).toHaveBeenCalledOnce();
