@@ -1,17 +1,17 @@
-name: Composer remaining inherited failure proof
+name: Composer sidebar full-context proof
 on:
   push:
     branches: [solid2/w-chat-5-evidence]
 permissions:
   contents: read
 concurrency:
-  group: composer-inherited-final-proof
+  group: composer-sidebar-context-proof
   cancel-in-progress: false
 jobs:
   compare:
     name: Inherited E2E (${{ matrix.label }})
     runs-on: blacksmith-16vcpu-ubuntu-2404
-    timeout-minutes: 35
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -26,6 +26,12 @@ jobs:
         with:
           ref: ${{ matrix.source }}
           persist-credentials: false
+      - name: Read the exact original CI selection
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.sha }}
+          path: .evidence
+          persist-credentials: false
       - uses: ./.github/actions/setup-node-env
         with:
           node-version: 24.x
@@ -36,23 +42,18 @@ jobs:
       - uses: ./.github/actions/setup-playwright-chromium
         with:
           cache-mode: restore
-      - name: Reproduce remaining failed files
+      - name: Install the selected native bundle suite browser
+        run: pnpm --dir ui exec playwright install --with-deps webkit
+      - name: Compare the complete original shard 7
         env:
-          OPENCLAW_CAPTURE_UI_PROOF: "1"
+          OPENCLAW_VITEST_INCLUDE_FILE: .evidence/include-patterns.json
           OPENCLAW_UI_E2E_ARTIFACT_DIR: .artifacts/inherited-proof/screenshots
           OPENCLAW_UI_E2E_DIAGNOSTIC_DIR: .artifacts/inherited-proof/diagnostics
         run: |
           set -euo pipefail
           mkdir -p .artifacts/inherited-proof
           git rev-parse HEAD | tee .artifacts/inherited-proof/source.txt
-          node scripts/run-vitest.mjs run --config test/vitest/vitest.ui-e2e.config.ts --configLoader runner --maxWorkers 1 \
-            ui/src/e2e/chat-cold-load-anchor.e2e.test.ts \
-            ui/src/e2e/session-progress-scroll.e2e.test.ts \
-            ui/src/e2e/chat-markdown-table-interactions.e2e.test.ts \
-            ui/src/e2e/session-progress-motion.e2e.test.ts \
-            ui/src/e2e/chat-position-rail.e2e.test.ts \
-            ui/src/e2e/chat-history-loading.e2e.test.ts \
-            ui/src/e2e/claude-sessions.e2e.test.ts 2>&1 | tee .artifacts/inherited-proof/results.log
+          node scripts/run-vitest.mjs run --config test/vitest/vitest.ui-e2e.config.ts --configLoader runner --maxWorkers 2 --shard 7/8 2>&1 | tee .artifacts/inherited-proof/results.log
       - name: Verify source remained unchanged
         if: always()
         run: git diff --exit-code && git diff --cached --exit-code
@@ -60,7 +61,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: composer-final-${{ matrix.label }}-${{ github.run_id }}
+          name: composer-sidebar-context-${{ matrix.label }}-${{ github.run_id }}
           path: .artifacts/inherited-proof
           if-no-files-found: warn
           retention-days: 7
