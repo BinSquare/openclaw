@@ -111,6 +111,8 @@ export async function runCrabboxCommand(params: {
           observe("remote_milestone", {
             stage: event.stage,
             outcome: event.outcome,
+            ...(event.elapsedMs === undefined ? {} : { elapsedMs: event.elapsedMs }),
+            ...(event.totalElapsedMs === undefined ? {} : { totalElapsedMs: event.totalElapsedMs }),
             ...(event.runtimeCache ? { runtimeCache: event.runtimeCache } : {}),
           }),
       )

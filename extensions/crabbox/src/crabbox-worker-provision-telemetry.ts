@@ -7,8 +7,8 @@ export type CrabboxProvisionStageEvent = {
   leaseId: string;
   operationId: string;
   stage: string;
-  elapsedMs: number;
-  totalElapsedMs: number;
+  elapsedMs?: number;
+  totalElapsedMs?: number;
   outcome: "started" | "completed" | "failed";
   errorCode?: string;
   runtimeCache?: {
@@ -168,6 +168,35 @@ const WORKER_STAGES = new Set([
   "plugin-activation",
   "cache",
 ]);
+const SETUP_STAGES = new Set([
+  "node_probe",
+  "node_install",
+  "node_validation",
+  "package_prerequisites",
+  "helper_projection",
+  "rust_setup",
+  "azure_cli_setup",
+  "azure_version",
+  "azure_package",
+  "azure_payload",
+  "azure_install",
+  "azure_identity",
+  "azure_credential",
+  "env_load",
+  "credential_acquisition",
+  "credential_transport",
+  "repository_channel",
+  "msrustup_probe",
+  "msrustup_install",
+  "toolchain_probe",
+  "toolchain_install",
+  "provenance",
+  "compiler_probe",
+  "formatter_probe",
+  "clippy_probe",
+]);
+const SETUP_MARKER =
+  /^TEAMCLAW_SETUP_V1 stage=([a-z_]+) outcome=(started|succeeded|failed)(?: exit=(0|[1-9]\d{0,2}))?(?: elapsedMs=(0|[1-9]\d{0,9}))?$/u;
 /** Project only the allowlisted remote milestone; never log arbitrary command output. */
 export function createCrabboxWorkerStageObserver(leaseId: string, operationId: string, emit: Emit) {
   let pending = "";
@@ -183,6 +212,34 @@ export function createCrabboxWorkerStageObserver(leaseId: string, operationId: s
     while ((end = pending.indexOf("\n")) >= 0) {
       const line = pending.slice(0, end).trim();
       pending = pending.slice(end + 1);
+      const setup = SETUP_MARKER.exec(line);
+      if (setup && setup[1] !== undefined && SETUP_STAGES.has(setup[1]) && line.length <= 512) {
+        const elapsedMs = setup[4] === undefined ? undefined : Number(setup[4]);
+        if (
+          (elapsedMs !== undefined && elapsedMs > 2_147_483_647) ||
+          (setup[3] !== undefined && Number(setup[3]) > 255)
+        ) {
+          continue;
+        }
+        try {
+          emit({
+            leaseId,
+            operationId,
+            stage: `setup-${setup[1]}`,
+            outcome:
+              setup[2] === "succeeded"
+                ? "completed"
+                : setup[2] === "started"
+                  ? "started"
+                  : "failed",
+            ...(elapsedMs === undefined ? {} : { elapsedMs }),
+            ...(setup[2] === "failed" ? { errorCode: "setup_failed" } : {}),
+          });
+        } catch {
+          // Remote timing never changes command custody or outcome.
+        }
+        continue;
+      }
       const marker = line.indexOf(WORKER_STAGE_PREFIX);
       if (marker < 0 || line.length > 512) {
         continue;

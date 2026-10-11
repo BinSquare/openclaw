@@ -63,6 +63,57 @@ it("records settled CLI facts before preserving caller cancellation and unknown 
   expect(JSON.stringify(records)).not.toContain("private-");
 });
 
+it("retains bounded setup timing under host command custody without remote identity or output", async () => {
+  commandLog.mockReset();
+  await runCrabboxCommand({
+    action: "profile setup",
+    args: ["run"],
+    binary: "crabbox",
+    timeoutMs: 1000,
+    diagnostics: { operationId: "operation-1", leaseId: "cbx_1", stage: "profile-setup" },
+    runCommand: async (_argv, options) => {
+      const send = (text: string, stream: "stderr" | "stdout" = "stderr") =>
+        options.onOutputChunk?.(Buffer.from(text), stream);
+      send("TEAMCLAW_SETUP_V1 stage=node_probe outcome=sta");
+      send(
+        "rted elapsedMs=0\nTEAMCLAW_SETUP_V1 stage=node_probe outcome=succeeded exit=0 elapsedMs=12\n",
+      );
+      send("TEAMCLAW_SETUP_V1 stage=azure_identity outcome=failed exit=1 elapsedMs=23\n");
+      send("TEAMCLAW_SETUP_V1 stage=env_load outcome=succeeded\n");
+      send("TEAMCLAW_SETUP_V1 stage=secret_value outcome=succeeded elapsedMs=12\n");
+      send("TEAMCLAW_SETUP_V1 stage=node_probe outcome=succeeded elapsedMs=2147483648\n");
+      send(
+        "TEAMCLAW_SETUP_V1 stage=node_probe outcome=succeeded elapsedMs=1 token=private-token\n",
+      );
+      send("TEAMCLAW_SETUP_V1 stage=node_probe outcome=succeeded elapsedMs=1\n", "stdout");
+      send(
+        'CRABBOX_WORKER_STAGE:{"leaseId":"cbx_1","stage":"installation","elapsedMs":7,"totalElapsedMs":9,"outcome":"completed"}\n',
+      );
+      return { stdout: "", stderr: "", code: 0, signal: null, killed: false, termination: "exit" };
+    },
+  });
+  const records = commandLog.mock.calls.map(([, fields]) => fields);
+  const events = records.filter((record) => record.disposition === "remote_milestone");
+  expect(
+    events.map((event) => [event.stage, event.outcome, event.elapsedMs, event.totalElapsedMs]),
+  ).toEqual([
+    ["setup-node_probe", "started", 0, undefined],
+    ["setup-node_probe", "completed", 12, undefined],
+    ["setup-azure_identity", "failed", 23, undefined],
+    ["setup-env_load", "completed", undefined, undefined],
+    ["worker-installation", "completed", 7, 9],
+  ]);
+  expect(
+    events.every(
+      (event) =>
+        event.leaseId === "cbx_1" &&
+        event.operationId === "operation-1" &&
+        event.commandId === records[0].commandId,
+    ),
+  ).toBe(true);
+  expect(JSON.stringify(events)).not.toContain("private-token");
+});
+
 const LEASE_ID = "cbx_0123456789ab";
 const readError = `coordinator GET /v1/leases/${LEASE_ID}: http 404: {"error":"not_found"}`;
 const releaseError = `coordinator POST /v1/leases/${LEASE_ID}/release: http 404: {"error":"not_found"}`;
