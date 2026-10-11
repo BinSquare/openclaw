@@ -25,7 +25,7 @@ import {
 import type { SessionAdmissionDatabaseClaim } from "../../config/sessions/session-accessor.sqlite-entry-admission.js";
 import { loadSessionEntryForAdmission } from "../../config/sessions/session-accessor.sqlite-entry.js";
 import { normalizeStoreSessionKey } from "../../config/sessions/store-entry.js";
-import type { InternalSessionEntry, SessionEntry } from "../../config/sessions/types.js";
+import type { InternalSessionEntry } from "../../config/sessions/types.js";
 import type { GatewayRecoveryRuntime } from "../../gateway/server-instance-runtime.types.js";
 import type { GatewayContextResolver } from "../../gateway/server-methods/types.js";
 import { racePromiseWithAbortSignal } from "../../infra/abort-signal.js";
@@ -42,7 +42,6 @@ import { parseAgentSessionKey } from "../../routing/session-key.js";
 import {
   beginSessionWorkAdmission,
   getSessionWorkAdmissionOwnerRelease,
-  type SessionWorkAdmissionLease,
 } from "../../sessions/session-lifecycle-admission.js";
 import { getAsyncWorkSignal } from "../../shared/async-work-scope.js";
 import {
@@ -69,6 +68,10 @@ import {
 } from "./reply-run-registry.state.js";
 import {
   QueuedFollowupLifecycleInvalidatedError,
+  mayRetainActiveReplyAdmission,
+  assertReplyAdmissionGeneration,
+  observeReplyAdmissionBoundary,
+  type ReplyTurnAdmission,
   rejectLifecycleInvalidatedWork,
 } from "./reply-turn-admission-errors.js";
 import {
@@ -78,21 +81,6 @@ import {
   prepareForegroundRestartRecoveryWait,
 } from "./reply-turn-recovery-wait.js";
 import { createReplyTurnRotationEvidence } from "./reply-turn-rotation.js";
-
-type ReplyTurnAdmission =
-  | {
-      status: "owned";
-      operation: ReplyOperation;
-      sessionEntry?: SessionEntry;
-      databaseClaim?: SessionAdmissionDatabaseClaim;
-    }
-  | {
-      status: "skipped";
-      reason: "active-run" | "aborted" | "lifecycle-invalidated";
-      activeOperation?: ReplyOperation;
-      sessionEntry?: SessionEntry;
-      lifecycleAdmission?: SessionWorkAdmissionLease;
-    };
 
 class ReplyOperationChangedDuringAdmissionError extends Error {}
 
@@ -282,15 +270,12 @@ export async function admitReplyTurn(
                 const assertCurrent = () => {
                   params.assertRequestCurrent?.();
                   assertDatabaseOwnerCurrent();
-                  if (
-                    !admitting ||
-                    interruptedBeforeOperation ||
-                    lifecycleGeneration !== getAgentEventLifecycleGeneration()
-                  ) {
-                    throw new SessionWorkStartChangedError(
-                      "Session changed while waiting for state admission.",
-                    );
-                  }
+                  assertReplyAdmissionGeneration({
+                    admitting,
+                    interrupted: interruptedBeforeOperation,
+                    expectedGeneration: lifecycleGeneration,
+                    currentGeneration: getAgentEventLifecycleGeneration(),
+                  });
                 };
                 const current = await loadSessionEntryForAdmission(
                   {
@@ -536,7 +521,8 @@ export async function admitReplyTurn(
           if (
             error instanceof ReplyRunAlreadyActiveError &&
             admission &&
-            params.retainLifecycleAdmissionOnActive
+            params.retainLifecycleAdmissionOnActive &&
+            mayRetainActiveReplyAdmission(params.kind, replyRunRegistry.get(params.sessionKey))
           ) {
             void admission.released.then(() => {
               scheduleMainSessionRecoveryPendingTarget(pendingRecovery);
@@ -698,8 +684,15 @@ export async function admitReplyTurn(
           continue;
         }
         // Visible and queued turns may wait for active runs when waitForActive is set.
-        if (params.kind === "heartbeat" || params.waitForActive === false) {
+        if (
+          params.kind === "heartbeat" ||
+          (params.waitForActive === false &&
+            mayRetainActiveReplyAdmission(params.kind, activeOperation))
+        ) {
           return { status: "skipped", reason: "active-run", activeOperation };
+        }
+        if (!mayRetainActiveReplyAdmission(params.kind, activeOperation)) {
+          observeReplyAdmissionBoundary(params.kind, "closing-predecessor-wait", activeOperation);
         }
         const activeWaitTimeoutMs =
           params.kind === "visible" ? resolveVisibleActiveWaitMs(activeOperation) : waitTimeoutMs;
