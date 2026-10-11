@@ -1,11 +1,11 @@
-name: Composer inherited failure proof
+name: Composer follow and sidebar failure proof
 on:
   push:
     branches: [solid2/w-chat-5-evidence]
 permissions:
   contents: read
 concurrency:
-  group: composer-inherited-proof
+  group: composer-inherited-followup-proof
   cancel-in-progress: false
 jobs:
   compare:
@@ -36,7 +36,7 @@ jobs:
       - uses: ./.github/actions/setup-playwright-chromium
         with:
           cache-mode: restore
-      - name: Reproduce the three failed files
+      - name: Reproduce follow and sidebar failures
         env:
           OPENCLAW_CAPTURE_UI_PROOF: "1"
           OPENCLAW_UI_E2E_ARTIFACT_DIR: .artifacts/inherited-proof/screenshots
@@ -46,9 +46,8 @@ jobs:
           mkdir -p .artifacts/inherited-proof
           git rev-parse HEAD | tee .artifacts/inherited-proof/source.txt
           node scripts/run-vitest.mjs run --config test/vitest/vitest.ui-e2e.config.ts --configLoader runner --maxWorkers 1 \
-            ui/src/e2e/chat-history-prepend-anchor.e2e.test.ts \
-            ui/src/e2e/chat-position-rail-split.e2e.test.ts \
-            ui/src/e2e/chat-subagent-waiting.e2e.test.ts 2>&1 | tee .artifacts/inherited-proof/results.log
+            ui/src/e2e/chat-follow-maintenance.e2e.test.ts \
+            ui/src/e2e/sidebar-rail.e2e.test.ts 2>&1 | tee .artifacts/inherited-proof/results.log
       - name: Verify source remained unchanged
         if: always()
         run: git diff --exit-code && git diff --cached --exit-code
@@ -56,107 +55,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: composer-inherited-${{ matrix.label }}-${{ github.run_id }}
+          name: composer-followup-${{ matrix.label }}-${{ github.run_id }}
           path: .artifacts/inherited-proof
-          if-no-files-found: warn
-          retention-days: 7
-  remaining-e2e:
-    name: Remaining E2E (${{ matrix.shard }}/8)
-    runs-on: blacksmith-16vcpu-ubuntu-2404
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      max-parallel: 4
-      matrix:
-        shard: [1, 3, 4, 8]
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          ref: f07d1401ab94efa7e4128b13a6219004a7c8b248
-          persist-credentials: false
-      - name: Read the exact original CI selection
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          ref: ${{ github.sha }}
-          path: .evidence
-          persist-credentials: false
-      - uses: ./.github/actions/setup-node-env
-        with:
-          node-version: 24.x
-          install-bun: "false"
-          cache-mode: restore
-          dependency-cache: "true"
-          restore-test-caches: "true"
-      - uses: ./.github/actions/setup-playwright-chromium
-        with:
-          cache-mode: restore
-      - name: Install the WebKit browser used by the selected native bundle suite
-        run: pnpm --dir ui exec playwright install --with-deps webkit
-      - name: Run the previously cancelled shard
-        env:
-          OPENCLAW_VITEST_INCLUDE_FILE: .evidence/include-patterns.json
-          OPENCLAW_UI_E2E_DIAGNOSTIC_DIR: .artifacts/remaining-e2e/diagnostics
-          EVIDENCE_SHARD: ${{ matrix.shard }}
-        run: |
-          set -euo pipefail
-          mkdir -p .artifacts/remaining-e2e
-          git rev-parse HEAD | tee .artifacts/remaining-e2e/source.txt
-          node scripts/run-vitest.mjs run --config test/vitest/vitest.ui-e2e.config.ts --configLoader runner --maxWorkers 2 --shard "$EVIDENCE_SHARD/8" 2>&1 | tee .artifacts/remaining-e2e/results.log
-      - name: Verify source remained unchanged
-        if: always()
-        run: git diff --exit-code && git diff --cached --exit-code
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        if: always()
-        with:
-          name: composer-e2e-${{ matrix.shard }}-${{ github.run_id }}
-          path: .artifacts/remaining-e2e
-          if-no-files-found: warn
-          retention-days: 7
-  remaining-types:
-    name: Remaining type stripes (${{ matrix.stripe }}/5)
-    runs-on: blacksmith-16vcpu-ubuntu-2404
-    timeout-minutes: 35
-    strategy:
-      fail-fast: false
-      max-parallel: 4
-      matrix:
-        stripe: [2, 3, 4, 5]
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          ref: f07d1401ab94efa7e4128b13a6219004a7c8b248
-          persist-credentials: false
-      - uses: ./.github/actions/setup-node-env
-        with:
-          node-version: 24.x
-          semantic-checks: "true"
-          install-bun: "false"
-          cache-mode: restore
-          dependency-cache: "true"
-      - name: Run core test type stripe
-        env:
-          EVIDENCE_STRIPE: ${{ matrix.stripe }}
-        run: |
-          set -euo pipefail
-          mkdir -p .artifacts/remaining-types
-          git rev-parse HEAD | tee .artifacts/remaining-types/source.txt
-          node scripts/run-tsgo-core-test-shards.mjs --stripe "$EVIDENCE_STRIPE/5" --concurrency 2 2>&1 | tee .artifacts/remaining-types/core.log
-      - name: Run root type stripe
-        if: ${{ !cancelled() }}
-        env:
-          EVIDENCE_STRIPE: ${{ matrix.stripe }}
-          OPENCLAW_LOCAL_CHECK: "0"
-        run: |
-          set -euo pipefail
-          mkdir -p .artifacts/remaining-types
-          node scripts/run-tsgo-core-test-shards.mjs --root-stripe "$((EVIDENCE_STRIPE - 1))/4" 2>&1 | tee .artifacts/remaining-types/root.log
-      - name: Verify source remained unchanged
-        if: always()
-        run: git diff --exit-code && git diff --cached --exit-code
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        if: always()
-        with:
-          name: composer-types-${{ matrix.stripe }}-${{ github.run_id }}
-          path: .artifacts/remaining-types
           if-no-files-found: warn
           retention-days: 7
