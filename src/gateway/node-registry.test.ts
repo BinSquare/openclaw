@@ -807,6 +807,75 @@ describe("gateway/node-registry", () => {
     expect(frames).toEqual([]);
   });
 
+  it.each(["recovers", "remains unavailable", "generation changes", "is cancelled"] as const)(
+    "rechecks a private worker pairing read that %s before dispatch",
+    async (outcome) => {
+      const pairing = { identity: "identity-a", generation: "generation-a" };
+      const resolveCurrentPairingState = vi.fn(async () => pairing);
+      const { nodeRegistry: registry, nodeWorkerSupervisorTransport: transport } =
+        createPrivateRegistry({ resolveCurrentPairingState });
+      const frames: string[] = [];
+      registerNodeSession(
+        registry,
+        makeClient("conn-1", "node-1", frames, { clientId: GATEWAY_CLIENT_IDS.NODE_HOST }),
+        pairingA,
+      );
+      publishRunner(registry, { enabled: true, capacity: { total: 1, available: 1 } });
+      const node = expectDefined(await transport.getCurrentNode("node-1"), "current runner");
+      resolveCurrentPairingState.mockRejectedValueOnce(new Error("temporary pairing read failure"));
+      if (outcome === "remains unavailable") {
+        resolveCurrentPairingState.mockRejectedValueOnce(
+          new Error("persistent pairing read failure"),
+        );
+      }
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const controller = new AbortController();
+      const onDispatchReady = vi.fn();
+      const invoke = transport.invoke({
+        node,
+        command: NODE_WORKER_BUNDLE_INSTALL_COMMAND,
+        timeoutMs: 0,
+        signal: controller.signal,
+        isDispatchAuthorized: () => true,
+        onDispatchReady,
+      });
+
+      await vi.advanceTimersByTimeAsync(249);
+      expect(frames).toEqual([]);
+      expect(onDispatchReady).not.toHaveBeenCalled();
+      if (outcome === "generation changes") {
+        pairing.generation = "generation-b";
+      } else if (outcome === "is cancelled") {
+        controller.abort();
+      }
+      await vi.advanceTimersByTimeAsync(1);
+      if (outcome !== "recovers") {
+        await expect(invoke).resolves.toEqual(
+          outcome === "remains unavailable"
+            ? failure("UNAVAILABLE", "node pairing state unavailable before dispatch")
+            : outcome === "generation changes"
+              ? failure("PAIRING_CHANGED", "node pairing changed before dispatch")
+              : failure("ABORTED", "node invoke cancelled"),
+        );
+        expect(frames).toEqual([]);
+        expect(onDispatchReady).not.toHaveBeenCalled();
+      } else {
+        await vi.waitFor(() => expect(frames).toHaveLength(1));
+        const request = readRequest(frames);
+        registry.handleInvokeResult({
+          id: request.id ?? "",
+          nodeId: "node-1",
+          connId: "conn-1",
+          ok: true,
+          payloadJSON: "null",
+        });
+        await expect(invoke).resolves.toMatchObject({ ok: true });
+        expect(onDispatchReady).toHaveBeenCalledOnce();
+      }
+      expect(resolveCurrentPairingState).toHaveBeenCalledTimes(outcome === "is cancelled" ? 2 : 3);
+    },
+  );
+
   it.each(["prompt-context", "authority"] as const)(
     "rechecks %s after the private launch pairing await",
     async (closed) => {

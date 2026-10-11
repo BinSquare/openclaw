@@ -2,7 +2,6 @@ import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { resolveTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
-import { racePromiseWithAbortSignal } from "../infra/abort-signal.js";
 import {
   isPrivateNodeInvokeCommand,
   NODE_WORKER_ENVIRONMENT_STOP_COMMAND,
@@ -18,12 +17,16 @@ import {
   type NodeRunnerInventoryIssue,
   type NodeRunnerInventoryDeclaration,
 } from "../infra/node-runner-inventory.js";
-import { ABSOLUTE_DEADLINE_EXPIRED, awaitWithinDeadline } from "../utils/absolute-deadline.js";
+import { ABSOLUTE_DEADLINE_EXPIRED } from "../utils/absolute-deadline.js";
 import { sameWorkerProtocolFeatures } from "../worker/worker-build-identity.js";
 import { logNodeInvokeDispatchRefusal, type NodeEventSendResult } from "./node-event-send.js";
 import { buildNodeInvokeRequest, serializeNodeEvent } from "./node-invoke-request.js";
 import type { NodeInvokeParams, NodeInvokeResult } from "./node-invoke.types.js";
-import type { NodePairingLeaseResolution } from "./node-registry-pairing.js";
+import {
+  resolvePairingLeaseBeforeDispatch,
+  type NodePairingLeaseDispatchResult,
+  type NodePairingLeaseResolution,
+} from "./node-registry-pairing.js";
 import { NODE_INVOKE_PAIRING_CHANGED_ABORT } from "./node-registry-private-token.js";
 import type { NodeInvokeStreamController, PendingInvoke } from "./node-registry.invoke-stream.js";
 import {
@@ -48,10 +51,8 @@ import {
 } from "./node-runner-inventory-runtime.js";
 import { MAX_PAYLOAD_BYTES } from "./server-constants.js";
 
-export type {
-  NodeRunnerStateChange,
-  NodeWorkerSupervisorNodeProof,
-} from "./node-runner-inventory-runtime.js";
+export type { NodeRunnerStateChange } from "./node-runner-inventory-runtime.js";
+export type { NodeWorkerSupervisorNodeProof } from "./node-runner-inventory-runtime.js";
 
 type PairingBoundNodeSession = NodeRunnerRegistrySession & { pairingIdentity: string };
 type NodeWorkerPrivateCommand = (typeof NODE_WORKER_PRIVATE_COMMANDS)[number];
@@ -195,15 +196,15 @@ async function invokeNodeRegistryCore(
   }
   if (expectedPairingGeneration && state.context.hasCurrentPairingStateResolver) {
     const pairingNode = node;
-    let resolution:
-      | NodePairingLeaseResolution<PairingBoundNodeSession>
-      | typeof ABSOLUTE_DEADLINE_EXPIRED;
+    let resolution: NodePairingLeaseDispatchResult<PairingBoundNodeSession>;
     try {
-      resolution = await awaitWithinDeadline(
-        () =>
-          racePromiseWithAbortSignal(state.context.resolvePairingLease(pairingNode), params.signal),
-        deadlineAtMs,
-        () => performance.now(),
+      resolution = await resolvePairingLeaseBeforeDispatch(
+        () => state.context.resolvePairingLease(pairingNode),
+        {
+          deadlineAtMs,
+          signal: params.signal,
+          retryUnavailable: allowPrivateCommand && isPrivateNodeInvokeCommand(params.command),
+        },
       );
     } catch (error) {
       if (params.signal?.aborted) {
