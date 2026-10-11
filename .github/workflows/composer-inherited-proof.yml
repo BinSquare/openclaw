@@ -1,26 +1,40 @@
-name: Composer sidebar full-context proof
+name: Composer exact three-worker CI proof
 on:
   push:
     branches: [solid2/w-chat-5-evidence]
 permissions:
   contents: read
 concurrency:
-  group: composer-sidebar-context-proof
+  group: composer-exact-three-worker-proof
   cancel-in-progress: false
 jobs:
   compare:
-    name: Inherited E2E (${{ matrix.label }})
+    name: Exact E2E (${{ matrix.label }}, ${{ matrix.shard }}/8)
     runs-on: blacksmith-16vcpu-ubuntu-2404
     timeout-minutes: 45
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 4
       matrix:
         include:
           - label: head
             source: f07d1401ab94efa7e4128b13a6219004a7c8b248
+            shard: 1
+          - label: head
+            source: f07d1401ab94efa7e4128b13a6219004a7c8b248
+            shard: 3
+          - label: head
+            source: f07d1401ab94efa7e4128b13a6219004a7c8b248
+            shard: 4
+          - label: head
+            source: f07d1401ab94efa7e4128b13a6219004a7c8b248
+            shard: 8
+          - label: head
+            source: f07d1401ab94efa7e4128b13a6219004a7c8b248
+            shard: 7
           - label: base
             source: ed684fc775159cb4a3294667789c4e9e86e9293e
+            shard: 7
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -44,16 +58,18 @@ jobs:
           cache-mode: restore
       - name: Install the selected native bundle suite browser
         run: pnpm --dir ui exec playwright install --with-deps webkit
-      - name: Compare the complete original shard 7
+      - name: Run the exact original three-worker shard
         env:
           OPENCLAW_VITEST_INCLUDE_FILE: .evidence/include-patterns.json
+          OPENCLAW_VITEST_MAX_WORKERS: "3"
+          EVIDENCE_SHARD: ${{ matrix.shard }}
           OPENCLAW_UI_E2E_ARTIFACT_DIR: .artifacts/inherited-proof/screenshots
           OPENCLAW_UI_E2E_DIAGNOSTIC_DIR: .artifacts/inherited-proof/diagnostics
         run: |
           set -euo pipefail
           mkdir -p .artifacts/inherited-proof
           git rev-parse HEAD | tee .artifacts/inherited-proof/source.txt
-          node scripts/run-vitest.mjs run --config test/vitest/vitest.ui-e2e.config.ts --configLoader runner --maxWorkers 2 --shard 7/8 2>&1 | tee .artifacts/inherited-proof/results.log
+          node scripts/run-vitest.mjs run --config test/vitest/vitest.ui-e2e.config.ts --configLoader runner --maxWorkers 3 --shard "$EVIDENCE_SHARD/8" 2>&1 | tee .artifacts/inherited-proof/results.log
       - name: Verify source remained unchanged
         if: always()
         run: git diff --exit-code && git diff --cached --exit-code
@@ -61,7 +77,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: composer-sidebar-context-${{ matrix.label }}-${{ github.run_id }}
+          name: composer-exact-${{ matrix.label }}-${{ matrix.shard }}-${{ github.run_id }}
           path: .artifacts/inherited-proof
           if-no-files-found: warn
           retention-days: 7
