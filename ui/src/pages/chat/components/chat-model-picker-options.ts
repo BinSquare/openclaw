@@ -1,16 +1,16 @@
 import { html, nothing } from "lit";
+import type { ModelRuntimeEntry } from "../../../../../src/shared/model-runtime-entry.js";
 import { icons } from "../../../components/icons.ts";
 import { renderKbd } from "../../../components/kbd.ts";
+import "../../../components/tooltip.ts";
 import {
   formatRawProviderLabel,
   providerDisplayLabel,
   renderProviderBrandIcon,
 } from "../../../components/provider-icon.ts";
-import "../../../components/tooltip.ts";
 import { t } from "../../../i18n/index.ts";
 import { registerModelControlsEnglish } from "../../../i18n/locales/en-model-controls.ts";
 import { formatContextTokenCapacity } from "../../../lib/format.ts";
-import type { ModelRuntimeEntry } from "../../../../../src/shared/model-runtime-entry.js";
 import { formatModelRuntimeLabel } from "../../../lib/model-runtime-label.ts";
 import { handleModelOptionMouseEnter } from "./chat-model-picker-search.ts";
 

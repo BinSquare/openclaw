@@ -1,5 +1,9 @@
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { normalizeThinkLevel } from "../../../../src/auto-reply/thinking.shared.js";
+import {
+  resolveModelRuntimeEntry,
+  type ModelRuntimeEntry,
+} from "../../../../src/shared/model-runtime-entry.js";
 import type {
   GatewaySessionRow,
   GatewayThinkingLevelOption,
@@ -7,10 +11,6 @@ import type {
   SessionsListResult,
 } from "../../api/types.ts";
 import { t } from "../../i18n/index.ts";
-import {
-  resolveModelRuntimeEntry,
-  type ModelRuntimeEntry,
-} from "../../../../src/shared/model-runtime-entry.js";
 import { pushUniqueTrimmedSelectOption } from "../select-options.ts";
 import { sessionModelMatchesDefaults } from "../session-model-defaults.ts";
 import { areUiSessionKeysEquivalent } from "../sessions/session-key.ts";

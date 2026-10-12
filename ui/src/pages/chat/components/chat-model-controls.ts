@@ -1,5 +1,6 @@
 import { html, nothing } from "lit";
 import type { ChatAccountSelection } from "../../../../../packages/gateway-protocol/src/index.ts";
+import { resolveModelRuntimeEntry } from "../../../../../src/shared/model-runtime-entry.js";
 import { resolveModelRuntimeRoute } from "../../../../../src/shared/model-runtime-route.js";
 import type {
   ModelAuthStatusResult,
@@ -31,7 +32,6 @@ import {
   describeModelProviderAuth,
   type ModelProviderAuthLabel,
 } from "../../../lib/model-provider-auth-label.ts";
-import { resolveModelRuntimeEntry } from "../../../../../src/shared/model-runtime-entry.js";
 import { isSessionRuntimePinned } from "../../../lib/model-runtime-choice.ts";
 import { areUiSessionKeysEquivalent } from "../../../lib/sessions/session-key.ts";
 import { renderChatEffortPicker } from "./chat-effort-picker.ts";

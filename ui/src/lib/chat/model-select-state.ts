@@ -1,3 +1,8 @@
+import {
+  resolveModelRuntimeEntry,
+  runtimeOffersUltrafast,
+  type ModelRuntimeEntry,
+} from "../../../../src/shared/model-runtime-entry.js";
 import type {
   FastMode,
   GatewaySessionRow,
@@ -7,11 +12,6 @@ import type {
 } from "../../api/types.ts";
 import { t } from "../../i18n/index.ts";
 import { registerModelControlsEnglish } from "../../i18n/locales/en-model-controls.ts";
-import {
-  resolveModelRuntimeEntry,
-  runtimeOffersUltrafast,
-  type ModelRuntimeEntry,
-} from "../../../../src/shared/model-runtime-entry.js";
 import {
   buildCatalogDisplayLookup,
   buildChatModelOptionFromLookup,

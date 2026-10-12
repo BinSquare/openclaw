@@ -1,7 +1,7 @@
+import type { ModelRuntimeEntry } from "../../../../src/shared/model-runtime-entry.js";
 import type { FastMode, GatewayAgentRow } from "../../api/types.ts";
 import type { DurableDraftModelSelection } from "../../lib/chat/composer-draft-store.runtime.ts";
 import { normalizeThinkingOptionValue } from "../../lib/chat/thinking.ts";
-import type { ModelRuntimeEntry } from "../../../../src/shared/model-runtime-entry.js";
 import type { DraftCloudProfile } from "./discovery.ts";
 import {
   reconcileDraftModelSelection,

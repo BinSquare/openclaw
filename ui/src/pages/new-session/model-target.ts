@@ -1,4 +1,8 @@
 import type { ChatAccountSelection } from "@openclaw/gateway-protocol";
+import {
+  resolveModelRuntimeEntry,
+  type ModelRuntimeEntry,
+} from "../../../../src/shared/model-runtime-entry.js";
 import type {
   FastMode,
   GatewayAgentRow,
@@ -25,10 +29,6 @@ import {
   type ChatThinkingTarget,
 } from "../../lib/chat/thinking.ts";
 import type { ChatModelCatalogState } from "../../lib/model-catalog-store.ts";
-import {
-  resolveModelRuntimeEntry,
-  type ModelRuntimeEntry,
-} from "../../../../src/shared/model-runtime-entry.js";
 import { draftCloudProfileSupportsExecutionMode, type DraftCloudProfile } from "./discovery.ts";
 
 registerNewSessionSetupEnglish();
