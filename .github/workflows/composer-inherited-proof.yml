@@ -1,84 +1,70 @@
-name: Composer base unit failure attribution
+name: Composer current E2E failure attribution
 on:
   push:
     branches: [solid2/w-chat-5-evidence]
 permissions:
   contents: read
 concurrency:
-  group: composer-final-ci-coverage-recovery
+  group: composer-current-e2e-attribution
   cancel-in-progress: false
 jobs:
-  proof:
-    name: ${{ matrix.label }}
+  comparison:
+    name: Current E2E attribution (${{ matrix.label }})
     runs-on: blacksmith-16vcpu-ubuntu-2404
     timeout-minutes: 40
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 2
       matrix:
         include:
-          - family: unit
-            label: UI unit base 1/3
+          - label: head
+            source: 009c3cdd855e2e6675d7721c05f30b5048f8f092
+          - label: base
             source: d0df645f66013c79290904ac9c4e69f9749b94fd
-            shard: 1
-          - family: unit
-            label: UI unit base 2/3
-            source: d0df645f66013c79290904ac9c4e69f9749b94fd
-            shard: 2
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ matrix.source }}
           persist-credentials: false
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          ref: ${{ github.sha }}
-          path: .evidence
-          persist-credentials: false
-      - name: Record exact source and selection
+      - name: Record exact source
         run: |
-          set -euo pipefail
-          mkdir -p .artifacts/coverage-proof
-          git rev-parse HEAD > .artifacts/coverage-proof/source.txt
-          sha256sum .evidence/ui-unit-groups.gzip-base64 .evidence/e2e-include-patterns.json > .artifacts/coverage-proof/selection.sha256
+          mkdir -p .artifacts/attribution
+          git rev-parse HEAD > .artifacts/attribution/source.txt
       - uses: ./.github/actions/setup-node-env
         with:
           node-version: 24.x
-          semantic-checks: ${{ matrix.family == 'types' && 'true' || 'false' }}
           install-bun: "false"
           cache-mode: restore
           dependency-cache: "true"
           restore-test-caches: "true"
-      - name: Setup pinned Bun test runtime
-        if: matrix.family == 'unit'
-        uses: ./.github/actions/setup-test-bun
       - uses: ./.github/actions/setup-playwright-chromium
-        if: matrix.family != 'types'
         with:
           cache-mode: restore
-      - name: Restore the exact UI unit selection
-        if: matrix.family == 'unit'
-        run: |
-          printf 'OPENCLAW_NODE_TEST_GROUPS_GZIP_BASE64=%s\n' "$(cat .evidence/ui-unit-groups.gzip-base64)" >> "$GITHUB_ENV"
-      - name: Run original Bun-compatible UI unit shard
-        if: matrix.family == 'unit'
+      - name: Install WebKit for the Workboard contract
+        run: pnpm --dir ui exec playwright install --with-deps webkit
+      - name: Compare eight failed E2E files
         env:
-          COMPATIBILITY_TARGET: "false"
-          OPENCLAW_CI_TEST_RUNTIME_POLICY: bun-compatible
-          OPENCLAW_UI_E2E_DIAGNOSTIC_DIR: .artifacts/coverage-proof/diagnostics
-          OPENCLAW_NODE_TEST_CONFIGS_JSON: '["ui/vitest.config.ts"]'
-          OPENCLAW_NODE_TEST_PLAN_CONCURRENCY: "1"
-          OPENCLAW_NODE_TEST_VITEST_ARGS_JSON: ${{ format('["--maxWorkers", "3", "--reporter=verbose", "--reporter=github-actions", "--reporter=./scripts/lib/vitest-resource-reporter.mts", "--shard={0}/3"]', matrix.shard) }}
+          OPENCLAW_CAPTURE_UI_PROOF: "1"
+          OPENCLAW_UI_E2E_ARTIFACT_DIR: .artifacts/attribution/screenshots
+          OPENCLAW_UI_E2E_DIAGNOSTIC_DIR: .artifacts/attribution/diagnostics
         run: |
           set -euo pipefail
-          DEBUG=vitest:browser:*,pw:browser node --import tsx scripts/ci-run-node-test-shard.mts 2>&1 | tee .artifacts/coverage-proof/results.log
+          node scripts/run-vitest.mjs run --config test/vitest/vitest.ui-e2e.config.ts --configLoader runner --maxWorkers 1 \
+            ui/src/e2e/settings-prefs-reconnect.e2e.test.ts \
+            ui/src/e2e/theme-muted-contrast.e2e.test.ts \
+            ui/src/pages/workboard/workboard-native-bundle.e2e.test.ts \
+            ui/src/e2e/board-mcp-app.e2e.test.ts \
+            ui/src/e2e/meetings.e2e.test.ts \
+            ui/src/e2e/lazy-custom-element-recovery.e2e.test.ts \
+            ui/src/e2e/chat-markdown-table-interactions.e2e.test.ts \
+            ui/src/e2e/tool-titles.e2e.test.ts 2>&1 | tee .artifacts/attribution/results.log
       - name: Verify source remained unchanged
         if: always()
         run: git diff --exit-code && git diff --cached --exit-code
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
-          name: composer-coverage-${{ matrix.family }}-${{ matrix.source }}-${{ matrix.shard }}-${{ github.run_id }}
-          path: .artifacts/coverage-proof
+          name: composer-current-attribution-${{ matrix.label }}-${{ github.run_id }}
+          path: .artifacts/attribution
           if-no-files-found: warn
           retention-days: 7
